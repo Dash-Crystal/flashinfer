@@ -242,7 +242,7 @@ template <>
 struct KVCacheList<true> {
   GMemCacheHead* kCacheVLLM;
   GMemCacheHead* vCacheVLLM;
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
   GMemCacheHeadSf* kSfCacheVLLM;
   GMemCacheHeadSf* vSfCacheVLLM;
 #endif

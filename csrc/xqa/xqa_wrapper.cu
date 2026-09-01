@@ -57,8 +57,10 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
-                 int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
-                 TensorView semaphores, TensorView scratch, bool enable_pdl) {
+                 int64_t qSeqLen, Optional<TensorView> qCuSeqLens,
+                 Optional<TensorView> mask, TensorView semaphores,
+                 TensorView scratch, bool enable_pdl, int64_t localSubSeqOverride,
+                 int64_t reductionSubSeqTotal, int64_t reductionSubSeqBase, bool applySpecMask) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -69,87 +71,60 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
   float const* kvScalePtr = kvScaleTensor.has_value()
                                 ? reinterpret_cast<float const*>(kvScaleTensor.value().data_ptr())
                                 : nullptr;
+#if USE_SM90_MHA
+  auto const mha_func = run_sm90_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
+#else
+  auto const mha_func = &launchMHAFlashInfer;
+#endif
+
   // Extract strides from TensorView (in elements, not bytes)
   uint64_t kv_stride_page = kCacheVLLM.stride(0);
   uint64_t kv_stride_token = kCacheVLLM.stride(-3);
   uint64_t kv_stride_head = kCacheVLLM.stride(-2);
-#if ENABLE_4BIT_KV_CACHE
-  uint64_t sf_stride_page = kv_stride_page;
-  uint64_t sf_stride_token = kv_stride_token;
-  uint64_t sf_stride_head = kv_stride_head;
-  if (kSfCacheVLLM.has_value()) {
-    sf_stride_page = kSfCacheVLLM.value().stride(0);
-    sf_stride_token = kSfCacheVLLM.value().stride(-3);
-    sf_stride_head = kSfCacheVLLM.value().stride(-2);
-  }
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+  uint64_t sf_stride_page = kSfCacheVLLM.value().stride(0);
+  uint64_t sf_stride_token = kSfCacheVLLM.value().stride(-3);
+  uint64_t sf_stride_head = kSfCacheVLLM.value().stride(-2);
 #endif
 
 #if SPEC_DEC
+  uint32_t const* qCuSeqLensPtr =
+      qCuSeqLens.has_value()
+          ? reinterpret_cast<uint32_t const*>(qCuSeqLens.value().data_ptr())
+          : nullptr;
   MaskType const* maskPtr =
       mask.has_value() ? reinterpret_cast<MaskType const*>(mask.value().data_ptr()) : nullptr;
-  // Optional ragged Q: cumulative draft lengths [batchSize + 1]; when set,
-  // qSeqLen is the max draft length and q/mask/output are packed by qCuSeqLens.
-  SeqLenDataType const* qCuSeqLensPtr =
-      qCuSeqLens.has_value()
-          ? reinterpret_cast<SeqLenDataType const*>(qCuSeqLens.value().data_ptr())
-          : nullptr;
 #endif
 
   void* kSfCachePtr = kSfCacheVLLM.has_value() ? kSfCacheVLLM.value().data_ptr() : nullptr;
   void* vSfCachePtr = vSfCacheVLLM.has_value() ? vSfCacheVLLM.value().data_ptr() : nullptr;
 
-#if USE_SM90_MHA
-  if (run_sm90_fp8_mha) {
-#if SPEC_DEC
-    // mha_sm90.cu's qCuSeqLens path is unvalidated; fail loudly.
-    TVM_FFI_ICHECK(qCuSeqLensPtr == nullptr)
-        << "ragged Q (q_cu_seq_lens) is not supported on the SM90 fp8 MHA path";
-#endif
-    launchHopperF8MHAFlashInfer(
-        multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
-        reinterpret_cast<OutputHead*>(output.data_ptr()),
+  mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
+           reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-        rcpOutScale,
+           rcpOutScale,
 #endif
-        reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
-        reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
-        reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
-        reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
-        reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
+           reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
+           reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
+           reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+           reinterpret_cast<GMemCacheHeadSf*>(kSfCachePtr),
+           reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
+#endif
+           reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+           reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale,
+           kvScalePtr,
 #if SPEC_DEC
-        qSeqLen, qCuSeqLensPtr, maskPtr,
+           qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
-        reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-        reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
-        kv_stride_head, stream);
-    return;
-  }
+           reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+           reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
+           kv_stride_head,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+           sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
-
-  launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
-                      reinterpret_cast<OutputHead*>(output.data_ptr()),
-#if LOW_PREC_OUTPUT
-                      rcpOutScale,
-#endif
-                      reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
-                      reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
-                      reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
-#if ENABLE_4BIT_KV_CACHE
-                      reinterpret_cast<GMemCacheHeadSf*>(kSfCachePtr),
-                      reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
-#endif
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
-                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
-                      kvCacheScale, kvScalePtr,
-#if SPEC_DEC
-                      qSeqLen, qCuSeqLensPtr, maskPtr,
-#endif
-                      reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-                      reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,
-                      kv_stride_token, kv_stride_head,
-#if ENABLE_4BIT_KV_CACHE
-                      sf_stride_page, sf_stride_token, sf_stride_head,
-#endif
-                      stream);
+           static_cast<uint32_t>(localSubSeqOverride),
+           static_cast<uint32_t>(reductionSubSeqTotal),
+           static_cast<uint32_t>(reductionSubSeqBase), applySpecMask, stream);
 }
 #endif

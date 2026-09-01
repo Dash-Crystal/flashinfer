@@ -83,7 +83,8 @@ using MaskType = uint32_t;
 static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is enabled.");
 #endif
 
-// 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
+// 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3;
+// 3: block-scaled NVFP4; 4: block-scaled FP8 E4M3.
 #ifndef CACHE_ELEM_ENUM
 #define CACHE_ELEM_ENUM 2
 #endif
@@ -92,6 +93,12 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define ENABLE_4BIT_KV_CACHE 1
 #else
 #define ENABLE_4BIT_KV_CACHE 0
+#endif
+
+#if CACHE_ELEM_ENUM == 3 || CACHE_ELEM_ENUM == 4
+#define ENABLE_BLOCK_SCALED_KV_CACHE 1
+#else
+#define ENABLE_BLOCK_SCALED_KV_CACHE 0
 #endif
 
 // don't modify
@@ -240,3 +247,15 @@ struct ElemTypeConverter<3> {
   static constexpr int QuantVectorSize = 16;
 };
 #endif
+
+// Specialization for elemTypeEnum = 4 (E4M3 payload, E4M3 scale per 16 values).
+// The scale is deliberately finer grained and higher precision than OCP MXFP8's
+// UE8M0 scale per 32 values. Attention arithmetic remains in INPUT_ELEM.
+template <>
+struct ElemTypeConverter<4> {
+  using Type = __nv_fp8_e4m3;
+  using ContainerType = __nv_fp8_e4m3;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = __nv_fp8_e4m3;
+  static constexpr int QuantVectorSize = 16;
+};

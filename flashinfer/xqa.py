@@ -47,6 +47,7 @@ def get_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool = False,
+    block_scaled_fp8: bool = False,
 ):
     # Ragged Q must reuse the uniform module unless it changes the compile
     # flags; a second cache entry would re-register the same torch op.
@@ -61,6 +62,7 @@ def get_xqa_module(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        block_scaled_fp8,
     )
 
 
@@ -75,6 +77,7 @@ def _get_xqa_module_cached(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool,
+    block_scaled_fp8: bool,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -86,6 +89,7 @@ def _get_xqa_module_cached(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        block_scaled_fp8,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -120,6 +124,10 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        local_subseq_override: int,
+        reduction_subseq_total: int,
+        reduction_subseq_base: int,
+        apply_spec_mask: bool,
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -148,6 +156,10 @@ def _get_xqa_module_cached(
             semaphores,
             workspace_buffer,
             enable_pdl,
+            local_subseq_override,
+            reduction_subseq_total,
+            reduction_subseq_base,
+            apply_spec_mask,
         )
 
     @register_fake_op(op_name)
@@ -176,6 +188,10 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        local_subseq_override: int,
+        reduction_subseq_total: int,
+        reduction_subseq_base: int,
+        apply_spec_mask: bool,
     ) -> None:
         pass
 
@@ -206,6 +222,10 @@ def xqa(
     rcp_out_scale: float = 1.0,
     q_seq_len: int = 1,
     mask: Optional[torch.Tensor] = None,
+    local_subseq_override: int = 0,
+    reduction_subseq_total: int = 0,
+    reduction_subseq_base: int = 0,
+    apply_spec_mask: bool = True,
     *,
     q_cu_seq_lens: Optional[torch.Tensor] = None,
     k_sf_cache: Optional[torch.Tensor] = None,
@@ -230,10 +250,10 @@ def xqa(
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as k_cache. When using NVFP4 KV, the data type is torch.uint8, and the last dimension should be `head_dim / 2`.
     k_sf_cache: Optional[torch.Tensor]
-        Optional scale factor cache tensor for the K cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        Optional scale factor cache tensor for the K cache. Use with NVFP4 or block-scaled FP8 KV. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as v_sf_cache. Data type should be torch.uint8.
     v_sf_cache: Optional[torch.Tensor]
-        Optional scale factor cache tensor for the V cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        Optional scale factor cache tensor for the V cache. Use with NVFP4 or block-scaled FP8 KV. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as k_sf_cache. Data type should be torch.uint8.
     page_table : torch.Tensor
         Page table tensor with shape ``batch_size, nb_pages_per_seq``.
@@ -298,6 +318,19 @@ def xqa(
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
         cumulative offsets.
+    local_subseq_override : int, default=0
+        Override XQA's local sequence-split heuristic. A positive value is
+        required when contributing this launch to a cross-launch reduction.
+    reduction_subseq_total : int, default=0
+        Total sequence splits across format-specialized launches. Zero keeps
+        the ordinary single-launch reduction behavior.
+    reduction_subseq_base : int, default=0
+        First global scratch slot owned by this launch. Format launches must
+        use disjoint contiguous ranges and the same workspace and semaphores.
+    apply_spec_mask : bool, default=True
+        Whether this page run contains the live query span. Historical
+        compressed page runs set this to False; the A16 active-span run keeps
+        the supplied mask.
 
     Note
     ----
@@ -320,6 +353,15 @@ def xqa(
         sm_count = get_device_sm_count(q.device)
 
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
+    if reduction_subseq_total:
+        if local_subseq_override <= 0:
+            raise ValueError(
+                "local_subseq_override must be positive for cross-launch reduction"
+            )
+        if reduction_subseq_base < 0 or (
+            reduction_subseq_base + local_subseq_override > reduction_subseq_total
+        ):
+            raise ValueError("cross-launch reduction scratch range is out of bounds")
 
     use_ragged_q = q_cu_seq_lens is not None
     if use_ragged_q:
@@ -366,6 +408,25 @@ def xqa(
     use_sliding_window = sliding_win_size > 0
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
+    block_scaled_fp8 = (
+        k_cache.dtype == torch.float8_e4m3fn
+        and k_sf_cache is not None
+        and v_sf_cache is not None
+    )
+    if (k_sf_cache is None) != (v_sf_cache is None):
+        raise ValueError(
+            "K and V scale caches must either both be present or both be absent"
+        )
+    if block_scaled_fp8:
+        expected_sf_dim = head_dim // 16
+        if k_sf_cache.dtype != torch.uint8 or v_sf_cache.dtype != torch.uint8:
+            raise TypeError(
+                "block-scaled FP8 scale caches must use torch.uint8 storage"
+            )
+        if k_sf_cache.shape[-1] != expected_sf_dim:
+            raise ValueError(
+                f"block-scaled FP8 requires {expected_sf_dim} scale bytes per head"
+            )
 
     if output.dtype == torch.float8_e4m3fn:
         assert k_cache.dtype == torch.float8_e4m3fn, (
@@ -387,7 +448,7 @@ def xqa(
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
     ):
-        run_sm90_fp8_mha = True
+        run_sm90_fp8_mha = not block_scaled_fp8
     else:
         run_sm90_fp8_mha = False
 
@@ -401,6 +462,10 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
+    # Generic speculative XQA consumes q_seq_len at runtime. Reuse one module
+    # for larger verification and continued-prefill widths; only the small
+    # swap-AB specialization requires the exact static query width.
+    module_q_seq_len = q_seq_len if q_seq_len * head_group_ratio <= 32 else 33
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -409,8 +474,9 @@ def xqa(
         head_group_ratio,
         use_sliding_window,
         output.dtype,
-        q_seq_len,
+        module_q_seq_len,
         use_ragged_q,
+        block_scaled_fp8,
     )
 
     if q_seq_len > 1:
@@ -452,6 +518,10 @@ def xqa(
         q_seq_len,
         q_cu_seq_lens,
         mask,
+        local_subseq_override,
+        reduction_subseq_total,
+        reduction_subseq_base,
+        apply_spec_mask,
     )
 
 
