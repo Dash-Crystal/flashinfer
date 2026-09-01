@@ -1649,6 +1649,58 @@ def get_fp4_kv_quantization_module():
     ) -> None:
         module.nvfp4_kv_quant(input, global_scale, fp4_output, block_scales)
 
+    @register_custom_op(
+        "flashinfer::bsfp8_kv_quant",
+        mutates_args=("fp8_output", "block_scales"),
+    )
+    def bsfp8_kv_quant(
+        input: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp8_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        module.bsfp8_kv_quant(input, global_scale, fp8_output, block_scales)
+
+    @register_custom_op(
+        "flashinfer::bsfp8_kv_quant_slots",
+        mutates_args=(
+            "k_output",
+            "v_output",
+            "k_block_scales",
+            "v_block_scales",
+            "page_format",
+            "page_error_stats",
+        ),
+    )
+    def bsfp8_kv_quant_slots(
+        k_input: torch.Tensor,
+        v_input: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_global_scale: torch.Tensor,
+        v_global_scale: torch.Tensor,
+        k_output: torch.Tensor,
+        v_output: torch.Tensor,
+        k_block_scales: torch.Tensor,
+        v_block_scales: torch.Tensor,
+        page_format: torch.Tensor,
+        page_error_stats: torch.Tensor,
+        routing_thresholds: torch.Tensor,
+    ) -> None:
+        module.bsfp8_kv_quant_slots(
+            k_input,
+            v_input,
+            slot_mapping,
+            k_global_scale,
+            v_global_scale,
+            k_output,
+            v_output,
+            k_block_scales,
+            v_block_scales,
+            page_format,
+            page_error_stats,
+            routing_thresholds,
+        )
+
     @register_fake_op("flashinfer::nvfp4_kv_quant")
     def _fake_nvfp4_kv_quant(
         input: torch.Tensor,
@@ -1658,7 +1710,37 @@ def get_fp4_kv_quantization_module():
     ) -> None:
         pass
 
-    return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
+    @register_fake_op("flashinfer::bsfp8_kv_quant")
+    def _fake_bsfp8_kv_quant(
+        input: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp8_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        pass
+
+    @register_fake_op("flashinfer::bsfp8_kv_quant_slots")
+    def _fake_bsfp8_kv_quant_slots(
+        k_input: torch.Tensor,
+        v_input: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_global_scale: torch.Tensor,
+        v_global_scale: torch.Tensor,
+        k_output: torch.Tensor,
+        v_output: torch.Tensor,
+        k_block_scales: torch.Tensor,
+        v_block_scales: torch.Tensor,
+        page_format: torch.Tensor,
+        page_error_stats: torch.Tensor,
+        routing_thresholds: torch.Tensor,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(
+        nvfp4_kv_quant=nvfp4_kv_quant,
+        bsfp8_kv_quant=bsfp8_kv_quant,
+        bsfp8_kv_quant_slots=bsfp8_kv_quant_slots,
+    )
 
 
 _NVFP4_BLOCK_SIZE = 16

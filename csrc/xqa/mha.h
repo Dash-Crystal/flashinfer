@@ -59,7 +59,7 @@ using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
 using GMemCacheHead = Vec<CacheElemConverter::ContainerType,
                           exactDiv(validElemsPerHead, CacheElemConverter::ElemsPerContainer)>;
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
 using GMemCacheHeadSf = Vec<CacheElemConverter::ScalingFactorType,
                             exactDiv(validElemsPerHead, CacheElemConverter::QuantVectorSize)>;
 #endif
@@ -81,7 +81,7 @@ using PaddedInputHead = Vec<InputElem, headElems>;
 // For 4 bit KV cache, each 16 elements (64b) are padded with 64b to match 128b banks.
 using PaddedCacheHead = Vec<CacheElemConverter::ContainerType, headElems>;
 
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
 using PaddedCacheHeadSf =
     Vec<CacheElemConverter::ScalingFactorType, headElems / CacheElemConverter::QuantVectorSize>;
 #endif
@@ -124,7 +124,7 @@ void launchMHA(
 #endif
     float const* attentionSinks,  // [headGrpSize]
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
     GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
 #endif
 
@@ -150,7 +150,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM,
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
                          GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
 #endif
                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
@@ -161,6 +161,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+                         uint64_t sf_stride_page, uint64_t sf_stride_token,
+                         uint64_t sf_stride_head,
+#endif
+                         uint32_t localSubSeqOverride, uint32_t reductionSubSeqTotal,
+                         uint32_t reductionSubSeqBase, bool applySpecMask,
                          cudaStream_t stream);
 
 void launchHopperF8MHA(
@@ -182,6 +188,9 @@ void launchHopperF8MHA(
 #endif
     float const* attentionSinks,  // [headGrpSize]
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+    GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
+#endif
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
                           // KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
@@ -194,7 +203,12 @@ void launchHopperF8MHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
+    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
+    uint64_t kv_stride_token, uint64_t kv_stride_head,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
+#endif
+    cudaStream_t stream);
 
 void launchHopperF8MHAFlashInfer(
     uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize, float qScale,
@@ -203,13 +217,23 @@ void launchHopperF8MHAFlashInfer(
     float rcpOutScale,
 #endif
     InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+    GMemCacheHead* vCacheVLLM,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+    GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
+#endif
+    KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
     uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
     uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream);
+    uint64_t kv_stride_token, uint64_t kv_stride_head,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
+#endif
+    uint32_t localSubSeqOverride,
+    uint32_t reductionSubSeqTotal, uint32_t reductionSubSeqBase, bool applySpecMask,
+    cudaStream_t stream);
 
 void launchMLA(
     cudaDeviceProp const& prop,

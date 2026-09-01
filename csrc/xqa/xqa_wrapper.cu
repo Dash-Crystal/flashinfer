@@ -57,8 +57,10 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
-                 int64_t qSeqLen, Optional<TensorView> mask, TensorView semaphores,
-                 TensorView scratch, bool enable_pdl) {
+                 int64_t qSeqLen, Optional<TensorView> qCuSeqLens,
+                 Optional<TensorView> mask, TensorView semaphores,
+                 TensorView scratch, bool enable_pdl, int64_t localSubSeqOverride,
+                 int64_t reductionSubSeqTotal, int64_t reductionSubSeqBase, bool applySpecMask) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -79,8 +81,17 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
   uint64_t kv_stride_page = kCacheVLLM.stride(0);
   uint64_t kv_stride_token = kCacheVLLM.stride(-3);
   uint64_t kv_stride_head = kCacheVLLM.stride(-2);
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+  uint64_t sf_stride_page = kSfCacheVLLM.value().stride(0);
+  uint64_t sf_stride_token = kSfCacheVLLM.value().stride(-3);
+  uint64_t sf_stride_head = kSfCacheVLLM.value().stride(-2);
+#endif
 
 #if SPEC_DEC
+  uint32_t const* qCuSeqLensPtr =
+      qCuSeqLens.has_value()
+          ? reinterpret_cast<uint32_t const*>(qCuSeqLens.value().data_ptr())
+          : nullptr;
   MaskType const* maskPtr =
       mask.has_value() ? reinterpret_cast<MaskType const*>(mask.value().data_ptr()) : nullptr;
 #endif
@@ -96,7 +107,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
            reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
            reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
-#if ENABLE_4BIT_KV_CACHE
+#if ENABLE_BLOCK_SCALED_KV_CACHE
            reinterpret_cast<GMemCacheHeadSf*>(kSfCachePtr),
            reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
 #endif
@@ -104,10 +115,16 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale,
            kvScalePtr,
 #if SPEC_DEC
-           qSeqLen, nullptr, maskPtr,
+           qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
            reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
            reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
-           kv_stride_head, stream);
+           kv_stride_head,
+#if ENABLE_BLOCK_SCALED_KV_CACHE
+           sf_stride_page, sf_stride_token, sf_stride_head,
+#endif
+           static_cast<uint32_t>(localSubSeqOverride),
+           static_cast<uint32_t>(reductionSubSeqTotal),
+           static_cast<uint32_t>(reductionSubSeqBase), applySpecMask, stream);
 }
 #endif

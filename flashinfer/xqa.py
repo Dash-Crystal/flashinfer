@@ -42,6 +42,7 @@ def get_xqa_module(
     use_sliding_window: bool,
     output_dtype: torch.dtype,
     q_seq_len: int,
+    block_scaled_fp8: bool,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -52,6 +53,7 @@ def get_xqa_module(
         use_sliding_window,
         output_dtype,
         q_seq_len,
+        block_scaled_fp8,
     ).build_and_load()
 
     if q_seq_len > 1:
@@ -60,7 +62,7 @@ def get_xqa_module(
         use_spec_dec = False
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -86,7 +88,12 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        local_subseq_override: int,
+        reduction_subseq_total: int,
+        reduction_subseq_base: int,
+        apply_spec_mask: bool,
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -110,14 +117,19 @@ def get_xqa_module(
             1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
             None if isinstance(kv_scale, float) else kv_scale,
             q_seq_len,
+            q_cu_seq_lens,
             mask,
             semaphores,
             workspace_buffer,
             enable_pdl,
+            local_subseq_override,
+            reduction_subseq_total,
+            reduction_subseq_base,
+            apply_spec_mask,
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -142,7 +154,12 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        local_subseq_override: int,
+        reduction_subseq_total: int,
+        reduction_subseq_base: int,
+        apply_spec_mask: bool,
     ) -> None:
         pass
 
@@ -172,7 +189,12 @@ def xqa(
     enable_pdl: Optional[bool] = None,
     rcp_out_scale: float = 1.0,
     q_seq_len: int = 1,
+    q_cu_seq_lens: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
+    local_subseq_override: int = 0,
+    reduction_subseq_total: int = 0,
+    reduction_subseq_base: int = 0,
+    apply_spec_mask: bool = True,
     *,
     k_sf_cache: Optional[torch.Tensor] = None,
     v_sf_cache: Optional[torch.Tensor] = None,
@@ -196,10 +218,10 @@ def xqa(
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as k_cache. When using NVFP4 KV, the data type is torch.uint8, and the last dimension should be `head_dim / 2`.
     k_sf_cache: Optional[torch.Tensor]
-        Optional scale factor cache tensor for the K cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        Optional scale factor cache tensor for the K cache. Use with NVFP4 or block-scaled FP8 KV. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as v_sf_cache. Data type should be torch.uint8.
     v_sf_cache: Optional[torch.Tensor]
-        Optional scale factor cache tensor for the V cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        Optional scale factor cache tensor for the V cache. Use with NVFP4 or block-scaled FP8 KV. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as k_sf_cache. Data type should be torch.uint8.
     page_table : torch.Tensor
         Page table tensor with shape ``batch_size, nb_pages_per_seq``.
@@ -243,11 +265,28 @@ def xqa(
         Reciprocal of output scale factor.
     q_seq_len : int, default=1
         Query sequence length. When > 1, enables speculative decoding mode.
+    q_cu_seq_lens : Optional[torch.Tensor], default=None
+        Optional cumulative query lengths for ragged speculative decoding.
+        Shape: ``[batch_size + 1]``. Values are offsets into flattened Q/output
+        storage and each request length must be at most ``q_seq_len``.
     mask : Optional[torch.Tensor], default=None
         Causal attention mask for speculative decoding mode (when ``q_seq_len > 1``).
         Shape: ``[batch_size, q_seq_len, mask_size_per_row]`` where
         ``mask_size_per_row = ((q_seq_len + 31) // 32) * 2``.
         Data type should be torch.uint16 (bit-packed format, aligned to 32 bits).
+    local_subseq_override : int, default=0
+        Override XQA's local sequence-split heuristic. A positive value is
+        required when contributing this launch to a cross-launch reduction.
+    reduction_subseq_total : int, default=0
+        Total sequence splits across format-specialized launches. Zero keeps
+        the ordinary single-launch reduction behavior.
+    reduction_subseq_base : int, default=0
+        First global scratch slot owned by this launch. Format launches must
+        use disjoint contiguous ranges and the same workspace and semaphores.
+    apply_spec_mask : bool, default=True
+        Whether this page run contains the live speculative tail. Historical
+        compacted page runs set this to False; exactly one final run retains
+        the causal mask.
 
     Note
     ----
@@ -265,9 +304,18 @@ def xqa(
         sm_count = get_device_sm_count(q.device)
 
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
+    if reduction_subseq_total:
+        if local_subseq_override <= 0:
+            raise ValueError(
+                "local_subseq_override must be positive for cross-launch reduction"
+            )
+        if reduction_subseq_base < 0 or (
+            reduction_subseq_base + local_subseq_override > reduction_subseq_total
+        ):
+            raise ValueError("cross-launch reduction scratch range is out of bounds")
 
     # Infer parameters from tensors
-    batch_size = q.shape[0]
+    batch_size = q_cu_seq_lens.numel() - 1 if q_cu_seq_lens is not None else q.shape[0]
     num_q_heads = q.shape[-2]
     head_dim = q.shape[-1]
 
@@ -282,6 +330,25 @@ def xqa(
     use_sliding_window = sliding_win_size > 0
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
+    block_scaled_fp8 = (
+        k_cache.dtype == torch.float8_e4m3fn
+        and k_sf_cache is not None
+        and v_sf_cache is not None
+    )
+    if (k_sf_cache is None) != (v_sf_cache is None):
+        raise ValueError(
+            "K and V scale caches must either both be present or both be absent"
+        )
+    if block_scaled_fp8:
+        expected_sf_dim = head_dim // 16
+        if k_sf_cache.dtype != torch.uint8 or v_sf_cache.dtype != torch.uint8:
+            raise TypeError(
+                "block-scaled FP8 scale caches must use torch.uint8 storage"
+            )
+        if k_sf_cache.shape[-1] != expected_sf_dim:
+            raise ValueError(
+                f"block-scaled FP8 requires {expected_sf_dim} scale bytes per head"
+            )
 
     if output.dtype == torch.float8_e4m3fn:
         assert k_cache.dtype == torch.float8_e4m3fn, (
@@ -303,7 +370,11 @@ def xqa(
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
     ):
-        run_sm90_fp8_mha = True
+        # Per-tensor FP8 uses the Hopper WGMMA specialization. Block-scaled
+        # FP8 deliberately stays on the register-dequantized warp-MMA path:
+        # expanding every compressed tile into an A16 shared-memory tile is
+        # slower even with a correctly overlapped TMA producer.
+        run_sm90_fp8_mha = not block_scaled_fp8
     else:
         run_sm90_fp8_mha = False
 
@@ -317,6 +388,10 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
+    # Generic speculative XQA uses runtime q_seq_len. Share one compiled module
+    # across larger verification and continued-prefill widths; only the small
+    # swap-AB specialization needs the exact static length.
+    module_q_seq_len = q_seq_len if q_seq_len * head_group_ratio <= 32 else 33
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -325,11 +400,19 @@ def xqa(
         head_group_ratio,
         use_sliding_window,
         output.dtype,
-        q_seq_len,
+        module_q_seq_len,
+        block_scaled_fp8,
     )
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
+        if q_cu_seq_lens is not None:
+            if q_cu_seq_lens.dtype not in (torch.int32, torch.uint32):
+                raise TypeError("q_cu_seq_lens must use int32 or uint32")
+            if q_cu_seq_lens.ndim != 1 or q_cu_seq_lens.numel() != batch_size + 1:
+                raise ValueError("q_cu_seq_lens must have shape [batch_size + 1]")
+            if not q_cu_seq_lens.is_cuda or not q_cu_seq_lens.is_contiguous():
+                raise ValueError("q_cu_seq_lens must be contiguous CUDA storage")
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
 
@@ -356,7 +439,12 @@ def xqa(
         workspace_buffer,
         enable_pdl,
         q_seq_len,
+        q_cu_seq_lens,
         mask,
+        local_subseq_override,
+        reduction_subseq_total,
+        reduction_subseq_base,
+        apply_spec_mask,
     )
 
 
