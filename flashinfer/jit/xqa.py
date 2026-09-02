@@ -60,7 +60,6 @@ def gen_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int = 1,
     use_ragged_q: bool = False,
-    block_scaled_fp8: bool = False,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -72,7 +71,7 @@ def gen_xqa_module(
         )
 
     if kv_cache_dtype == torch.float8_e4m3fn:
-        flag_kv_cache_dtype = [f"-DCACHE_ELEM_ENUM={4 if block_scaled_fp8 else 2}"]
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=2"]
     elif kv_cache_dtype == torch.int8:
         flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=1"]
     elif kv_cache_dtype == torch.uint8:
@@ -139,7 +138,7 @@ def gen_xqa_module(
         jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
     ]
 
-    if _has_sm90_target() and not block_scaled_fp8:
+    if _has_sm90_target():
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
@@ -150,7 +149,7 @@ def gen_xqa_module(
     # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
     ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags

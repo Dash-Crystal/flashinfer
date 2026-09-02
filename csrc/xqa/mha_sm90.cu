@@ -50,9 +50,8 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #define SWAP_AB (!SPEC_DEC)
 #endif
 
-#define IS_SUPPORTED_F16_CASE                                                        \
-  ((CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4) && !SPEC_DEC && SWAP_AB &&       \
-   !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+#define IS_SUPPORTED_F16_CASE \
+  (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -60,10 +59,9 @@ inline constexpr bool swapAB = SWAP_AB;
 
 static_assert((inputElemSize == cacheElemSize && mha::is_same_v<InputElem, CacheElem>) ||
               inputElemSize > cacheElemSize);
-using MathElem = mha::conditional_t<
-    CACHE_ELEM_ENUM == 4, half,
+using MathElem =
     mha::conditional_t<(inputElemSize > cacheElemSize && mha::is_same_v<CacheElem, int8_t>),
-                       InputElem, CacheElem>>;
+                       InputElem, CacheElem>;
 
 constexpr uint32_t gmmaWarpsPerGrp = 4;
 constexpr uint32_t gmmaWarpGrpSize = warp_size * gmmaWarpsPerGrp;
@@ -105,22 +103,16 @@ constexpr uint32_t multiBlockMinNbTilesPerCta = 1;  // 3; // @fixme: need tuning
 constexpr uint32_t multiBlockMinNbTiles = multiBlockMinNbTilesPerCta * 2;
 constexpr uint32_t nbWarps = gemm0NbWarps + gemm1NbWarps + nbIOWarps;
 
-constexpr uint32_t cacheHeadPartBytes =
-    mha::min(CACHE_ELEM_ENUM == 4 ? mathHeadBytes : paddedCacheHeadBytes, 128U);
+constexpr uint32_t cacheHeadPartBytes = mha::min(paddedCacheHeadBytes, 128U);
 constexpr uint32_t cacheHeadNbParts =
-    exactDiv(CACHE_ELEM_ENUM == 4 ? mathHeadBytes : paddedCacheHeadBytes,
-             cacheHeadPartBytes);  // @fixme: support divUp in the future
+    exactDiv(paddedCacheHeadBytes, cacheHeadPartBytes);  // @fixme: support divUp in the future
 constexpr uint32_t cacheHeadPartElems = exactDiv(headElems, cacheHeadNbParts);
-constexpr uint32_t cacheLoadHeadPartBytes = cacheElemSize * cacheHeadPartElems;
 constexpr uint32_t swizzleBytes = cacheHeadPartBytes;
 static_assert(swizzleBytes == 128 || swizzleBytes == 64 || swizzleBytes == 32);
 
 constexpr bool needInputCvt =
-    inputElemSize > cacheElemSize&& mha::is_same_v<CacheElem, __nv_fp8_e4m3> &&
-    CACHE_ELEM_ENUM != 4;
-constexpr bool needCacheCvt =
-    inputElemSize > cacheElemSize&&
-    (mha::is_same_v<CacheElem, int8_t> || CACHE_ELEM_ENUM == 4);
+    inputElemSize > cacheElemSize&& mha::is_same_v<CacheElem, __nv_fp8_e4m3>;
+constexpr bool needCacheCvt = inputElemSize > cacheElemSize&& mha::is_same_v<CacheElem, int8_t>;
 static_assert(needInputCvt || needCacheCvt || mha::is_same_v<InputElem, CacheElem>);
 
 using ShmQWiseVec = Vec<float, ctaNbQHeads>;
@@ -129,11 +121,10 @@ constexpr uint32_t qPartBytes = mha::min(mathHeadBytes, 128U);
 constexpr uint32_t nbQParts = exactDiv(mathHeadBytes, qPartBytes);
 constexpr uint32_t grainsPerQPart = exactDiv(qPartBytes, grainBytes);
 
-constexpr uint32_t xPartBytes =
-    mha::min<uint32_t>(sizeof(MathElem) * gemm0CtaTileNbTokens, 128U);
-constexpr uint32_t nbXParts = exactDiv(sizeof(MathElem) * gemm0CtaTileNbTokens, xPartBytes);
+constexpr uint32_t xPartBytes = mha::min(cacheElemSize * gemm0CtaTileNbTokens, 128U);
+constexpr uint32_t nbXParts = exactDiv(cacheElemSize * gemm0CtaTileNbTokens, xPartBytes);
 constexpr uint32_t grainsPerXPart = exactDiv(xPartBytes, grainBytes);
-constexpr uint32_t cacheElemsPerGrain = exactDiv(grainBytes, sizeof(MathElem));
+constexpr uint32_t cacheElemsPerGrain = exactDiv(grainBytes, cacheElemSize);
 
 constexpr uint32_t grainsPerIOHead = exactDiv(ioHeadBytes, grainBytes);
 constexpr uint32_t grainsPerPaddedInputHead = exactDiv(paddedInputHeadBytes, grainBytes);
@@ -147,40 +138,24 @@ using PaddedOutHead = PaddedInputHead;
 #pragma endregion Config
 
 struct alignas(128) SharedMem {
-  // The BSFP8 producer writes these arrays with ordinary shared-memory stores.
-  // Unlike the A16 TMA destination, their member offsets are not guaranteed to
-  // start at a complete GMMA swizzle-pattern boundary (1 KiB for 128B rows).
-  // Address-relative indexing must therefore account for the runtime base.
-  using KBuffer =
-      Array2D<LdGrain, gemm0CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes),
-              CACHE_ELEM_ENUM != 4>;
+  using KBuffer = Array2D<LdGrain, gemm0CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes)>;
   static constexpr uint32_t nbKBuf = 2;
   KBuffer k[nbKBuf];  // as is loaded from global mem.
-#if CACHE_ELEM_ENUM == 4
-  using KLoadBuffer =
-      Array2D<LdGrain, gemm0CtaTileNbTokens, exactDiv(cacheLoadHeadPartBytes, grainBytes), false>;
-  KLoadBuffer kLoad[nbKBuf];
-#endif
-  using XBuffer =
-      Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerXPart, CACHE_ELEM_ENUM != 4>, nbXParts>;
+  using XBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerXPart>, nbXParts>;
   static constexpr uint32_t nbXBuf =
       2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens
                ? 1
                : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
   using VBuffer =
       Vec<Array2D<LdGrain, gemm1CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes),
-                  CACHE_ELEM_ENUM != 4 && sizeof(XBuffer) % (cacheHeadPartBytes * 8) == 0>,
+                  sizeof(XBuffer) % (cacheHeadPartBytes * 8) == 0>,
           cacheHeadNbParts>;
 #if !SWAP_AB
   using VTBuffer =
       Array2D<LdGrain, headElems, exactDiv(gemm1CtaTileNbTokens, cacheElemsPerGrain), true>;
 #endif
   static constexpr uint32_t nbVBuf = 2;
-#if CACHE_ELEM_ENUM == 4
-  using VLoadBuffer = Vec<KLoadBuffer, cacheHeadNbParts>;
-  VLoadBuffer vLoad[nbVBuf];
-#endif
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
   using OutSwizzleBuf = Array2D<LdGrain, ctaNbQHeads, grainsPerPaddedInputHead>;
 #elif CACHE_ELEM_ENUM == 2
   using OutSwizzleBuf = Array2D<Vec<Vec<InputElem, 4>, 4>, ctaNbQHeads, exactDiv(headElems, 4 * 4)>;
@@ -213,8 +188,7 @@ struct alignas(128) SharedMem {
     return reusedXVOutSwizzleBuf[i].outSwizzle;
   }
 
-  using QBuffer =
-      Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart, CACHE_ELEM_ENUM != 4>, nbQParts>;
+  using QBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart>, nbQParts>;
   QBuffer q;  // For gmma math. Conversion done if needed.
 
   // @fixme: move these into reusedXVOutSwizzleBuf
@@ -234,23 +208,13 @@ struct alignas(128) SharedMem {
 
   static constexpr uint32_t nbPagesPerTile =
       gemm0CtaTileNbTokens >= tokensPerPage ? exactDiv(gemm0CtaTileNbTokens, tokensPerPage) : 1;
-  // K and V each need one page-list buffer per compressed pipeline stage.  The
-  // TMA producer is allowed to run one stage ahead of the dequantizer, so a
-  // single page list would otherwise be overwritten before the scale gather.
-  Vec<KVCachePageIndex, nbPagesPerTile> pages[2][nbKBuf];
+  Vec<KVCachePageIndex, nbPagesPerTile> pages[2];  // one for K and one for V
 
   // mem barriers
 
   CtaBarrierPair qBar;
   CtaBarrierPair kBar[nbKBuf];
   CtaBarrierPair vBar[nbVBuf];
-#if CACHE_ELEM_ENUM == 4
-  // Compressed-ready/free barriers.  These have a deliberately shorter
-  // lifetime than kBar/vBar: the compressed buffer becomes free as soon as
-  // expansion finishes, while the expanded A16 buffer remains owned by WGMMA.
-  CtaBarrierPair kLoadBar[nbKBuf];
-  CtaBarrierPair vLoadBar[nbVBuf];
-#endif
 #if !SWAP_AB
   CtaBarrierPair vtBar[nbVBuf];
 #endif
@@ -275,13 +239,13 @@ static_assert(smemSize < kMAX_SMEM_SIZE);
 constexpr uint32_t nbQLdWarps = needInputCvt ? nbIOWarps - 2 : 1;
 constexpr uint32_t nbQLdThrds = warp_size * nbQLdWarps;
 
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2
 template <uint32_t nbThrds = 64, uint32_t beamWidth = 1>
 struct F16QToF8Converter {
   static_assert(inputElemSize == 2);
   using F16Vec = Vec<InputElem, exactDiv(grainBytes, inputElemSize)>;
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
-  using ShmVec = Vec<MathElem, exactDiv(grainBytes, sizeof(MathElem))>;
+#if CACHE_ELEM_ENUM == 0
+  using ShmVec = F16Vec;
 #elif CACHE_ELEM_ENUM == 2
   using F8Vec = Vec<CacheElem, exactDiv(grainBytes, inputElemSize)>;
   using ShmVec = F8Vec;
@@ -315,17 +279,11 @@ struct KVTilePartLoader {
   static constexpr uint32_t nbPagesPerTile = SharedMem::nbPagesPerTile;
 
   uint32_t const nbKHeads;
-  bool const isK;
   KVCacheList<usePagedKVCache> const& cacheList;
   uint32_t const idxReq;
   uint32_t const idxHeadGrp;
 
   CUtensorMap const& tensorMap;
-#if CACHE_ELEM_ENUM == 4
-  uint64_t const sfStridePage;
-  uint64_t const sfStrideToken;
-  uint64_t const sfStrideHead;
-#endif
   uint32_t const nbPages;  // for bound check
   Vec<KVCachePageIndex, nbPagesPerTile>& pages;
   uint32_t idxTileRef;  // idxTile used to load the pages
@@ -334,26 +292,14 @@ struct KVTilePartLoader {
   __device__ KVTilePartLoader(bool isK, uint32_t nbKHeads,
                               KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq,
                               uint32_t idxHeadGrp, CUtensorMap const& tensorMap, uint32_t nbPages,
-#if CACHE_ELEM_ENUM == 4
-                              uint64_t sfStridePage, uint64_t sfStrideToken, uint64_t sfStrideHead,
-#endif
                               Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf);
   // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
   template <uint32_t nbTokens, bool alignedForSwizzle>
   __device__ void loadData(
       Array2D<LdGrain, nbTokens, exactDiv(cacheHeadPartBytes, grainBytes), alignedForSwizzle>& dst,
       uint32_t idxTile, uint32_t idxPart, CtaBarrier& bar);
-#if CACHE_ELEM_ENUM == 4
-  __device__ void loadBSFP8Data(SharedMem::KLoadBuffer& dst, uint32_t idxTile, uint32_t idxPart,
-                                CtaBarrier& bar);
-  __device__ void dequantBSFP8Data(SharedMem::KBuffer& dst,
-                                   SharedMem::KLoadBuffer const& src, uint32_t idxTile,
-                                   uint32_t idxPart, float globalScale, uint32_t groupRank,
-                                   uint32_t groupSize);
-#endif
 
   __device__ void loadPages(uint32_t idxTile);
-  __device__ inline void bindPages(uint32_t idxTile) { idxTileRef = idxTile; }
   __device__ GMemKVCacheHead& getHead(uint32_t pos);
 };
 
@@ -688,9 +634,6 @@ __launch_bounds__(128 * 3)
         float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         __grid_constant__ CUtensorMap const tensorMapVLLMK,
         __grid_constant__ CUtensorMap const tensorMapVLLMV,
-#if CACHE_ELEM_ENUM == 4
-        uint64_t sfStridePage, uint64_t sfStrideToken, uint64_t sfStrideHead,
-#endif
 #if SPEC_DEC
         SpecDecParams const specDecParams,
 #endif
@@ -789,25 +732,14 @@ __launch_bounds__(128 * 3)
   extern __shared__ char smemByteBuf[];
   assert(dynamicSmemSize() >= sizeof(SharedMem));
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
+
   constexpr uint32_t nbBuffers = 2;
   static_assert(nbBuffers == SharedMem::nbKBuf && nbBuffers == SharedMem::nbVBuf &&
                 nbBuffers == SharedMem::nbXBuf);
   if (wid < nbBuffers) {
     if (warpElectSync()) {
-      smem.kBar[wid].initialize(
-          gemm0NbThrds + (CACHE_ELEM_ENUM == 4 ? 2 * warp_size : 0),
-          gemm0NbThrds + (CACHE_ELEM_ENUM == 4 ? 2 * warp_size : warp_size));
-      smem.vBar[wid].initialize(
-          gemm1NbThrds + (CACHE_ELEM_ENUM == 4 ? 2 * warp_size : 0),
-          gemm1NbThrds + (CACHE_ELEM_ENUM == 4 ? 2 * warp_size : warp_size));
-#if CACHE_ELEM_ENUM == 4
-      smem.kLoadBar[wid].initialize(1, 2 * warp_size);
-      smem.vLoadBar[wid].initialize(1, 2 * warp_size);
-      // Bootstrap both compressed stages as empty.  Later phases are advanced
-      // only by the dequantizer after its final read from the compressed tile.
-      unused(smem.kLoadBar[wid].consumed.arrive(2 * warp_size));
-      unused(smem.vLoadBar[wid].consumed.arrive(2 * warp_size));
-#endif
+      smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
+      smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #if !SWAP_AB
       smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
@@ -847,9 +779,7 @@ __launch_bounds__(128 * 3)
     }
 
     float const qkScale =
-        (CACHE_ELEM_ENUM == 4
-             ? 1.f
-             : qScaleValue * (isKVCacheQuantized ? kvCacheScaleValue : 1.f)) *
+        qScaleValue * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     uint32_t const warpRank = warpIdx.x;
 
@@ -890,11 +820,7 @@ __launch_bounds__(128 * 3)
         assert(matDescKBase == gmma::makeMatDesc(nullptr, 0, SharedMem::KBuffer::rowBytes * 8,
                                                  gmma::getSwizzleMode<true>(SharedMem::KBuffer{}))
                                    .raw());
-#if CACHE_ELEM_ENUM == 4
-        kBar.produced.wait(kBar.produced.arrive());
-#else
         arrive_tx_and_wait(kBar.produced, exactDiv(sizeof(SharedMem::KBuffer), gemm0NbThrds));
-#endif
         // if (threadIdx.x == 0) {
         //     printf("************* part %u *******\n", idxPart);
         //     printf("q:\n");
@@ -1042,8 +968,7 @@ __launch_bounds__(128 * 3)
 #else
     constexpr float oScale = 1.F;
 #endif
-    float const xvoScale =
-        xScale * (isKVCacheQuantized && CACHE_ELEM_ENUM != 4 ? kvCacheScaleValue : 1.f) * oScale;
+    float const xvoScale = xScale * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) * oScale;
 
     Gemm1Acc acc{};  // init to zeros to avoid runtime checking for first gmma instruction.
     gmma::fence();
@@ -1054,11 +979,7 @@ __launch_bounds__(128 * 3)
       auto const idxVBuf = idxIter % SharedMem::nbVBuf;
       auto const idxXBuf = idxVBuf;
       auto& vBar = smem.vBar[idxVBuf];
-#if CACHE_ELEM_ENUM == 4
-      vBar.produced.wait(vBar.produced.arrive());
-#else
       arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
-#endif
       auto const& vBuf = smem.vBuf(idxVBuf);
 #if !SWAP_AB
       CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
@@ -1135,7 +1056,7 @@ __launch_bounds__(128 * 3)
           gmma::makeMatDesc(nullptr, 0, SharedMem::XBuffer::Elem::rowBytes * 8,
                             gmma::getSwizzleMode<true>(SharedMem::XBuffer::Elem{}))
               .raw();
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
       auto const descVBase =
           gmma::makeMatDesc(nullptr, 0, SharedMem::VBuffer::Elem::rowBytes * 8,
                             gmma::getSwizzleMode<true>(SharedMem::VBuffer::Elem{}))
@@ -1202,7 +1123,7 @@ __launch_bounds__(128 * 3)
 #endif
 #pragma unroll
         for (uint32_t idxInstM = 0; idxInstM < gemm1NbGmmaInstM; idxInstM++) {
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
           auto const descV =
               addAddr(descVBase, &vBuf[idxInstM](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
           gmma::mma_async_shmA<MathElem, ctaNbQHeads, true, false>(
@@ -1378,142 +1299,9 @@ __launch_bounds__(128 * 3)
       // fence is needed.
       asm volatile("fence.proxy.async.shared::cta;\n");
       unused(smem.qBar.produced.arrive());
-    }
-#if CACHE_ELEM_ENUM == 4
-    // Tile pipeline for block-scaled FP8 cache pages:
-    //
-    //   warp 0: Q once, then TMA K[C(i+1)] and expand half of K[C(i)]
-    //   warp 1: gather K scales and expand the other half of K[C(i)]
-    //   warp 2: TMA V[C(i+1)] and expand half of V[C(i)]
-    //   warp 3: gather V scales and expand the other half of V[C(i)]
-    //
-    // The two loadBar pairs protect the short-lived compressed buffers.  The
-    // existing kBar/vBar pairs independently protect the longer-lived A16
-    // buffers consumed by WGMMA.  Consequently TMA for i+1 overlaps both the
-    // expansion of i and tensor-core consumption of i-1.
-    if (warpIdx.x < 2) {  // K lookahead producer + 64-lane expansion group
-      constexpr uint32_t cvtGroupSize = 2 * warp_size;
-      uint32_t const cvtGroupRank = warpIdx.x * warp_size + laneId();
-      uint32_t const nbKPartsGlobal = nbIters * cacheHeadNbParts;
-      if (warpIdx.x == 0) {
-        auto& loadBar = smem.kLoadBar[0];
-        loadBar.consumed.wait_parity(toParity<SharedMem::nbKBuf>(0));
-        KVTilePartLoader loader{true,       nbKHeads,       cacheList, idxReq,
-                                idxHeadGrp, tensorMapVLLMK, nbPages,
-                                sfStridePage, sfStrideToken, sfStrideHead, smem.pages[0][0]};
-        loader.loadPages(idxKTileInit);
-        if (warpElectSync()) {
-          loader.loadBSFP8Data(smem.kLoad[0], idxKTileInit, 0, loadBar.produced);
-          unused(arrive_tx(loadBar.produced, sizeof(SharedMem::KLoadBuffer)));
-        }
-      }
-      for (uint32_t idxPartGlobal = 0; idxPartGlobal < nbKPartsGlobal; idxPartGlobal++) {
-        uint32_t const idxIter = idxPartGlobal / cacheHeadNbParts;
-        uint32_t const idxPart = idxPartGlobal % cacheHeadNbParts;
-        uint32_t const idxKTile = idxKTileInit + idxIter * nbSubSeq;
-        uint32_t const idxKBuf = idxPartGlobal % SharedMem::nbKBuf;
-        uint32_t const idxPartNextGlobal = idxPartGlobal + 1;
-        if (warpIdx.x == 0 && idxPartNextGlobal < nbKPartsGlobal) {
-          uint32_t const idxIterNext = idxPartNextGlobal / cacheHeadNbParts;
-          uint32_t const idxPartNext = idxPartNextGlobal % cacheHeadNbParts;
-          uint32_t const idxKTileNext = idxKTileInit + idxIterNext * nbSubSeq;
-          uint32_t const idxKBufNext = idxPartNextGlobal % SharedMem::nbKBuf;
-          auto& loadBarNext = smem.kLoadBar[idxKBufNext];
-          loadBarNext.consumed.wait_parity(
-              toParity<SharedMem::nbKBuf>(idxPartNextGlobal));
-          KVTilePartLoader loaderNext{true,       nbKHeads,       cacheList, idxReq,
-                                      idxHeadGrp, tensorMapVLLMK, nbPages,
-                                      sfStridePage, sfStrideToken, sfStrideHead,
-                                      smem.pages[0][idxKBufNext]};
-          loaderNext.loadPages(idxKTileNext);
-          if (warpElectSync()) {
-            loaderNext.loadBSFP8Data(smem.kLoad[idxKBufNext], idxKTileNext, idxPartNext,
-                                     loadBarNext.produced);
-            unused(arrive_tx(loadBarNext.produced, sizeof(SharedMem::KLoadBuffer)));
-          }
-        }
-        auto& loadBar = smem.kLoadBar[idxKBuf];
-        loadBar.produced.wait_parity(toParity<SharedMem::nbKBuf>(idxPartGlobal));
-        auto& kBar = smem.kBar[idxKBuf];
-        kBar.consumed.arrive_and_wait();
-        KVTilePartLoader loader{true,       nbKHeads,       cacheList, idxReq,
-                                idxHeadGrp, tensorMapVLLMK, nbPages,
-                                sfStridePage, sfStrideToken, sfStrideHead,
-                                smem.pages[0][idxKBuf]};
-        loader.bindPages(idxKTile);
-        loader.dequantBSFP8Data(smem.k[idxKBuf], smem.kLoad[idxKBuf], idxKTile, idxPart,
-                                qScaleValue * kvCacheScaleValue, cvtGroupRank, cvtGroupSize);
-        asm volatile("fence.proxy.async.shared::cta;\n");
-        unused(kBar.produced.arrive());
-        unused(loadBar.consumed.arrive());
-      }
-    } else {  // V lookahead producer + 64-lane expansion group
-      constexpr uint32_t cvtGroupSize = 2 * warp_size;
-      uint32_t const cvtGroupRank = (warpIdx.x - 2) * warp_size + laneId();
-      if (warpIdx.x == 2) {
-        auto& loadBar = smem.vLoadBar[0];
-        loadBar.consumed.wait_parity(toParity<SharedMem::nbVBuf>(0));
-        KVTilePartLoader loader{false,      nbKHeads,       cacheList, idxReq,
-                                idxHeadGrp, tensorMapVLLMV, nbPages,
-                                sfStridePage, sfStrideToken, sfStrideHead, smem.pages[1][0]};
-        loader.loadPages(idxVTileInit);
-        if (warpElectSync()) {
-#pragma unroll
-          for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-            loader.loadBSFP8Data(smem.vLoad[0][idxPart], idxVTileInit, idxPart,
-                                 loadBar.produced);
-          }
-          unused(arrive_tx(loadBar.produced, sizeof(SharedMem::VLoadBuffer)));
-        }
-      }
-      for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
-        uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
-        uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
-        uint32_t const idxIterNext = idxIter + 1;
-        if (warpIdx.x == 2 && idxIterNext < nbIters) {
-          uint32_t const idxVTileNext = idxVTileInit + idxIterNext * nbSubSeq;
-          uint32_t const idxVBufNext = idxIterNext % SharedMem::nbVBuf;
-          auto& loadBarNext = smem.vLoadBar[idxVBufNext];
-          loadBarNext.consumed.wait_parity(toParity<SharedMem::nbVBuf>(idxIterNext));
-          KVTilePartLoader loaderNext{false,      nbKHeads,       cacheList, idxReq,
-                                      idxHeadGrp, tensorMapVLLMV, nbPages,
-                                      sfStridePage, sfStrideToken, sfStrideHead,
-                                      smem.pages[1][idxVBufNext]};
-          loaderNext.loadPages(idxVTileNext);
-          if (warpElectSync()) {
-#pragma unroll
-            for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-              loaderNext.loadBSFP8Data(smem.vLoad[idxVBufNext][idxPart], idxVTileNext,
-                                       idxPart, loadBarNext.produced);
-            }
-            unused(arrive_tx(loadBarNext.produced, sizeof(SharedMem::VLoadBuffer)));
-          }
-        }
-        auto& loadBar = smem.vLoadBar[idxVBuf];
-        loadBar.produced.wait_parity(toParity<SharedMem::nbVBuf>(idxIter));
-        auto& vBar = smem.vBar[idxVBuf];
-        vBar.consumed.arrive_and_wait();
-        KVTilePartLoader loader{false,      nbKHeads,       cacheList, idxReq,
-                                idxHeadGrp, tensorMapVLLMV, nbPages,
-                                sfStridePage, sfStrideToken, sfStrideHead,
-                                smem.pages[1][idxVBuf]};
-        loader.bindPages(idxVTile);
-#pragma unroll
-        for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-          loader.dequantBSFP8Data(smem.vBuf(idxVBuf)[idxPart], smem.vLoad[idxVBuf][idxPart],
-                                  idxVTile, idxPart, kvCacheScaleValue, cvtGroupRank,
-                                  cvtGroupSize);
-        }
-        asm volatile("fence.proxy.async.shared::cta;\n");
-        unused(vBar.produced.arrive());
-        unused(loadBar.consumed.arrive());
-      }
-    }
-#else
-    else if (warpIdx.x == nbQLdWarps) {  // load k
+    } else if (warpIdx.x == nbQLdWarps) {  // load k
       KVTilePartLoader kTilePartLoader{true,       nbKHeads,       cacheList, idxReq,
-                                       idxHeadGrp, tensorMapVLLMK, nbPages,
-                                       smem.pages[0][0]};
+                                       idxHeadGrp, tensorMapVLLMK, nbPages,   smem.pages[0]};
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxKTile = idxKTileInit + idxIter * nbSubSeq;
         kTilePartLoader.loadPages(idxKTile);
@@ -1572,8 +1360,7 @@ __launch_bounds__(128 * 3)
       }
     } else if (warpIdx.x == nbQLdWarps + 1) {  // load v
       KVTilePartLoader vTileLoader{false,      nbKHeads,       cacheList, idxReq,
-                                   idxHeadGrp, tensorMapVLLMV, nbPages,
-                                   smem.pages[1][0]};
+                                   idxHeadGrp, tensorMapVLLMV, nbPages,   smem.pages[1]};
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
         vTileLoader.loadPages(idxVTile);
@@ -1622,7 +1409,6 @@ __launch_bounds__(128 * 3)
         __syncwarp();
       }
     }
-#endif
   }
   __syncthreads();
   uint32_t const nbBarriers = &smem.gemm1WarpGrpBar - &smem.qBar.produced + 1;
@@ -1818,7 +1604,7 @@ __launch_bounds__(128 * 3)
 #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && BEAM_WIDTH == 1
 }
 
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 2
 template <uint32_t nbThrds, uint32_t beamWidth>
 __device__ inline typename F16QToF8Converter<nbThrds, beamWidth>::RegData
 F16QToF8Converter<nbThrds, beamWidth>::load(uint32_t tid, TinyPtr<IOHead const> const& src,
@@ -1877,13 +1663,9 @@ __device__ inline void F16QToF8Converter<nbThrds, beamWidth>::store(
     if (idxGrain >= totalGrains) {
       break;
     }
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
-    static_assert(sizeof(ShmVec) == grainBytes);
-#if CACHE_ELEM_ENUM == 4
-    ShmVec const shmData = convert<MathElem>(data[iter]);
-#else
+#if CACHE_ELEM_ENUM == 0
+    static_assert(inputElemSize == cacheElemSize);
     ShmVec const& shmData = data[iter];
-#endif
     uint32_t const r = idxGrain / grainsPerPaddedInputHead;
     BoundedVal<grainsPerPaddedInputHead> const c = {idxGrain % grainsPerPaddedInputHead};
 
@@ -1913,22 +1695,12 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
                                                      KVCacheList<usePagedKVCache> const& cacheList,
                                                      uint32_t idxReq, uint32_t idxHeadGrp,
                                                      CUtensorMap const& tensorMap, uint32_t nbPages,
-#if CACHE_ELEM_ENUM == 4
-                                                     uint64_t sfStridePage, uint64_t sfStrideToken,
-                                                     uint64_t sfStrideHead,
-#endif
                                                      Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf)
     : nbKHeads{nbKHeads},
-      isK{isK},
       cacheList{cacheList},
       idxReq{idxReq},
       idxHeadGrp{idxHeadGrp},
       tensorMap{tensorMap},
-#if CACHE_ELEM_ENUM == 4
-      sfStridePage{sfStridePage},
-      sfStrideToken{sfStrideToken},
-      sfStrideHead{sfStrideHead},
-#endif
       nbPages{nbPages},
       pages{pageBuf},
       baseOffset{idxReq * cacheList.maxNbPagesPerSeq} {}
@@ -1953,58 +1725,6 @@ __device__ inline void KVTilePartLoader::loadData(
     }
   }
 }
-
-#if CACHE_ELEM_ENUM == 4
-__device__ inline void KVTilePartLoader::loadBSFP8Data(SharedMem::KLoadBuffer& dst,
-                                                       uint32_t idxTile, uint32_t idxPart,
-                                                       CtaBarrier& bar) {
-  constexpr uint32_t nbTokens = gemm0CtaTileNbTokens;
-  assert(idxTile == idxTileRef);
-  if constexpr (nbTokens < tokensPerPage) {
-    assert(nbPagesPerTile == 1);
-    uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
-    tma::loadAsync(&dst, tensorMap,
-                   DimsLE<4>{partElems * idxPart, idxHeadGrp, offset, (uint32_t)pages[0]}, bar);
-  } else {
-#pragma unroll
-    for (uint32_t i = 0; i < nbPagesPerTile; i++) {
-      tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
-                     DimsLE<4>{partElems * idxPart, idxHeadGrp, 0, (uint32_t)pages[i]}, bar);
-    }
-  }
-}
-
-__device__ inline void KVTilePartLoader::dequantBSFP8Data(
-    SharedMem::KBuffer& dst, SharedMem::KLoadBuffer const& src, uint32_t idxTile,
-    uint32_t idxPart, float globalScale, uint32_t groupRank, uint32_t groupSize) {
-  assert(idxTile == idxTileRef);
-  constexpr uint32_t groupsPerRow =
-      exactDiv(partElems, CacheElemConverter::QuantVectorSize);
-  constexpr uint32_t nbGroups = gemm0CtaTileNbTokens * groupsPerRow;
-  auto const* base = reinterpret_cast<__nv_fp8_e4m3 const*>(
-      isK ? cacheList.kSfCacheVLLM : cacheList.vSfCacheVLLM);
-#pragma unroll
-  for (uint32_t group = groupRank; group < nbGroups; group += groupSize) {
-    uint32_t const token = group / groupsPerRow;
-    uint32_t const page = pages[token / tokensPerPage];
-    uint32_t const tokenInPage = token % tokensPerPage;
-    uint32_t const block = group % groupsPerRow;
-    auto const scale = base[page * sfStridePage + tokenInPage * sfStrideToken +
-                            idxHeadGrp * sfStrideHead + idxPart * groupsPerRow + block];
-    uint32_t const row = token;
-    auto const& srcGrain = src.template at<true>(row, block);
-    MathElem const sfInput = MathElem(float(scale) * globalScale);
-    uint16_t const sfBits = reinterpret_cast<uint16_t const&>(sfInput);
-#pragma unroll
-    for (uint32_t word = 0; word < 4; word++) {
-      auto data = convertKCacheWordToF16<MathElem, __nv_fp8_e4m3>(srcGrain[word]);
-      auto& dstGrain = dst.template at<true>(row, block * 2 + word / 2);
-      dstGrain[(word % 2) * 2] = applyF16ScalingFactor<MathElem>(data[0], sfBits);
-      dstGrain[(word % 2) * 2 + 1] = applyF16ScalingFactor<MathElem>(data[1], sfBits);
-    }
-  }
-}
-#endif
 
 __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile) {
   uint32_t const idxPageBeg = gemm0CtaTileNbTokens >= tokensPerPage
@@ -2246,11 +1966,11 @@ __device__ inline RegColWiseVec computeWarpColSum(Gemm0Acc& src) {
 __device__ inline void storeGemm0AccToShm(uint32_t warpRank, uint32_t lane,
                                           SharedMem::XBuffer& smemX, CtaBarrier& barConsumed,
                                           Gemm0Acc const& acc) {
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
   using F16Acc = Array2D<Vec<uint32_t, 2>, Gemm0Acc::rows, Gemm0Acc::cols>;
   F16Acc f16Acc;
-  reinterpret_cast<Vec<MathElem, sizeof(f16Acc) / sizeof(MathElem)>&>(f16Acc) =
-      convert<MathElem>(reinterpret_cast<Vec<float, sizeof(acc) / sizeof(float)> const&>(acc));
+  reinterpret_cast<Vec<CacheElem, sizeof(f16Acc) / sizeof(CacheElem)>&>(f16Acc) =
+      convert<CacheElem>(reinterpret_cast<Vec<float, sizeof(acc) / sizeof(float)> const&>(acc));
   static_assert(Gemm0Acc::size == 1 || Gemm0Acc::size % 2 == 0);
   uint32_t const idxHalf = lane / 16;
   uint32_t const idxInHalf = lane % 16;
@@ -2565,7 +2285,7 @@ __device__ inline Vec<RegMatAFrag, gemm1NbGmmaInstM> loadVTileTransposed(
   for (uint32_t i = 0; i < gemm1NbGmmaInstM; i++) {
     static_assert(exactDiv(gmma::instM, gmmaWarpsPerGrp) == grainBytes);
     constexpr uint32_t grainsPerPart = exactDiv(cacheHeadPartBytes, grainBytes);
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
     uint32_t idxRow = lane % 8;
     uint32_t idxMat = lane / 8;
     uint32_t c = idxMat % 2;
@@ -2845,7 +2565,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
                                             Gemm1Acc const& acc, CtaBarrier& warpGrpBar,
                                             uint32_t nbKHeads) {
   uint32_t const lane = laneId();
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
   uint32_t const idxMat = lane / 8;
   uint32_t const idxRow = lane % 8;
 #elif CACHE_ELEM_ENUM == 2
@@ -2857,7 +2577,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
 #pragma unroll
     for (uint32_t n = 0; n < Gemm1Acc::cols; n++) {
       auto const& core = acc(m, n);
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
       Vec<uint32_t, 2> f16Core;
       reinterpret_cast<Vec<InputElem, 4>&>(f16Core) =
           convert<InputElem>(reinterpret_cast<Vec<float, 4> const&>(core));
@@ -2898,7 +2618,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
     uint32_t const idxHead = idxHeadBase + iter * headsPerIter;
     if ((iter < nbWholeIters || idxHead < ctaNbValidQHeads) &&
         (!isHeadPadded || idxGrain < grainsPerIOHead)) {
-#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 4
+#if CACHE_ELEM_ENUM == 0
       auto const data = swizzleBuf.template at<true>(idxHead, idxGrain);
 #elif CACHE_ELEM_ENUM == 2
       auto const data = reinterpret_cast<Vec<LdGrain, 2>&>(
@@ -3209,9 +2929,6 @@ void launchHopperF8MHA(
 #endif
     float const* attentionSinks,  // [headGrpSize]
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-    GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
-#endif
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
                           // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
@@ -3225,11 +2942,7 @@ void launchHopperF8MHA(
     SpecDecParams const& specDecParams,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
-#endif
-    cudaStream_t stream) {
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
@@ -3279,11 +2992,8 @@ void launchHopperF8MHA(
     throw std::runtime_error("unsupported cache element type");
   }();
 
-  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-                                    kSfCacheVLLM, vSfCacheVLLM,
-#endif
-                                    kvCachePageList, seqLen, maxNbPagesPerSeq};
+  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
+                                    maxNbPagesPerSeq};
 
   auto const tensorMapVLLMK = makeTensorMapForPagedKVCache(
       kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
@@ -3314,9 +3024,6 @@ void launchHopperF8MHA(
                          beamSearchParams,
 #endif
                          batchSize, kvCacheScale, kvScalePtr, tensorMapVLLMK, tensorMapVLLMV,
-#if CACHE_ELEM_ENUM == 4
-                         sf_stride_page, sf_stride_token, sf_stride_head,
-#endif
 #if SPEC_DEC
                          specDecParams,
 #endif
@@ -3327,8 +3034,8 @@ void launchHopperF8MHA(
 
 static uint32_t configureKernel() {
   uint32_t size;
-  checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-  checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
+  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
+  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
   return size;
 }
 
@@ -3341,33 +3048,14 @@ void launchHopperF8MHAFlashInfer(
     float rcpOutScale,
 #endif
     InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-    GMemCacheHead* vCacheVLLM,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-    GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
-#endif
-    KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
     uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
     uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
-#endif
-    uint32_t localSubSeqOverride,
-    uint32_t reductionSubSeqTotal, uint32_t reductionSubSeqBase, bool applySpecMask,
-    cudaStream_t stream) {
-  if (!applySpecMask) {
-    throw std::runtime_error("mask-free speculative page runs are not implemented by SM90 FP8");
-  }
-  if (reductionSubSeqTotal != 0 || reductionSubSeqBase != 0) {
-    throw std::runtime_error("cross-launch XQA reduction is not implemented by the SM90 FP8 path");
-  }
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
-    if (localSubSeqOverride != 0) {
-      return localSubSeqOverride;
-    }
     float const factor = 0.25f;
     return mha::min<uint32_t>(
         mha::max<uint32_t>(
@@ -3395,11 +3083,8 @@ void launchHopperF8MHAFlashInfer(
     throw std::runtime_error("unsupported cache element type");
   }();
 
-  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM,
-#if ENABLE_BLOCK_SCALED_KV_CACHE
-                                    kSfCacheVLLM, vSfCacheVLLM,
-#endif
-                                    kvCachePageList, seqLen, maxNbPagesPerSeq};
+  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
+                                    maxNbPagesPerSeq};
 
   auto const tensorMapVLLMK = makeTensorMapForPagedKVCache(
       kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
@@ -3407,6 +3092,7 @@ void launchHopperF8MHAFlashInfer(
   auto const tensorMapVLLMV = makeTensorMapForPagedKVCache(
       vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
       gemm0CtaTileNbTokens, kv_stride_page, kv_stride_token, kv_stride_head);
+
   cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
                                              slidingWinSize,
@@ -3417,9 +3103,6 @@ void launchHopperF8MHAFlashInfer(
 #endif
                                              q, attentionSinks, cacheList, batchSize, kvCacheScale,
                                              kvScalePtr, tensorMapVLLMK, tensorMapVLLMV,
-#if CACHE_ELEM_ENUM == 4
-                                             sf_stride_page, sf_stride_token, sf_stride_head,
-#endif
 #if SPEC_DEC
                                              specDecParams,
 #endif

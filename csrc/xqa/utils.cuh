@@ -182,14 +182,6 @@ __device__ __host__ inline Vec<Dst, size> convert(Vec<Src, size> const& src) {
     if constexpr (size % 2 != 0) {
       dst[size - 1] = Dst{src[size - 1]};
     }
-  } else if constexpr (mha::is_same_v<Src, __nv_bfloat16> && mha::is_same_v<Dst, half>) {
-    for (uint32_t i = 0; i < size - 1; i += 2) {
-      reinterpret_cast<half2&>(dst[i]) = __float22half2_rn(
-          __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const&>(src[i])));
-    }
-    if constexpr (size % 2 != 0) {
-      dst[size - 1] = Dst{float(src[size - 1])};
-    }
   } else if constexpr (mha::is_same_v<Src, float> && mha::is_same_v<Dst, __nv_bfloat16>) {
     for (uint32_t i = 0; i < size - 1; i += 2) {
       reinterpret_cast<__nv_bfloat162&>(dst[i]) =
