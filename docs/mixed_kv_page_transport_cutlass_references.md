@@ -171,14 +171,35 @@ This stage is finished and is not to be reopened by transport-side work. The onl
 interface it exposes to the consumer is `page_format` (one byte per page) and the
 payload/scale tensors described in `include/flashinfer/attention/page_transport.cuh`.
 
-## 7. Acceptance targets
+## 7. Measurement discipline
+
+Two conditions on the shared test hosts silently invalidate numbers:
+
+1. **Import path.** The venvs carry an editable install of another checkout.
+   `python -m pytest` from a checkout imports that checkout (cwd is on
+   `sys.path`), but `python benchmarks/foo.py` puts the *script directory* on
+   `sys.path` and imports the editable one — the JIT then compiles the other
+   tree's `csrc`. Every measurement process must pin `PYTHONPATH` to the
+   checkout under test and print `flashinfer.__file__` and
+   `flashinfer.jit.env.FLASHINFER_CSRC_DIR`; the benchmark does this itself.
+   Confirm with the `-c` source paths in the workspace's `build.ninja`.
+2. **Co-tenant time slicing.** When another process holds the GPU (e.g. a
+   `VLLM::EngineCore` at 99% SM), kernels are time-sliced with it once a burst
+   exceeds roughly half a millisecond, and every sustained number is inflated
+   ~2x — memory-bound and compute-carrying kernels alike, with the threshold
+   depending on the burst length. Check `nvidia-smi pmon -s u`. On such a host
+   report short bursts (`--no-cuda-graph --repeats 3 --trials 15`) and treat
+   graph-replay medians as lower-quality; clocks and throttle reasons are not
+   the explanation (verify with `nvidia-smi --query-gpu=clocks.sm,...`).
+
+## 8. Acceptance targets and current state
 
 B = 17, S = 4096, H_kv = 8, D = 128, K+V, BF16 math. Bytes: A16 285 MB, E4M3 152 MB
 (payload + scales), E2M1 80 MB.
 
 | Device | A16 XQA (measured) | achieved BW | E4M3 target | E2M1 target |
 | --- | ---: | ---: | ---: | ---: |
-| H200 / sm90 (~4.8 TB/s) | 109 µs | 2.6 TB/s | ≤ 60 µs | ≤ 35 µs |
+| H200 / sm90 (~4.8 TB/s) | 88-91 µs | 3.2 TB/s | ≤ 60 µs | ≤ 35 µs |
 | RTX 5090 / sm120 (~1.8 TB/s) | 177 µs | 1.6 TB/s | ≤ 95 µs | ≤ 55 µs |
 
 Targets are the A16 kernel's *achieved* bandwidth applied to the compressed byte count,
@@ -187,5 +208,32 @@ is accepted only when (a) it is bit-exact against explicit A16 expansion, (b) th
 asserted kernel family matches the architecture (see `mixed_kv_page_transport_backends.md`),
 and (c) the same-run A16 baseline is within 10% of the figure above, so that the
 compressed result can be expressed as achieved bandwidth rather than as a ratio to a
-drifting baseline. A change that moves a compressed kernel from 761 µs to 675 µs against
-a 35 µs target is not evidence about the transport design and is not reported as such.
+drifting baseline.
+
+### sm90 state (TMA loader + converter warps, this branch)
+
+H200 burst measurements (Section 7 discipline; co-tenant present), q = 1, all 34
+transport cases bit-exact:
+
+| mode | before (cp.async gather) | now | tiles/s note |
+| --- | ---: | ---: | --- |
+| static A16 through the mixed kernel | 92 µs | 88-91 µs | reference cadence |
+| static E4M3 | 318 µs | ~104 µs | 3.1x faster; parity with A16 |
+| static E2M1 | 455 µs | ~111 µs | 4.1x faster; parity with A16 |
+| dynamic mixed pages | 477 µs | ~148 µs | 3.2x faster |
+
+What was fixed, in order of measured effect: (1) per-lane `cp.async` gather replaced by
+one elected-lane TMA per page (byte-typed maps for compressed pages, whole-head rows
+once per tile); (2) the load warp no longer waits for its scale copies before issuing
+the TMA (that serialized two DRAM round trips per part and alone accounted for the
+E4M3 deficit); (3) the grid is split by an occupancy-aware chooser so the ~83 KB CTA
+(two per SM) fills every SM without a straggler wave — 136 CTAs at two per SM had been
+running on 68 SMs.
+
+What remains: the compressed kernels now run at the same per-tile cadence as the A16
+kernel (~1.4 µs per 64-token tile per CTA), which is latency- rather than
+bandwidth-bound; K stage depth 3 and 4 measured identical to 2 (4 also drops to one CTA
+per SM). Turning the byte reduction into wall-clock therefore needs the cadence itself
+shortened — more tiles in flight per SM through the softmax/X hand-off, not deeper K/V
+staging — and that change applies to the A16 kernel equally. Compile time for
+`mha_sm90.cu` is ~4 s.

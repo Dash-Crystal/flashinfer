@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import statistics
 
@@ -112,6 +113,13 @@ def kv_transport_bytes(args: argparse.Namespace, mode: str) -> int:
 
 
 def main() -> None:
+    # A measurement is only attributable if the source tree it exercised is
+    # known: print the imported package and the csrc directory the JIT compiles.
+    import flashinfer
+    from flashinfer.jit import env as _jit_env
+
+    print(f"flashinfer: {flashinfer.__file__}", file=sys.stderr)
+    print(f"csrc: {_jit_env.FLASHINFER_CSRC_DIR}", file=sys.stderr)
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=17)
     parser.add_argument("--sequence-length", type=int, default=4096)
