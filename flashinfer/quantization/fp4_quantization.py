@@ -2035,6 +2035,80 @@ def get_fp4_kv_quantization_module():
     ) -> None:
         module.nvfp4_kv_quant(input, global_scale, fp4_output, block_scales)
 
+    @register_custom_op(
+        "flashinfer::bsfp8_kv_quant",
+        mutates_args=("fp8_output", "block_scales"),
+    )
+    def bsfp8_kv_quant(
+        input: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp8_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        module.bsfp8_kv_quant(input, global_scale, fp8_output, block_scales)
+
+    @register_custom_op(
+        "flashinfer::mixed_kv_quant_pages",
+        mutates_args=(
+            "fp8_k_output",
+            "fp8_v_output",
+            "fp8_k_block_scales",
+            "fp8_v_block_scales",
+            "fp4_k_output",
+            "fp4_v_output",
+            "fp4_k_block_scales",
+            "fp4_v_block_scales",
+            "page_format",
+            "page_router_stats",
+        ),
+    )
+    def mixed_kv_quant_pages(
+        k_input: torch.Tensor,
+        v_input: torch.Tensor,
+        reused_pages: torch.Tensor,
+        reused_count: torch.Tensor,
+        completed_pages: torch.Tensor,
+        completed_count: torch.Tensor,
+        fp8_k_global_scale: torch.Tensor,
+        fp8_v_global_scale: torch.Tensor,
+        fp4_k_global_scale: torch.Tensor,
+        fp4_v_global_scale: torch.Tensor,
+        fp8_k_output: torch.Tensor,
+        fp8_v_output: torch.Tensor,
+        fp8_k_block_scales: torch.Tensor,
+        fp8_v_block_scales: torch.Tensor,
+        fp4_k_output: torch.Tensor,
+        fp4_v_output: torch.Tensor,
+        fp4_k_block_scales: torch.Tensor,
+        fp4_v_block_scales: torch.Tensor,
+        page_format: torch.Tensor,
+        page_router_stats: torch.Tensor,
+        routing_thresholds: torch.Tensor,
+    ) -> None:
+        module.mixed_kv_quant_pages(
+            k_input,
+            v_input,
+            reused_pages,
+            reused_count,
+            completed_pages,
+            completed_count,
+            fp8_k_global_scale,
+            fp8_v_global_scale,
+            fp4_k_global_scale,
+            fp4_v_global_scale,
+            fp8_k_output,
+            fp8_v_output,
+            fp8_k_block_scales,
+            fp8_v_block_scales,
+            fp4_k_output,
+            fp4_v_output,
+            fp4_k_block_scales,
+            fp4_v_block_scales,
+            page_format,
+            page_router_stats,
+            routing_thresholds,
+        )
+
     @register_fake_op("flashinfer::nvfp4_kv_quant")
     def _fake_nvfp4_kv_quant(
         input: torch.Tensor,
@@ -2044,7 +2118,46 @@ def get_fp4_kv_quantization_module():
     ) -> None:
         pass
 
-    return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
+    @register_fake_op("flashinfer::bsfp8_kv_quant")
+    def _fake_bsfp8_kv_quant(
+        input: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp8_output: torch.Tensor,
+        block_scales: torch.Tensor,
+    ) -> None:
+        pass
+
+    @register_fake_op("flashinfer::mixed_kv_quant_pages")
+    def _fake_mixed_kv_quant_pages(
+        k_input: torch.Tensor,
+        v_input: torch.Tensor,
+        reused_pages: torch.Tensor,
+        reused_count: torch.Tensor,
+        completed_pages: torch.Tensor,
+        completed_count: torch.Tensor,
+        fp8_k_global_scale: torch.Tensor,
+        fp8_v_global_scale: torch.Tensor,
+        fp4_k_global_scale: torch.Tensor,
+        fp4_v_global_scale: torch.Tensor,
+        fp8_k_output: torch.Tensor,
+        fp8_v_output: torch.Tensor,
+        fp8_k_block_scales: torch.Tensor,
+        fp8_v_block_scales: torch.Tensor,
+        fp4_k_output: torch.Tensor,
+        fp4_v_output: torch.Tensor,
+        fp4_k_block_scales: torch.Tensor,
+        fp4_v_block_scales: torch.Tensor,
+        page_format: torch.Tensor,
+        page_router_stats: torch.Tensor,
+        routing_thresholds: torch.Tensor,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(
+        nvfp4_kv_quant=nvfp4_kv_quant,
+        bsfp8_kv_quant=bsfp8_kv_quant,
+        mixed_kv_quant_pages=mixed_kv_quant_pages,
+    )
 
 
 _NVFP4_BLOCK_SIZE = 16

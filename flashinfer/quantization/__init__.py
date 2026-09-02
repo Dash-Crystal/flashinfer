@@ -23,6 +23,17 @@ from .fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_dequantize_host,
 )
+from .kv_cache_fp8 import (
+    BlockScaledFP8,
+    MixedKVPagedCache,
+    dequantize_block_scaled_fp8,
+    dequantize_mxfp8_reference,
+    quantize_block_scaled_fp8,
+    quantize_block_scaled_fp8_cuda,
+    quantize_mxfp8_reference,
+    quantize_tensor_fp8_reference,
+    seal_mixed_kv_pages_cuda,
+)
 
 # Re-export FP4 quantization (all public symbols)
 from .fp4_quantization import (
@@ -76,6 +87,15 @@ __all__ = [
     "mxfp8_quantize",
     "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
+    "BlockScaledFP8",
+    "MixedKVPagedCache",
+    "quantize_block_scaled_fp8",
+    "quantize_block_scaled_fp8_cuda",
+    "seal_mixed_kv_pages_cuda",
+    "dequantize_block_scaled_fp8",
+    "quantize_mxfp8_reference",
+    "dequantize_mxfp8_reference",
+    "quantize_tensor_fp8_reference",
     # FP4
     "SfLayout",
     "block_scale_interleave",
