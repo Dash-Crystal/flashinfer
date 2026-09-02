@@ -108,3 +108,27 @@ CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_e
                                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return tensorMap;
 }
+
+CUtensorMap makeTensorMapForPackedKVPages(void const* addr, uint32_t rowBytes, uint32_t nbKHeads,
+                                          uint32_t tokensPerPage, uint32_t partBytes,
+                                          uint64_t stride_page_bytes, uint64_t stride_token_bytes,
+                                          uint64_t stride_head_bytes) {
+  if (partBytes % 16 != 0 || rowBytes % partBytes != 0) {
+    throw std::runtime_error("packed KV page box must be a 16-byte multiple dividing the row: " +
+                             std::to_string(partBytes) + " of " + std::to_string(rowBytes));
+  }
+  if (stride_head_bytes % 16 != 0 || stride_token_bytes % 16 != 0 || stride_page_bytes % 16 != 0) {
+    throw std::runtime_error("packed KV page strides must be 16-byte multiples");
+  }
+  CUtensorMap tensorMap{};
+  uint64_t const globalDims[] = {rowBytes, nbKHeads, tokensPerPage, 1U << 31};
+  uint64_t const globalStrides[] = {stride_head_bytes, stride_token_bytes, stride_page_bytes};
+  uint32_t const boxDims[] = {partBytes, 1, tokensPerPage, 1};
+  uint32_t const elemStrides[] = {1, 1, 1, 1};
+  checkCu(cuTensorMapEncodeTiled(&tensorMap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
+                                 const_cast<void*>(addr), globalDims, globalStrides, boxDims,
+                                 elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                 CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  return tensorMap;
+}
