@@ -28,6 +28,7 @@ from .jit.xqa import (
     swap_ab_eligible,
 )
 from .jit.utils import filename_safe_dtype_map
+from .quantization.kv_cache_fp8 import MixedKVPagedCache
 from .utils import (
     get_device_sm_count,
     register_custom_op,
@@ -47,6 +48,9 @@ def get_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool = False,
+    mixed_page: bool = False,
+    block_scaled_fp8: bool = False,
+    mixed_page_static_format: int = -1,
 ):
     # Ragged Q must reuse the uniform module unless it changes the compile
     # flags; a second cache entry would re-register the same torch op.
@@ -61,6 +65,9 @@ def get_xqa_module(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        mixed_page,
+        block_scaled_fp8,
+        mixed_page_static_format,
     )
 
 
@@ -75,6 +82,9 @@ def _get_xqa_module_cached(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool,
+    mixed_page: bool,
+    block_scaled_fp8: bool,
+    mixed_page_static_format: int,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -86,6 +96,9 @@ def _get_xqa_module_cached(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        mixed_page,
+        block_scaled_fp8,
+        mixed_page_static_format,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -109,6 +122,19 @@ def _get_xqa_module_cached(
         v_cache: torch.Tensor,
         k_sf_cache: Optional[torch.Tensor],
         v_sf_cache: Optional[torch.Tensor],
+        fp8_k_payload: Optional[torch.Tensor],
+        fp8_v_payload: Optional[torch.Tensor],
+        fp8_k_scales: Optional[torch.Tensor],
+        fp8_v_scales: Optional[torch.Tensor],
+        fp4_k_payload: Optional[torch.Tensor],
+        fp4_v_payload: Optional[torch.Tensor],
+        fp4_k_scales: Optional[torch.Tensor],
+        fp4_v_scales: Optional[torch.Tensor],
+        page_format: Optional[torch.Tensor],
+        fp8_k_global_scale: Optional[torch.Tensor],
+        fp8_v_global_scale: Optional[torch.Tensor],
+        fp4_k_global_scale: Optional[torch.Tensor],
+        fp4_v_global_scale: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
         seq_lens: torch.Tensor,
@@ -136,6 +162,19 @@ def _get_xqa_module_cached(
             v_cache,
             k_sf_cache,
             v_sf_cache,
+            fp8_k_payload,
+            fp8_v_payload,
+            fp8_k_scales,
+            fp8_v_scales,
+            fp4_k_payload,
+            fp4_v_payload,
+            fp4_k_scales,
+            fp4_v_scales,
+            page_format,
+            fp8_k_global_scale,
+            fp8_v_global_scale,
+            fp4_k_global_scale,
+            fp4_v_global_scale,
             page_table,
             max_seq_len,
             seq_lens,
@@ -165,6 +204,19 @@ def _get_xqa_module_cached(
         v_cache: torch.Tensor,
         k_sf_cache: Optional[torch.Tensor],
         v_sf_cache: Optional[torch.Tensor],
+        fp8_k_payload: Optional[torch.Tensor],
+        fp8_v_payload: Optional[torch.Tensor],
+        fp8_k_scales: Optional[torch.Tensor],
+        fp8_v_scales: Optional[torch.Tensor],
+        fp4_k_payload: Optional[torch.Tensor],
+        fp4_v_payload: Optional[torch.Tensor],
+        fp4_k_scales: Optional[torch.Tensor],
+        fp4_v_scales: Optional[torch.Tensor],
+        page_format: Optional[torch.Tensor],
+        fp8_k_global_scale: Optional[torch.Tensor],
+        fp8_v_global_scale: Optional[torch.Tensor],
+        fp4_k_global_scale: Optional[torch.Tensor],
+        fp4_v_global_scale: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
         seq_lens: torch.Tensor,
@@ -210,6 +262,8 @@ def xqa(
     q_cu_seq_lens: Optional[torch.Tensor] = None,
     k_sf_cache: Optional[torch.Tensor] = None,
     v_sf_cache: Optional[torch.Tensor] = None,
+    page_transport: Optional[MixedKVPagedCache] = None,
+    page_transport_static_format: Optional[int] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -366,8 +420,81 @@ def xqa(
     use_sliding_window = sliding_win_size > 0
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
+    mixed_page = page_transport is not None
+    mixed_page_static_format = (
+        -1 if page_transport_static_format is None else page_transport_static_format
+    )
+    if mixed_page_static_format not in (-1, 0, 1, 2):
+        raise ValueError("page_transport_static_format must be 0, 1, or 2")
+    if not mixed_page and mixed_page_static_format != -1:
+        raise ValueError("page_transport_static_format requires page_transport")
+    block_scaled_fp8 = (
+        not mixed_page
+        and k_cache.dtype == torch.float8_e4m3fn
+        and k_sf_cache is not None
+        and v_sf_cache is not None
+    )
+    if (k_sf_cache is None) != (v_sf_cache is None):
+        raise ValueError("K and V block-scale caches must be supplied together")
+    if block_scaled_fp8:
+        expected_scales = (*k_cache.shape[:-1], q.shape[-1] // 16)
+        if k_sf_cache.shape != expected_scales or v_sf_cache.shape != expected_scales:
+            raise ValueError(
+                "block-scaled FP8 caches require one E4M3 scale per 16 values"
+            )
+        if (
+            k_sf_cache.dtype != torch.float8_e4m3fn
+            or v_sf_cache.dtype != torch.float8_e4m3fn
+        ):
+            raise TypeError("block-scaled FP8 scale caches must use float8_e4m3fn")
+    if mixed_page:
+        if k_cache.dtype != q.dtype:
+            raise TypeError("mixed-page canonical A16 cache must match the query dtype")
+        expected_a16 = k_cache.shape
+        expected_fp4 = (*expected_a16[:-1], expected_a16[-1] // 2)
+        expected_scales = (*expected_a16[:-1], expected_a16[-1] // 16)
+        if page_transport.fp8_k_payload.shape != expected_a16 or page_transport.fp8_v_payload.shape != expected_a16:
+            raise ValueError("FP8 page payload pools must match the A16 cache shape")
+        if page_transport.fp4_k_payload.shape != expected_fp4 or page_transport.fp4_v_payload.shape != expected_fp4:
+            raise ValueError("FP4 page payload pools must pack two coefficients per byte")
+        block_scales = (
+            page_transport.fp8_k_scales,
+            page_transport.fp8_v_scales,
+            page_transport.fp4_k_scales,
+            page_transport.fp4_v_scales,
+        )
+        if any(x.shape != expected_scales or x.dtype != torch.uint8 for x in block_scales):
+            raise ValueError("each mixed-page block-scale pool must contain one E4M3 byte per 16 values")
+        if page_transport.fp8_k_payload.dtype != torch.float8_e4m3fn or page_transport.fp8_v_payload.dtype != torch.float8_e4m3fn:
+            raise TypeError("FP8 page payload pools must use float8_e4m3fn")
+        if page_transport.fp4_k_payload.dtype != torch.uint8 or page_transport.fp4_v_payload.dtype != torch.uint8:
+            raise TypeError("FP4 page payload pools must use packed uint8 storage")
+        if page_transport.page_format.dtype != torch.uint8 or page_transport.page_format.shape != (k_cache.shape[0],):
+            raise ValueError("page_format must contain one uint8 tag per physical page")
+        globals_ = (
+            page_transport.fp8_k_global_scale,
+            page_transport.fp8_v_global_scale,
+            page_transport.fp4_k_global_scale,
+            page_transport.fp4_v_global_scale,
+        )
+        if any(x.dtype != torch.float32 or x.numel() != 1 for x in globals_):
+            raise TypeError("mixed-page global scales must be scalar float32 tensors")
+        transport_operands = (
+            page_transport.fp8_k_payload,
+            page_transport.fp8_v_payload,
+            *block_scales,
+            page_transport.fp4_k_payload,
+            page_transport.fp4_v_payload,
+            page_transport.page_format,
+            *globals_,
+        )
+        if any(x.device != q.device for x in transport_operands):
+            raise ValueError("all mixed-page operands must be on the query device")
+        if any(x.stride(-1) != 1 for x in transport_operands if x.dim() > 0):
+            raise ValueError("mixed-page payload and metadata inner dimensions must be contiguous")
 
     if output.dtype == torch.float8_e4m3fn:
+        assert not mixed_page, "mixed-page XQA expands into A16 and requires A16 output"
         assert k_cache.dtype == torch.float8_e4m3fn, (
             "KV cache must be fp8 when output is fp8"
         )
@@ -383,9 +510,23 @@ def xqa(
             k_sf_cache = k_sf_cache.transpose(-3, -2)
         if v_sf_cache is not None:
             v_sf_cache = v_sf_cache.transpose(-3, -2)
+        if page_transport is not None:
+            page_transport = page_transport._replace(
+                fp8_k_payload=page_transport.fp8_k_payload.transpose(-3, -2),
+                fp8_v_payload=page_transport.fp8_v_payload.transpose(-3, -2),
+                fp8_k_scales=page_transport.fp8_k_scales.transpose(-3, -2),
+                fp8_v_scales=page_transport.fp8_v_scales.transpose(-3, -2),
+                fp4_k_payload=page_transport.fp4_k_payload.transpose(-3, -2),
+                fp4_v_payload=page_transport.fp4_v_payload.transpose(-3, -2),
+                fp4_k_scales=page_transport.fp4_k_scales.transpose(-3, -2),
+                fp4_v_scales=page_transport.fp4_v_scales.transpose(-3, -2),
+            )
     if (
-        k_cache.dtype == torch.float8_e4m3fn
-        and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and (
+            (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
+            or (mixed_page and q_seq_len == 1)
+        )
     ):
         run_sm90_fp8_mha = True
     else:
@@ -401,6 +542,9 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
+    # Large query spans share the runtime-width generic specialization.  Only
+    # the small SM90 swap-AB case bakes the exact width into tile geometry.
+    module_q_seq_len = q_seq_len if swap_ab_eligible(q_seq_len, head_group_ratio) else 33
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -409,8 +553,11 @@ def xqa(
         head_group_ratio,
         use_sliding_window,
         output.dtype,
-        q_seq_len,
+        module_q_seq_len,
         use_ragged_q,
+        mixed_page,
+        block_scaled_fp8,
+        mixed_page_static_format,
     )
 
     if q_seq_len > 1:
@@ -441,6 +588,19 @@ def xqa(
         v_cache,
         k_sf_cache,
         v_sf_cache,
+        None if page_transport is None else page_transport.fp8_k_payload,
+        None if page_transport is None else page_transport.fp8_v_payload,
+        None if page_transport is None else page_transport.fp8_k_scales,
+        None if page_transport is None else page_transport.fp8_v_scales,
+        None if page_transport is None else page_transport.fp4_k_payload,
+        None if page_transport is None else page_transport.fp4_v_payload,
+        None if page_transport is None else page_transport.fp4_k_scales,
+        None if page_transport is None else page_transport.fp4_v_scales,
+        None if page_transport is None else page_transport.page_format,
+        None if page_transport is None else page_transport.fp8_k_global_scale,
+        None if page_transport is None else page_transport.fp8_v_global_scale,
+        None if page_transport is None else page_transport.fp4_k_global_scale,
+        None if page_transport is None else page_transport.fp4_v_global_scale,
         page_table,
         max_seq_len,
         seq_lens,

@@ -3544,6 +3544,8 @@ def xqa_batch_decode_with_kv_cache(
         torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
     q_cu_seq_lens: Optional[torch.Tensor] = None,
+    page_transport=None,
+    page_transport_static_format: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -3723,6 +3725,8 @@ def xqa_batch_decode_with_kv_cache(
         q_seq_len=q_len_per_req,
         q_cu_seq_lens=q_cu_seq_lens,
         mask=mask,
+        page_transport=page_transport,
+        page_transport_static_format=page_transport_static_format,
     )
 
     return out

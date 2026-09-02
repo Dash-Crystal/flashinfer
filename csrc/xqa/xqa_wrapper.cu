@@ -55,6 +55,13 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  TensorView output, double rcpOutScale, TensorView q,
                  Optional<TensorView> attentionSinks, TensorView kCacheVLLM, TensorView vCacheVLLM,
                  Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
+                 Optional<TensorView> fp8KPayload, Optional<TensorView> fp8VPayload,
+                 Optional<TensorView> fp8KScales, Optional<TensorView> fp8VScales,
+                 Optional<TensorView> fp4KPayload, Optional<TensorView> fp4VPayload,
+                 Optional<TensorView> fp4KScales, Optional<TensorView> fp4VScales,
+                 Optional<TensorView> pageFormat, Optional<TensorView> fp8KGlobalScale,
+                 Optional<TensorView> fp8VGlobalScale, Optional<TensorView> fp4KGlobalScale,
+                 Optional<TensorView> fp4VGlobalScale,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
                  int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
@@ -82,6 +89,59 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
     sf_stride_token = kSfCacheVLLM.value().stride(-3);
     sf_stride_head = kSfCacheVLLM.value().stride(-2);
   }
+#endif
+
+#if ENABLE_MIXED_KV_CACHE
+  TVM_FFI_ICHECK(fp8KPayload.has_value() && fp8VPayload.has_value() &&
+                 fp8KScales.has_value() && fp8VScales.has_value() &&
+                 fp4KPayload.has_value() && fp4VPayload.has_value() &&
+                 fp4KScales.has_value() && fp4VScales.has_value() && pageFormat.has_value() &&
+                 fp8KGlobalScale.has_value() && fp8VGlobalScale.has_value() &&
+                 fp4KGlobalScale.has_value() && fp4VGlobalScale.has_value())
+      << "mixed-page XQA requires all fixed-shape transport operands";
+  auto const byte_stride = [](int64_t elements, uint64_t element_bytes) -> uint32_t {
+    TVM_FFI_ICHECK_GE(elements, 0) << "mixed-page XQA requires nonnegative strides";
+    uint64_t const bytes = uint64_t(elements) * element_bytes;
+    TVM_FFI_ICHECK_LE(bytes, uint64_t{UINT32_MAX})
+        << "mixed-page XQA byte stride exceeds the compact transport descriptor";
+    return static_cast<uint32_t>(bytes);
+  };
+  PageTransport pageTransport{};
+  pageTransport.page_format = reinterpret_cast<uint8_t const*>(pageFormat.value().data_ptr());
+  auto& a16 = pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kA16)];
+  a16.k_payload = kCacheVLLM.data_ptr();
+  a16.v_payload = vCacheVLLM.data_ptr();
+  a16.payload_stride = {byte_stride(kCacheVLLM.stride(0), sizeof(InputElem)),
+                        byte_stride(kCacheVLLM.stride(-3), sizeof(InputElem)),
+                        byte_stride(kCacheVLLM.stride(-2), sizeof(InputElem))};
+  auto& fp8 =
+      pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP8)];
+  fp8.k_payload = fp8KPayload.value().data_ptr();
+  fp8.v_payload = fp8VPayload.value().data_ptr();
+  fp8.k_scales = reinterpret_cast<uint8_t const*>(fp8KScales.value().data_ptr());
+  fp8.v_scales = reinterpret_cast<uint8_t const*>(fp8VScales.value().data_ptr());
+  fp8.k_global_scale = reinterpret_cast<float const*>(fp8KGlobalScale.value().data_ptr());
+  fp8.v_global_scale = reinterpret_cast<float const*>(fp8VGlobalScale.value().data_ptr());
+  fp8.payload_stride = {byte_stride(fp8KPayload.value().stride(0), 1),
+                        byte_stride(fp8KPayload.value().stride(-3), 1),
+                        byte_stride(fp8KPayload.value().stride(-2), 1)};
+  fp8.scale_stride = {byte_stride(fp8KScales.value().stride(0), 1),
+                      byte_stride(fp8KScales.value().stride(-3), 1),
+                      byte_stride(fp8KScales.value().stride(-2), 1)};
+  auto& fp4 =
+      pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP4)];
+  fp4.k_payload = fp4KPayload.value().data_ptr();
+  fp4.v_payload = fp4VPayload.value().data_ptr();
+  fp4.k_scales = reinterpret_cast<uint8_t const*>(fp4KScales.value().data_ptr());
+  fp4.v_scales = reinterpret_cast<uint8_t const*>(fp4VScales.value().data_ptr());
+  fp4.k_global_scale = reinterpret_cast<float const*>(fp4KGlobalScale.value().data_ptr());
+  fp4.v_global_scale = reinterpret_cast<float const*>(fp4VGlobalScale.value().data_ptr());
+  fp4.payload_stride = {byte_stride(fp4KPayload.value().stride(0), 1),
+                        byte_stride(fp4KPayload.value().stride(-3), 1),
+                        byte_stride(fp4KPayload.value().stride(-2), 1)};
+  fp4.scale_stride = {byte_stride(fp4KScales.value().stride(0), 1),
+                      byte_stride(fp4KScales.value().stride(-3), 1),
+                      byte_stride(fp4KScales.value().stride(-2), 1)};
 #endif
 
 #if SPEC_DEC
@@ -114,6 +174,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
         reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
         reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
         reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+#if ENABLE_MIXED_KV_CACHE
+        pageTransport,
+#endif
         reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
         reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
 #if SPEC_DEC
@@ -137,6 +200,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #if ENABLE_4BIT_KV_CACHE
                       reinterpret_cast<GMemCacheHeadSf*>(kSfCachePtr),
                       reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
+#endif
+#if ENABLE_MIXED_KV_CACHE
+                      pageTransport,
 #endif
                       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,

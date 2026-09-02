@@ -129,6 +129,7 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
         fp4_v_scales,
         torch.full((4,), 1, device="cuda", dtype=torch.uint8),
         torch.full((4, 2), torch.inf, device="cuda", dtype=torch.float32),
+        torch.empty((2, 16, 2, 4), device="cuda", dtype=torch.float32),
         torch.tensor(thresholds, device="cuda", dtype=torch.float32),
         fp8_global_scale,
         fp8_global_scale,

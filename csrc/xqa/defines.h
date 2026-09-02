@@ -83,16 +83,45 @@ using MaskType = uint32_t;
 static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is enabled.");
 #endif
 
-// 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
+// 0: half/bf16; 1: int8_t; 2: __nv_fp8_e4m3; 3: block-scaled
+// NVFP4; 4: block-scaled FP8 E4M3; 5: page-routed A16 / block-scaled FP8 / block-scaled FP4.  Enum 5
+// changes storage transport only: shared-memory tiles and attention math are
+// INPUT_ELEM.
 #ifndef CACHE_ELEM_ENUM
 #define CACHE_ELEM_ENUM 2
 #endif
 
-#if CACHE_ELEM_ENUM == 3
+// The original XQA NVFP4 path used ENABLE_4BIT_KV_CACHE as a proxy for
+// "block-scaled cache".  E4M3 uses the same per-16-value scale transport, but
+// not the packed-nibble ldmatrix layout.  Keep those two properties explicit.
+#if CACHE_ELEM_ENUM == 3 || CACHE_ELEM_ENUM == 4
 #define ENABLE_4BIT_KV_CACHE 1
 #else
 #define ENABLE_4BIT_KV_CACHE 0
 #endif
+
+#if CACHE_ELEM_ENUM == 3
+#define IS_PACKED_4BIT_KV_CACHE 1
+#else
+#define IS_PACKED_4BIT_KV_CACHE 0
+#endif
+
+#if CACHE_ELEM_ENUM == 3 || CACHE_ELEM_ENUM == 4
+#define ENABLE_BLOCK_SCALED_KV_CACHE 1
+#else
+#define ENABLE_BLOCK_SCALED_KV_CACHE 0
+#endif
+
+#if CACHE_ELEM_ENUM == 5
+#define ENABLE_MIXED_KV_CACHE 1
+#else
+#define ENABLE_MIXED_KV_CACHE 0
+#endif
+
+#ifndef MIXED_PAGE_STATIC_FORMAT
+#define MIXED_PAGE_STATIC_FORMAT -1
+#endif
+static_assert(MIXED_PAGE_STATIC_FORMAT >= -1 && MIXED_PAGE_STATIC_FORMAT <= 2);
 
 // don't modify
 #define USE_KV_CACHE true
@@ -111,7 +140,7 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // don't modify
 #define USE_BEAM_SEARCH (BEAM_WIDTH > 1)
 
-#if CACHE_ELEM_ENUM == 0
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
 #define PRAGMA_UNROLL_FP16_ONLY _Pragma("unroll")
 #else
 #define PRAGMA_UNROLL_FP16_ONLY _Pragma("unroll(1)")
@@ -171,7 +200,9 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1)
+#define GRP_LOAD_V \
+  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) || \
+   (HEAD_ELEMS == 256 && BEAM_WIDTH > 1))
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER
@@ -227,6 +258,26 @@ struct ElemTypeConverter<2> {
   static constexpr int ElemsPerContainer = 1;
   using ScalingFactorType = void;
   static constexpr int QuantVectorSize = 1;
+};
+
+template <>
+struct ElemTypeConverter<5> {
+  using Type = INPUT_ELEM;
+  using ContainerType = INPUT_ELEM;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+// E4M3 payload with one E4M3 scale per 16 values.  This is the
+// format-specialized arm reused by the mixed-page transport.
+template <>
+struct ElemTypeConverter<4> {
+  using Type = __nv_fp8_e4m3;
+  using ContainerType = __nv_fp8_e4m3;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = __nv_fp8_e4m3;
+  static constexpr int QuantVectorSize = 16;
 };
 
 #if ENABLE_4BIT_KV_CACHE

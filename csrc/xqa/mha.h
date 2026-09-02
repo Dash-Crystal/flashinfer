@@ -21,6 +21,9 @@
 #endif
 #include "defines.h"
 #include "utils.h"
+#if ENABLE_MIXED_KV_CACHE
+#include <flashinfer/attention/page_transport.cuh>
+#endif
 #if SPEC_DEC
 #include "specDec.h"
 #endif
@@ -59,6 +62,9 @@ using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
 using GMemCacheHead = Vec<CacheElemConverter::ContainerType,
                           exactDiv(validElemsPerHead, CacheElemConverter::ElemsPerContainer)>;
+#if ENABLE_MIXED_KV_CACHE
+using PageTransport = flashinfer::KVPageTransport<InputElem>;
+#endif
 #if ENABLE_4BIT_KV_CACHE
 using GMemCacheHeadSf = Vec<CacheElemConverter::ScalingFactorType,
                             exactDiv(validElemsPerHead, CacheElemConverter::QuantVectorSize)>;
@@ -127,6 +133,9 @@ void launchMHA(
 #if ENABLE_4BIT_KV_CACHE
     GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
 #endif
+#if ENABLE_MIXED_KV_CACHE
+    PageTransport const& pageTransport,
+#endif
 
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
@@ -156,6 +165,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          GMemCacheHead* vCacheVLLM,
 #if ENABLE_4BIT_KV_CACHE
                          GMemCacheHeadSf* kSfCacheVLLM, GMemCacheHeadSf* vSfCacheVLLM,
+#endif
+#if ENABLE_MIXED_KV_CACHE
+                         PageTransport const& pageTransport,
 #endif
                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
                          uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
@@ -189,6 +201,9 @@ void launchHopperF8MHA(
 #endif
     float const* attentionSinks,  // [headGrpSize]
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#if ENABLE_MIXED_KV_CACHE
+    PageTransport const& pageTransport,
+#endif
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
                           // KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
@@ -210,7 +225,11 @@ void launchHopperF8MHAFlashInfer(
     float rcpOutScale,
 #endif
     InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+    GMemCacheHead* vCacheVLLM,
+#if ENABLE_MIXED_KV_CACHE
+    PageTransport const& pageTransport,
+#endif
+    KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
     uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
     uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
