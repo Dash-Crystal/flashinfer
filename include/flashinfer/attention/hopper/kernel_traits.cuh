@@ -7,6 +7,7 @@
 #ifndef FLASHINFER_ATTENTION_HOPPER_KERNEL_TRAITS_CUH_
 #define FLASHINFER_ATTENTION_HOPPER_KERNEL_TRAITS_CUH_
 
+#include <cstddef>
 #include <type_traits>
 
 #include "../../cutlass_utils.cuh"
@@ -39,6 +40,51 @@ struct SharedStorageQKVO {
   };
 };
 
+// Shared storage for the mixed-page producer: per-stage TMA transaction
+// barriers and their phases (the producer waits for its own TMA before
+// expanding), plus one 8 B whole-head block-scale word per token per stage.
+template <typename MainloopPipeline, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType, int CTA_KV, int NUM_STAGES, typename SmemLayoutQ,
+          typename SmemLayoutK, typename SmemLayoutV, typename SmemLayoutO>
+struct SharedStorageQKVOMixed {
+  cute::array_aligned<DTypeQ, cute::cosize_v<SmemLayoutQ>> smem_q;
+  cute::array_aligned<DTypeKV, cute::cosize_v<SmemLayoutK>> smem_k;
+  union {
+    cute::array_aligned<DTypeKV, cute::cosize_v<SmemLayoutV>> smem_v;
+    cute::array_aligned<DTypeOut, cute::cosize_v<SmemLayoutO>> smem_o;
+  };
+  struct {
+    cutlass::arch::ClusterTransactionBarrier barrier_Q;
+    cutlass::arch::ClusterBarrier barrier_O;
+    typename MainloopPipeline::SharedStorage pipeline_k;
+    typename MainloopPipeline::SharedStorage pipeline_v;
+    cutlass::arch::ClusterTransactionBarrier mixed_tma_bar_k[NUM_STAGES];
+    cutlass::arch::ClusterTransactionBarrier mixed_tma_bar_v[NUM_STAGES];
+    uint32_t mixed_phase_k;  // bit s: parity to wait for on mixed_tma_bar_k[s]
+    uint32_t mixed_phase_v;
+  };
+  alignas(16) uint8_t mixed_scales_k[NUM_STAGES][CTA_KV][8];
+  alignas(16) uint8_t mixed_scales_v[NUM_STAGES][CTA_KV][8];
+  // Tile metadata ring (shared by K and V of a tile): page indices, format
+  // tags, valid token count.  Three entries: the pair (K(t-1), V(t)) in flight
+  // plus tile t-2 being gathered for the next pair.
+  IdType mixed_meta_pages[3][CTA_KV / 16];
+  uint8_t mixed_meta_formats[3][CTA_KV / 16];
+  uint32_t mixed_meta_valid[3];
+
+  // D1: a page's 16 rows of one 64-element D-block must be one contiguous,
+  // 1024 B aligned 2 KB region (two SW128 atoms) so TMA SWIZZLE_128B boxes land
+  // in CuTe's layout, and the stage arrays must be 1024 B aligned.
+  // One stage = (CTA_KV/8 row groups) x (D/64 D-blocks) atoms of 8 rows x 128 B.
+  static_assert(cute::cosize_v<SmemLayoutK> * sizeof(DTypeKV) / NUM_STAGES ==
+                    (CTA_KV / 8) * (cute::size<1>(SmemLayoutK{}.shape()) / 64) * 1024,
+                "K stage is not tiled from 8-row x 128 B SW128 atoms");
+  static_assert(cute::cosize_v<SmemLayoutV> * sizeof(DTypeKV) / NUM_STAGES ==
+                    (CTA_KV / 8) * (cute::size<1>(SmemLayoutV{}.shape()) / 64) * 1024,
+                "V stage is not tiled from 8-row x 128 B SW128 atoms");
+  static_assert(CTA_KV % 16 == 0, "KV tile must be whole 16-token pages");
+};
+
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
           int NUM_STAGES_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
@@ -51,6 +97,7 @@ struct AttentionKernelTraits {
   using IdType = IdType_;
   using DTypeQKAccum = float;
 
+  static constexpr bool kMixedTraits = false;
   static constexpr int CTA_Q = CTA_Q_;
   static_assert(CTA_Q % 64 == 0);
   static constexpr int CTA_KV = CTA_KV_;
@@ -117,6 +164,28 @@ struct AttentionKernelTraits {
 
   using SharedStorage = SharedStorageQKVO<MainloopPipeline, DTypeQ, DTypeKV, DTypeO, IdType, CTA_KV,
                                           SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+};
+
+// Same traits with the mixed-page shared storage.  The producer drives its own
+// per-page TMA, so USE_TMA_LOAD_KV is false (PipelineAsync, 128 producer threads).
+template <int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
+          typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
+          typename AttentionVariant_>
+struct MixedAttentionKernelTraits
+    : AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK_, HEAD_DIM_VO_, CTA_Q_, CTA_KV_,
+                            NUM_STAGES_, DTypeQ_, DTypeKV_, DTypeO_, IdType_, AttentionVariant_> {
+  static constexpr bool kMixedTraits = true;
+  using BaseTraits =
+      AttentionKernelTraits<false, HEAD_DIM_QK_, HEAD_DIM_VO_, CTA_Q_, CTA_KV_, NUM_STAGES_,
+                            DTypeQ_, DTypeKV_, DTypeO_, IdType_, AttentionVariant_>;
+  using SharedStorage =
+      SharedStorageQKVOMixed<typename BaseTraits::MainloopPipeline, DTypeQ_, DTypeKV_, DTypeO_,
+                             IdType_, CTA_KV_, NUM_STAGES_, typename BaseTraits::SmemLayoutQ,
+                             typename BaseTraits::SmemLayoutK, typename BaseTraits::SmemLayoutV,
+                             typename BaseTraits::SmemLayoutO>;
+  static_assert(offsetof(SharedStorage, smem_k) % 1024 == 0 &&
+                    offsetof(SharedStorage, smem_v) % 1024 == 0,
+                "K/V stages must be 1024 B aligned for the SW128 swizzle (D1)");
 };
 
 }  // namespace flashinfer

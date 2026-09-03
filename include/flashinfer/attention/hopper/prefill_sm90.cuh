@@ -28,6 +28,7 @@
 #include "mainloop.cuh"
 #include "mainloop_mma.cuh"
 #include "sparse_mainloop.cuh"
+#include "sparse_mixed_mainloop.cuh"
 #include "tile_scheduler.cuh"
 #include "utils.cuh"
 
@@ -99,6 +100,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(/*num_threads=*/1);
     shared_storage.barrier_O.init(/*num_threads=*/1);
+    if constexpr (mainloop_has_init_shared_v<CollectiveMainloop,
+                                             typename Ktraits::SharedStorage>) {
+      CollectiveMainloop::init_shared(shared_storage);
+    }
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
   MainloopPipeline pipeline_k = [&] {
@@ -145,8 +150,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
   }
 
+  constexpr bool kMixedMainloop =
+      mainloop_has_init_shared_v<CollectiveMainloop, typename Ktraits::SharedStorage>;
   if (warp_group_idx == 0) {  // Producer
-    if constexpr (use_tma_load_kv) {
+    if constexpr (kMixedMainloop) {
+      cutlass::arch::warpgroup_reg_dealloc<CollectiveMainloop::kProducerRegs>();
+    } else if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else {
       cutlass::arch::warpgroup_reg_dealloc<72>();
@@ -203,7 +212,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
     }
   } else {  // Consumer
-    if constexpr (use_tma_load_kv) {
+    if constexpr (kMixedMainloop) {
+      static_assert(Ktraits::NUM_WARPS == 12, "mixed register split assumes 1 producer + 2 consumer WGs");
+      cutlass::arch::warpgroup_reg_alloc<CollectiveMainloop::kConsumerRegs>();
+    } else if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
     } else {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
@@ -360,8 +372,18 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using DTypeO = typename KernelTraits::DTypeO;
   using IdType = typename KernelTraits::IdType;
 
-  using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+  // Pages tagged with a per-page format use the mixed producer (TMA + in-place
+  // expansion); otherwise the cp.async gather producer.
+  // (Multi-item scoring keeps the gather producer; it is never combined with
+  // mixed pages at runtime.)
+  // #5: only traits that carry the mixed shared storage may host the mixed producer.
+  constexpr bool kMixedPages = has_mixed_page_format_v<typename Params::AdditionalParams> &&
+                               KernelTraits::kMixedTraits && !MULTIITEMSCORING;
+  using CollectiveMainloop = std::conditional_t<
+      kMixedPages,
+      SparseMixedCollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>,
+      SparseCollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL,
+                               MULTIITEMSCORING>>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -588,15 +610,27 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
           LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
-      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
-          AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-                                /*CTA_Q_=*/128,
-                                /*CTA_KV_=*/96,
-                                /*NUM_STAGES_=*/2, typename Params::DTypeQ,
-                                typename Params::DTypeKV, typename Params::DTypeO,
-                                typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+      if constexpr (has_mixed_page_format_v<typename Params::AdditionalParams>) {
+        BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+            MixedAttentionKernelTraits<HEAD_DIM_QK, HEAD_DIM_VO,
+                                       /*CTA_Q_=*/128,
+                                       /*CTA_KV_=*/96,
+                                       /*NUM_STAGES_=*/3, typename Params::DTypeQ,
+                                       typename Params::DTypeKV, typename Params::DTypeO,
+                                       typename Params::IdType, AttentionVariant>,
+            LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+            params, stream);
+      } else {
+        BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+            AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                                  /*CTA_Q_=*/128,
+                                  /*CTA_KV_=*/96,
+                                  /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                  typename Params::DTypeKV, typename Params::DTypeO,
+                                  typename Params::IdType, AttentionVariant>,
+            LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+            params, stream);
+      }
     } else {
       // HEAD_DIM == 256;
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
