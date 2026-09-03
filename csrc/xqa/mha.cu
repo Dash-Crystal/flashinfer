@@ -375,6 +375,10 @@ struct alignas(128) SharedMem {
                  [mixedKScaleBytes];
   uint8_t vScales[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers]
                  [cacheVTileSeqLen + 1][mixedVScaleBytes];
+#if MIXED_KV_PROBE_C
+  // Dead landing area for the probe's shadow copies (never read). 16 B per lane per gemm0 warp.
+  alignas(16) uint8_t probeScratch[ctaShapeInWarps.x][warp_size * 16];
+#endif
 #endif
 
 #if ENABLE_4BIT_KV_CACHE
@@ -2369,14 +2373,22 @@ CUBIN_EXPORT __global__
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset, 0,
-            idxHeadGrp, true, idxPart);
+            idxHeadGrp, true, idxPart
+#if MIXED_KV_PROBE_C
+            , warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
+#endif
+            );
       } else {
         uint32_t const nbHeadsAvail = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset, 0,
-            idxHeadGrp, true, idxPart, nbHeadsAvail);
+            idxHeadGrp, true, idxPart, nbHeadsAvail
+#if MIXED_KV_PROBE_C
+            , 0, &smem.probeScratch[warpIdx.x][0]
+#endif
+            );
       }
 #else
       if (isFullTile) {

@@ -43,6 +43,15 @@ __device__ inline void copyAsync(void* dst, void const* src,
   }
 }
 
+// 16-B copy with the L1-allocating (.ca) policy of the 4/8-B copies above. Used only by
+// the MIXED_KV_PROBE_C measurement build so that the probe's lanes keep the cache policy
+// of the two 8-B halves they replace (cp.async.cg would change L1 behaviour, not just bytes).
+__device__ inline void copyAsyncCa16(void* dst, void const* src, uint32_t srcSize = 16) {
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"l"(__cvta_generic_to_shared(dst)),
+      "l"(src), "r"(srcSize));
+}
+
 __device__ inline void commitGroup() { asm volatile("cp.async.commit_group;\n"); }
 
 // wait until only targetNbInFlightGroups groups are still in-flight.
