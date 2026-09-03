@@ -70,8 +70,19 @@ constexpr uint32_t grainBytesSf = 4;
 
 constexpr bool enableMicroFastPath = false;
 
+// Two structures for tiles with compressed pages: `compact` converts B
+// fragments in registers inside the MMA loop (per-page runtime dispatch), the
+// default expands the tile to A16 in shared memory once and runs the stock A16
+// GEMM.  With mixed tags per tile the compact form instantiates all three
+// converters inside the unrolled MMA loop (2.7x the code, 5x the branches,
+// local-memory spills) and ran 1.3x slower than plain A16 on sm120; the
+// expansion form runs 1.24x faster than A16 on the same stream.
+// MIXED_COMPACT_PAGES=1 selects the compact form (build flag).
+#ifndef MIXED_COMPACT_PAGES
+#define MIXED_COMPACT_PAGES 0
+#endif
 #if ENABLE_MIXED_KV_CACHE && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-constexpr bool compactMixedPages = tokensPerPage == 16;
+constexpr bool compactMixedPages = MIXED_COMPACT_PAGES && tokensPerPage == 16;
 #else
 constexpr bool compactMixedPages = false;
 #endif
@@ -2249,12 +2260,28 @@ CUBIN_EXPORT __global__
 #endif
 #if BEAM_WIDTH == 1
     KCachePageIndices pageIdx = KCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if ENABLE_MIXED_KV_CACHE
+    // Page indices are prefetched two tiles ahead and the page tags one tile
+    // ahead, so neither dependent load (index -> tag -> copy path) is ever
+    // waited for by the loading warp.  loadPages(p) rotates: the indices loaded
+    // by the previous call become current, their tags are requested, and p's
+    // indices are requested.
+    KCachePageIndices pageIdxNext = KCachePageIndices::filled(kBAD_PAGE_INDEX);
+    uint32_t pageTagLane = 0;
+#endif
 #endif
     auto loadPages = [&](uint32_t idxPage) mutable {
 #if BEAM_WIDTH == 1
       uint32_t const idxBeam = 0;
+#if ENABLE_MIXED_KV_CACHE
+      pageIdx = pageIdxNext;
+      pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
+      pageIdxNext =
+          getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+#else
       pageIdx =
           getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+#endif
 #else
       auto& dst = smem.kCachePages[warpIdx.x];
       loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages);
@@ -2262,6 +2289,12 @@ CUBIN_EXPORT __global__
     };
     uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + warpIdx.x * warpTile.x / tokensPerPage;
     loadPages(idxPageBeg);
+#if BEAM_WIDTH == 1 && ENABLE_MIXED_KV_CACHE
+    // Second call primes the two-deep prefetch: tile 0 becomes current (its tags
+    // are requested now), tile 1's indices are in flight.
+    idxPageBeg += nbPagesPerCtaTile * nbSubSeqPerSeq;
+    loadPages(idxPageBeg);
+#endif
     auto loadKTilePart = [&](uint32_t seqIter, uint32_t idxBeam, uint32_t idxPart) mutable {
       assert(idxBeam < beamWidth);
       assert(seqIter % nbSubSeqPerSeq == seqIterInit % nbSubSeqPerSeq);
@@ -2277,7 +2310,7 @@ CUBIN_EXPORT __global__
 
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_KV_CACHE
-      auto const pageFormats = gatherMixedPageFormats(cacheList.transport, pageIdx);
+      auto const pageFormats = broadcastMixedPageTags<nbPagesPerWarpTile>(pageTagLane);
 #endif
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
           cacheList.kCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
@@ -2670,12 +2703,24 @@ CUBIN_EXPORT __global__
     };
 #if BEAM_WIDTH == 1
     VCachePageIndices pageIdx = VCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if ENABLE_MIXED_KV_CACHE
+    // Two-deep prefetch, see the K loader.
+    VCachePageIndices pageIdxNext = VCachePageIndices::filled(kBAD_PAGE_INDEX);
+    uint32_t pageTagLane = 0;
+#endif
 #endif
     auto loadPages = [&](uint32_t idxPageBeg) mutable {
 #if BEAM_WIDTH == 1
       uint32_t const idxBeam = 0;
+#if ENABLE_MIXED_KV_CACHE
+      pageIdx = pageIdxNext;
+      pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
+      pageIdxNext =
+          getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+#else
       pageIdx =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+#endif
 #else
       auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
 #if ENABLE_4BIT_KV_CACHE
@@ -2688,6 +2733,46 @@ CUBIN_EXPORT __global__
     };
     uint32_t idxPageBeg =
         nbPagesPerCtaTile * seqIterInit + cacheVTileSeqLen * warpGrpIdx / tokensPerPage;
+    // Advance the V page window after the V tile (seqIter, xIter, vIter, idxBeam)
+    // has been issued; returns whether a new window was requested.
+    auto advanceVPages = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter,
+                             uint32_t idxBeam) mutable -> bool {
+      constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
+      if constexpr (xIterSeqStride <= tokensPerPage) {
+        uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
+        assert(nbXItersPerPage <= nbXItersPerCtaTile);
+        if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1 &&
+            (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
+          auto const step = 1;  // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
+          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
+                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
+                             : step);
+          assert(beamWidth == 1 ||
+                 cacheVTileSeqStride <= tokensPerPage &&
+                     "todo: need to substrate from idxPageBeg for beam switching");
+          loadPages(idxPageBeg);
+          return true;
+        }
+        return false;
+      } else {
+        constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
+        bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
+        bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
+        if (isLastVIter && isLastBeam) {
+          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step_per_viter >= nbPagesPerCtaTile
+                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step_per_viter
+                             : step_per_viter);
+          loadPages(idxPageBeg);
+        } else if (isLastVIter) {
+          idxPageBeg -= step_per_viter * (nbVItersPerXIter - 1);
+          loadPages(idxPageBeg);
+        } else {
+          idxPageBeg += step_per_viter;
+          loadPages(idxPageBeg);
+        }
+        return true;
+      }
+    };
     loadPages(idxPageBeg);
     auto nextStep = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter, uint32_t idxBeam) {
       uint32_t vIterNext, isNextBeam;
@@ -2703,6 +2788,18 @@ CUBIN_EXPORT __global__
       return mha::tuple<uint32_t, uint32_t, uint32_t, uint32_t>(seqIterNext, xIterNext, vIterNext,
                                                                 idxBeamNext);
     };
+#if BEAM_WIDTH == 1 && ENABLE_MIXED_KV_CACHE
+    {
+      // Prime the two-deep prefetch: step the V iteration state forward until the
+      // page window would first advance, exactly as the loop below will.
+      uint32_t pSeq = seqIterInit, pX = 0, pV = 0, pBeam = 0;
+#pragma unroll 1
+      for (uint32_t k = 0; k < nbXItersPerCtaTile * nbVItersPerXIter * beamWidth; ++k) {
+        if (advanceVPages(pSeq, pX, pV, pBeam)) break;
+        mha::tie(pSeq, pX, pV, pBeam) = nextStep(pSeq, pX, pV, pBeam);
+      }
+    }
+#endif
     auto loadVTilePart = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter,
                              uint32_t idxBeam) mutable {  // @fixme: merge three iteration
                                                           // parameters into idxVTileGlb.
@@ -2722,7 +2819,7 @@ CUBIN_EXPORT __global__
 
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_KV_CACHE
-      auto const pageFormats = gatherMixedPageFormats(cacheList.transport, pageIdx);
+      auto const pageFormats = broadcastMixedPageTags<nbPagesPerVTile>(pageTagLane);
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       if (laneId() == 0) {
         smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] =
@@ -2853,38 +2950,7 @@ CUBIN_EXPORT __global__
       unused(arrive<grpLoadV>(pWarpGrpBar));
       wait_parity<grpLoadV>(pWarpGrpBar, getAndFlip<grpLoadV>(warpGrpBarParityNext));
 #endif
-      constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
-      if constexpr (xIterSeqStride <= tokensPerPage) {
-        uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
-        assert(nbXItersPerPage <= nbXItersPerCtaTile);
-        if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1 &&
-            (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
-          auto const step = 1;  // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
-          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
-                             : step);
-          assert(beamWidth == 1 ||
-                 cacheVTileSeqStride <= tokensPerPage &&
-                     "todo: need to substrate from idxPageBeg for beam switching");
-          loadPages(idxPageBeg);
-        }
-      } else {
-        constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
-        bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
-        bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
-        if (isLastVIter && isLastBeam) {
-          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step_per_viter >= nbPagesPerCtaTile
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step_per_viter
-                             : step_per_viter);
-          loadPages(idxPageBeg);
-        } else if (isLastVIter) {
-          idxPageBeg -= step_per_viter * (nbVItersPerXIter - 1);
-          loadPages(idxPageBeg);
-        } else {
-          idxPageBeg += step_per_viter;
-          loadPages(idxPageBeg);
-        }
-      }
+      advanceVPages(seqIter, xIter, vIter, idxBeam);
 #if BEAM_WIDTH > 1
       uint32_t seqIterNext, xIterNext, vIterNext, idxBeamNext;
       mha::tie(seqIterNext, xIterNext, vIterNext, idxBeamNext) =

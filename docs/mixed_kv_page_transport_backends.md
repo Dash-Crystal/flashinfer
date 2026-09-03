@@ -79,3 +79,39 @@ infer from timings. Requirements:
   is architecture-independent by design.
 - Identical **acceptance tests**: bit-exactness against explicit A16 expansion, and the
   roofline targets in `mixed_kv_page_transport_cutlass_references.md`, apply to both.
+
+## sm120 (RTX 5090) state: mixed streams through the XQA host
+
+Measured on an RTX 5090 (B=17, S=4096, 8 KV heads, GQA 4; bursts; 34/34 cases
+bit-exact against explicit A16 expansion):
+
+| q per sequence | A16 stock | A16 transport | FP8 | FP4 | mixed |
+|---|---|---|---|---|---|
+| 1 (batched AR decode) | 179.9 µs | 179.8 | 139.8 | 83.7 | **145.3** |
+| 4 (draft verification) | 183.5 | 184.6 | 153.7 | 100.6 | **156.9** |
+| 64 (prefill; XQA is not the host for this) | 437.8 | 460.4 | 785.0 | 689.3 | 905.4 |
+
+Two structural changes got the dynamically mixed stream from 1.3× *slower* than
+A16 (237 µs) to 1.24× faster:
+
+1. **Page tags are gathered one tile ahead** with a two-deep page-index prefetch
+   (`loadPages` rotates `pageIdx ← pageIdxNext`, issues the tag load for the
+   landed indices, and requests the indices two tiles ahead; the tag is
+   broadcast with shuffles a tile later).  Before, the loading warp — which on
+   sm120 is the compute warp — waited on a dependent `page_format[pageIdx]` load
+   at every tile part.  Alone this did not change the mixed time (237 → 233 µs);
+   it removed a latency chain, not the bottleneck.
+2. **Tiles with compressed pages are expanded to A16 in shared memory and fed to
+   the stock A16 GEMM** (`MIXED_COMPACT_PAGES=0`, now the default).  The
+   register-side "compact" form dispatched on the page tag per (block, page)
+   inside the unrolled MMA loop, instantiating all three fragment converters:
+   `cuobjdump` showed 17 688 instructions, 647 branches and 338 local loads for
+   the dynamic kernel against 6.5–8.3 K instructions, 130–190 branches and
+   118–168 local loads for the static-format kernels.  With expansion the dynamic
+   kernel is 12 064 instructions / 262 branches, and the mixed stream moves
+   172 MB at 1.19 TB/s.  Pure FP8 at q=4 pays 13 % for this (136 → 154 µs);
+   mixed streams are the product.
+
+Open on sm120: no prefill-shaped host exists for mixed pages (the FA3 host is
+sm90-only); q ≥ 64 through XQA is 1.6–2× slower than A16 and should route to the
+sm12x prefill backend once one carries the page-transport contract.

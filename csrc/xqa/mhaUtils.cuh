@@ -181,6 +181,31 @@ __device__ inline MixedPageFormats<nbPages> gatherMixedPageFormats(
   return ret;
 }
 
+// Two-step form of gatherMixedPageFormats for a loader that prefetches page
+// indices two tiles ahead: issue this lane's tag load as soon as the indices
+// have landed (no consumer -> no stall) ...
+template <uint32_t nbPages>
+__device__ inline uint32_t mixedPageTagLane(PageTransport const& transport,
+                                            Vec<KVCachePageIndex, nbPages> const& pages) {
+  uint32_t const lane = laneId();
+  uint32_t value = 0;
+  if (lane < nbPages && pages[lane] != kBAD_PAGE_INDEX) {
+    value = transport.page_format[pages[lane]];
+  }
+  return value;
+}
+
+// ... and broadcast it a tile later, when it is needed.
+template <uint32_t nbPages>
+__device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t laneValue) {
+  MixedPageFormats<nbPages> ret;
+#pragma unroll
+  for (uint32_t i = 0; i < nbPages; ++i) {
+    ret.values[i] = static_cast<uint8_t>(__shfl_sync(0xffffffffU, laneValue, i));
+  }
+  return ret;
+}
+
 template <uint32_t nbPages>
 __device__ inline bool needsMixedPageExpansion(
     MixedPageFormats<nbPages> const& formats) {
