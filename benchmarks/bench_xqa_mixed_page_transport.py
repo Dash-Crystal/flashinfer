@@ -11,6 +11,7 @@ import torch
 
 from flashinfer.decode import xqa_batch_decode_with_kv_cache
 from flashinfer.quantization.kv_cache_fp8 import MixedKVPagedCache
+from flashinfer.xqa import last_xqa_dispatch
 
 
 def pack_causal_mask(batch_size: int, q_len: int, device: torch.device) -> torch.Tensor:
@@ -234,6 +235,18 @@ def main() -> None:
                     **common,
                 )
 
+            # One eager call first: it JIT-compiles the module and records
+            # which kernel family (mha.cu vs mha_sm90.cu) the shape dispatches
+            # to, so the timing line below is attributable to a kernel.
+            call()
+            torch.cuda.synchronize()
+            dispatch = last_xqa_dispatch()
+            print(
+                f"[q_len={q_len} mode={mode}] kernel_family={dispatch['kernel_family']} "
+                f"spec_dec={dispatch['spec_dec']} module_uri={dispatch['module_uri']}",
+                file=sys.stderr,
+                flush=True,
+            )
             timing = time_call(
                 call, args.repeats, args.trials, not args.no_cuda_graph
             )
@@ -242,6 +255,8 @@ def main() -> None:
                 {
                     "q_len": q_len,
                     "mode": mode,
+                    "kernel_family": dispatch["kernel_family"],
+                    "module_uri": dispatch["module_uri"],
                     "kv_transport_bytes": transport_bytes,
                     "effective_kv_gbps": transport_bytes / timing["median_us"] / 1e3,
                     **timing,

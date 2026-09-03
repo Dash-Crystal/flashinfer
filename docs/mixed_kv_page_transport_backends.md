@@ -211,3 +211,75 @@ per operand (the IO group's two Q warps and two loader warps are idle most of
 the tile) or a four-warp-group layout (fewer threads → 64 registers each,
 loader merged into the converters).  Both are real work with a bounded payoff
 (~20–30 %); neither is a tuning knob.
+
+## H200 host calibration (plan P0.1 / lever [32], 2026-09-03, nkcut2)
+
+Recorded so that later H200 numbers divide by a measured ceiling and name the
+kernel they measured.  Artifacts: `benchmarks/bench_xqa_mixed_page_transport.py`
+now prints `kernel_family` (mha.cu vs mha_sm90.cu, read back from the dispatch
+in `flashinfer/xqa.py`) and `module_uri` on every line;
+`benchmarks/probe_hbm_bandwidth.py` is the streaming probe (one kernel or a
+short burst per CUDA-event pair).  All timing under `flock /tmp/mixedkv-gpu0.lock`.
+
+### Kernel family per bench mode (B=17, S=4096, 8 KV heads, GQA 4, D=128, bf16)
+
+| mode | q=1 | q=4 |
+|---|---|---|
+| baseline_a16 (stock bf16 KV) | mha.cu, 108-110 us (2.6 TB/s) | mha.cu SPEC_DEC, 128 us |
+| transport_a16 (mixed build, static A16) | **mha_sm90.cu**, 81-83 us (3.45-3.52 TB/s) | mha.cu SPEC_DEC, 135 us |
+| fp8 / fp4 / mixed | mha_sm90.cu: 91.4 / 96.2 / 114.8 us | mha.cu SPEC_DEC: 226 / 277-285 / 441-452 us |
+
+The "A16 83 us" reference in the targets table is transport_a16 through
+mha_sm90.cu, not the stock mha.cu kernel (which is 1.3x slower at q=1).  At q=4
+every mode, A16 included, runs mha.cu with `SPEC_DEC=1 SPEC_Q_SEQ_LEN=4`
+(`run_sm90_fp8_mha` is cleared for swap-AB-eligible spans).  Module URIs:
+`xqa_input_bf16_kv_cache_bf16_block_scaled_fp8_False_mixed_page_{False|True}_static_format_{-1|0|1|2}_..._use_spec_dec_{False|True}_spec_q_seq_len_{1|4}`.
+
+### Streaming ceiling (probe, kernel-only in 5-kernel bursts, medians of 15)
+
+| footprint | read (Triton stream, 8 KiB/CTA) | copy (r+w, `copy_`) | write (`fill_`) |
+|---|---|---|---|
+| 80.2 MB (= FP4 bytes) | 23.0 us, 3.49 TB/s | 3.73 TB/s | |
+| 151.5 MB (= FP8) | 38.6 us, 3.93 TB/s | 3.99 TB/s | |
+| 172.3 MB (= mixed) | 43.0 us, 4.01 TB/s | 4.01 TB/s | |
+| 285.2 MB (= A16) | 67.5 us, 4.23 TB/s | 4.19-4.21 TB/s (135.4 us) | 63.3 us, 4.51 TB/s |
+| 1-2 GB sustained | 4.31-4.50 TB/s | 4.27 TB/s | 4.63-4.67 TB/s |
+
+Read fit over the four footprints: t = 5.6 us + bytes / 4.61 TB/s.  Theoretical
+at the observed 3201 MHz HBM3e clock x 6144 bit = 4.92 TB/s; spec sheet 4.8.
+`torch.sum` is a poor probe below 1 GB (two-pass, ~45 us fixed).  Single-kernel
+(non-burst) event timing adds the CPU launch gap (5-10 us C++ launches, 10-15 us
+Triton/Python), which is why `--repeats 1` bench numbers run 8-20 us high.
+
+**Corrected byte rooflines (measured achievable, replacing the 4.8 TB/s paper
+values 59/32/17/36 us): A16 67.5, FP8 38.6, FP4 23.0, mixed 43.0 us.**
+
+**Verdict on the A16 plateau:** the host reads 285 MB in 67.5 us (4.23 TB/s) and
+sustains 4.5 TB/s, so transport_a16's 81-83 us (3.45-3.52 TB/s) is kernel-side:
+~14 us (17-19 %) above the achievable read at the same footprint - the plan's
+"probe shows 4.5+" branch (per-tile TMA issue limiter, A16-side loader item,
+fold into [15]/[34]), with the headroom being ~14 us rather than the 24 us the
+4.8 TB/s figure implied.  Gate targets (relative to measured A16) are unchanged.
+
+### Co-tenant and clocks
+
+`VLLM::EngineCore` (PID 1373615, 27.8 GB, 99 % SM in `nvidia-smi pmon`, ~120 W
+draw, i.e. an idle spin) is resident for days.  Clocks at max and locked
+(SM 1980 MHz, HBM 3201 MHz, throttle reasons 0x0) before and after every run.
+Burst-length experiment (graph replay, per-kernel medians):
+
+| kernel | burst | per-kernel time |
+|---|---|---|
+| copy 2 GB | 1 / 2 / 3 kernels = 0.96 / 1.92 / 2.88 ms | 960 / 959 / **1787 us** |
+| mixed q=4 | 1 / 2 / 3 / 5 / 10 = 0.45 / 0.9 / 1.3 / 2.3 / 4.7 ms | 452 / 448 / 441 / **938 / 937** |
+| fp4 q=4 | 1 / 5 / 10 = 0.28 / 1.4 / 2.8 ms | 285 / 277 / **523** |
+| baseline_a16 q=1 | 1 / 5 / 20 = 0.13 / 0.54 / 2.2 ms | 130 / 109 / **229** |
+| transport_a16 q=1 | 1 / 5 / 20 / 40 = 0.09 / 0.41 / 1.6 / 3.2 ms | 90 / 83 / 81 / **143** |
+
+Bursts below ~1.9 ms are clean (min/median/max within 1 %); bursts of >= 2.2 ms
+are time-sliced 1:1 with the co-tenant (1.8-2.1x).  Rule for every H200 number
+while the co-tenant is present: `repeats x kernel_time < 1.5 ms` (repeats 5 is
+fine up to ~300 us kernels; use repeats 2-3 for the q=4 mixed kernel).  The
+previously recorded **q=4 mixed 935 us is this artifact**; the kernel itself
+takes 441-452 us (fp4 q=4 277-285, fp8 q=4 226, transport_a16 q=4 135,
+baseline_a16 q=4 128).
