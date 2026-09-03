@@ -210,3 +210,63 @@ meet them is out of specification regardless of its timing.
    is a pure TMA relanding of the stock gather).
 4. ncu on E2M1: issue-active and stall mix consistent with `T_c`-bound
    operation; duration within 15% of §5's figure for the benchmark shape.
+
+---
+
+## Amendments (after the first two implementations)
+
+These change the specification above; where they conflict, the amendment wins.
+
+### A1. Transport is `cp.async` by the producer warp group, not per-page TMA
+
+Measured on H200 with a per-pair `%globaltimer` trace of the producer: a TMA
+operation costs ~100–200 ns of issue on sm90 regardless of box size (2 KB A16
+page box ≈ 115 ns, 1 KB FP4 box ≈ 190 ns), so 24 boxes per pair from one thread
+made the producer the critical path at ~2.3 µs of issue per pair — twice the
+consumer's time — while `acquire` never waited and DRAM sat at 10 % of peak.
+This is why stock FA3 uses `cp.async` (`USE_TMA_LOAD_KV=false`) for paged KV.
+
+Consequently:
+
+- **D1** is now purely CuTe's SW128 stage layout; nothing in the design depends
+  on TMA swizzle equivalence.  The copies and the expansion address the stage
+  through the same CuTe tensor, so no swizzle formula appears in the kernel.
+- **C4** becomes the stock protocol: A16 tiles are committed with
+  `cp.async.mbarrier.arrive` (the producer never waits); compressed tiles form one
+  `cp.async` commit group per pair and are waited for with `cp.async.wait_group 1`
+  *one pair later*, so their landing latency is covered by a full pair time.
+  The producer therefore holds two pairs (pending + current) → **S ≥ 3**, and the
+  page-metadata ring has **4 slots** (pending pair, current pair sharing one tile,
+  one tile ahead).
+- The six tensor maps, the private transaction barriers and their phase words
+  are gone (`page_transport_tma.cuh` removed).
+
+### A2. D6 — warp-contiguous copy ownership
+
+Copy ownership is *not* per token.  Within a page, consecutive threads own
+consecutive 16 B chunks of a row: a warp instruction covers whole contiguous rows
+in global memory (full 32 B sectors, one request per 128 B) and a permutation of
+one row's 16 slots in the swizzled stage (conflict-free).  A16: thread t owns
+chunk t%16 of rows t/16 and t/16+8 (two copies per page); FP8: chunk t%8 of row
+t/8; FP4: threads < 64, chunk t%4 of row t/4; threads < 16 copy the 8 B of
+scales.  Per-token ownership (D3) remains the rule for the *expansion*, whose
+accesses are all within the owner's row.  The first `cp.async` implementation
+used per-token copy ownership and ran at 1.9× stock time from sector over-fetch
+and bank conflicts alone.
+
+### A3. §6 revised — hosts by query shape
+
+The FA3 host is bound by its 128-row consumer skeleton at q=1 (stock 296 µs for a
+stream the XQA host moves in 84 µs), so the XQA mixed path is **not** retired:
+XQA hosts batched AR decode and short draft verification (q ≤ 4 in the current
+dispatch); FA3 hosts continued prefill, naive prefill and long verification.
+On sm120 only the XQA host exists; see `mixed_kv_page_transport_backends.md`.
+
+### A4. Verification additions
+
+- Every confirmation run is bounded (`timeout`) — a protocol bug shows up as a
+  hang, and a hang must cost minutes, not an hour.
+- A hang is diagnosed by reading the commit protocol, not by instrumenting: the
+  first `cp.async` producer overwrote the pending tile's record when issuing the
+  next pair (fix: two records, `staged` → `pending`, rotated after the finish).
+- `cuobjdump -sass` counts: `UTMALDG` = Q only, `LDGSTS` > 0, `LDL`/`STL` = 0.
