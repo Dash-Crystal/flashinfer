@@ -211,3 +211,28 @@ per operand (the IO group's two Q warps and two loader warps are idle most of
 the tile) or a four-warp-group layout (fewer threads → 64 registers each,
 loader merged into the converters).  Both are real work with a bounded payoff
 (~20–30 %); neither is a tuning knob.
+
+**P0.6 / lever [5] step 1 — elected converter `produced` arrive: negative.**
+The K/V converter warps' `kBar/vBar.produced.arrive()` (32 same-address
+arrivals per warp, 128 per barrier) was replaced by `__syncwarp(); if (lane==0)
+arrive(32)` (counts unchanged).  SASS (fp4 module, `xqa_mha_sm90.cuda.o`): the
+two sites went from `SYNCS.ARRIVE.TRANS64.RED.A1T0 RZ,[bar],RZ` (unpredicated)
+to `@!P SYNCS.ARRIVE.TRANS64.RED.ART0 RZ,[bar],R3` with R3 = 0x20 on lane 0;
+the release fence that `mbarrier.arrive.release.cta` lowers to —
+`MEMBAR.ALL.CTA` followed by `FENCE.VIEW.ASYNC.S` — stays unpredicated (every
+lane), 48 registers either way, +8 instructions.  Level-3 trace, fp4 q=1, CTA 0
+tiles 2–7, 24 launches per variant interleaved A/B under the GPU lock, H200 at
+1980 MHz with a co-tenant: segment slot 13 → slot 8 (expansion done → fenced +
+arrived) baseline median 186 cyc (0.094 µs; per-launch medians 108–354), elected
+181 cyc (0.091 µs; 125–269); expansion 1656 vs 1654 cyc, copy issue 686 vs 693,
+converter period 2968 vs 2971 cyc, gemm0 period 2940 vs 2945.  No segment moved
+beyond run-to-run spread, so the 128 same-address arrivals do not serialize
+measurably; what the segment contains is the per-lane `MEMBAR.ALL.CTA` drain of
+the expansion's `STS.128`s, which an elected arrive cannot remove.  [5] step 2
+(elected arrivals at all 17 sites) is closed; the drain is attacked only by
+[14].  Note on units: today's baseline segment is 186 cyc, not the 0.45 µs
+(≈890 cyc at 1.98 GHz) quoted above.  The other level-3 segments quoted above
+(0.17 / 1.69 / 0.64 / 0.09) coincide with today's cycle counts (176 / 1656 /
+686 / 113) read as cycles/1000, which suggests that row was in kilo-cycles and
+that the arrive segment differed (450 vs 186 cyc) either through a code change
+since or through conditions; today's interleaved A/B is self-contained.

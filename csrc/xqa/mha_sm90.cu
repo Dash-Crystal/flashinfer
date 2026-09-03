@@ -2110,7 +2110,11 @@ __launch_bounds__(128 * ctaWarpGroups)
                         fp8KGlobalScale, fp4KGlobalScale, warpIdx.x, /*namedBarrierId=*/1);
       TRACE_STAMP(13, idxIter, warpIdx.x == 0);
       asm volatile("fence.proxy.async.shared::cta;\n");
-      unused(smem.kBar[idxKStage].produced.arrive());
+      // Elected arrive ([5] step 1): one lane arrives for the warp (count 32),
+      // instead of 32 same-address arrivals per warp; the barrier count is
+      // unchanged (convertWarpsPerOperand * warp_size).
+      __syncwarp();
+      if (laneId() == 0) unused(smem.kBar[idxKStage].produced.arrive(warp_size));
 #if MIXED_KV_TRACE >= 3
       TRACE_STAMP(8, idxIter, warpIdx.x == 0);  // K converter: fenced + produced
 #endif
@@ -2159,7 +2163,8 @@ __launch_bounds__(128 * ctaWarpGroups)
                         smem.vFormats[idxVBuf], fp8VGlobalScale, fp4VGlobalScale, warpIdx.x,
                         /*namedBarrierId=*/2);
       asm volatile("fence.proxy.async.shared::cta;\n");
-      unused(smem.vBar[idxVBuf].produced.arrive());
+      __syncwarp();
+      if (laneId() == 0) unused(smem.vBar[idxVBuf].produced.arrive(warp_size));
       TRACE_STAMP(15, idxIter, warpIdx.x == 0);
       if (idxIter + vAhead < nbIters) issueVCopies(idxIter + vAhead);
       ldgsts::commitGroup();
