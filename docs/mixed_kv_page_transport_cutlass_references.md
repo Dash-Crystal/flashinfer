@@ -8,6 +8,9 @@ acceptance targets. Paths are relative to the repository root; CUTLASS is pinned
 
 ## 0. Cost model
 
+(The binding design document is `mixed_kv_page_transport_dataflow.md`; this file
+collects the in-tree references it draws on and the measurements that confirmed it.)
+
 Per 16-token × `D`-channel page, one KV head, `D = 128`:
 
 | Format | payload | scales | bytes/page | decode ALU |

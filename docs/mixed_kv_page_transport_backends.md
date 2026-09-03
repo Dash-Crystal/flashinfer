@@ -14,6 +14,14 @@ mixed-KV-page branch. It exists because of the following review finding, quoted 
 > cvt** despite the "official x8 substitution" claim (the x8 helper exists in
 > `mhaUtils.cuh`; this path doesn't call it).
 
+## Design specification
+
+The producer/consumer data flow, its stall-freedom conditions, and the
+invariants an implementation must satisfy are fixed in
+`mixed_kv_page_transport_dataflow.md`. Kernels are written once from that
+specification and reviewed by reading against it; measurement confirms
+conformance, it does not tune.
+
 ## Rule
 
 Every CUDA compute capability that differs in any instruction used by the attention
@@ -32,7 +40,7 @@ Concretely, for this branch:
 | E4M3 → A16 | `cvt` via f16 pair | native packed `cvt.rn.bf16x2.e4m3x2` |
 | E2M1 → A16 | **software** (`prmt` LUT, x8 per 32-bit word) | native `cvt.rn.bf16x2.e2m1x2` |
 | Correct place to dequantize | dedicated converter warps → A16 smem stage → unchanged SS-GMMA consumer | inside the consumer's register-fragment load (the path that already wins) |
-| Source file | `csrc/xqa/mha_sm90.cu` | `csrc/xqa/mha.cu` |
+| Source file | `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh` (FA3 host, all query shapes); `csrc/xqa/mha_sm90.cu` (reference) | `csrc/xqa/mha.cu` |
 | Bandwidth-side reference in tree | `3rdparty/cutlass/.../sm90_mma_tma_gmma_rs_warpspecialized_mixed_input.hpp` | `include/flashinfer/attention/sparse_mla_sm120/decode_dsv4_kernel.cuh` |
 
 The two right-hand columns are not converging. Do not port the sm120 register-fragment
