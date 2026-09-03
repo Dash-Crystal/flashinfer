@@ -211,3 +211,80 @@ per operand (the IO group's two Q warps and two loader warps are idle most of
 the tile) or a four-warp-group layout (fewer threads → 64 registers each,
 loader merged into the converters).  Both are real work with a bounded payoff
 (~20–30 %); neither is a tuning knob.
+
+### P0.4 [12] — converter SASS class counts and PC sampling (nkcut2 H200, static fp4 / fp8 builds)
+
+Build: bench modes `fp4` (`MIXED_PAGE_STATIC_FORMAT=2`) and `fp8` (`=1`), q=1, B=17, S=4096, 8 KV
+heads; `xqa_mha_sm90.cuda.o`: REG 48, STACK 0, 3336 (fp4) / 3248 (fp8) SASS instructions.  Source
+attribution from a `FLASHINFER_JIT_LINEINFO=1` build whose SASS is byte-identical (address + text)
+to the production build (`nvdisasm --print-line-info-inline`); regions = any inline frame inside
+`expandPackedStage` (:2734-2819) / `issueCompressedPageCopies` (:2538-2607), K/V by the outermost
+converter-loop line.  ncu 2025.3.1 `--set full`, a 4x finer `--warp-sampling-interval 4` rerun, and a
+`--clock-control none` run (1.80 GHz effective, 95.8 us = production duration) agree within 2-3
+points; the fine run is quoted.  ncu "Instructions Executed" = 34816 (= 4 warps x 8704 tiles) for
+every expansion instruction: static count = dynamic count, no branch inside the expansion is taken.
+Tool: `benchmarks/mixed_kv_converter_pcsample.py` (sass / sample subcommands).
+
+**SASS per lane per tile (K converter; V identical +-1).**
+
+| region | fp4 | fp8 |
+|---|---|---|
+| `expandPackedStage` | **405**: PRMT 96, LOP3 78, SHF 28, HMUL2 32, HADD2 4, F2FP 6, LDS 4 (U8 tag, scale word, 2x LDS.128), STS.128 8, IMAD 104, CS2R 14, BRA 5 (+5 BSSY, +5 BSYNC), UMOV 8, FMUL 4, misc 6 | **287**: F2FP 70 (32 F16.E4M3.UNPACK_B, 32 BF16.F32.PACK_AB, 6 scale), HADD2.F32 68, HMUL2 32, LOP3 15, SHF 4, LDS 6 (tag, scale, 4x LDS.128), STS.128 8, IMAD 31, CS2R 14, BRA 6 (+5, +5), LEA 4, misc 22 |
+| `issueCompressedPageCopies` per call (executed / static) | 71 / 73: LDGSTS 3, LDS 8, IMAD 24, LOP3 10, IADD3 7, SHF 4, VIADD 4, ULDC 3, LDC 2, ISETP 2, BRA 2 | 90 / 92: LDGSTS 5, LDS 8, IMAD 20, IADD3 10, LOP3 9, VIADD 7, ULOP3 5, ULEA 5, USHF 3, ULDC 3, LEA 2, LDC 2, misc 11 |
+| `consumed.wait_parity` before the copies | 13 (K) / 23 (V, incl. retries) | 14 / 25 |
+| loop overhead (DEPBAR wait_group, syncwarp, `kLoadReady.arrive_and_wait` incl. 6-9 retry iterations, fence, `produced.arrive`, commit) | 61 (K) / 53 (V) | 53 / 47 |
+| K converter total per tile | 565 | 460 |
+
+fp4 expansion attribution (405): cutlass `_e2m1_to_bf16_x8` LUT decode, 8 calls = **259** (96 PRMT,
+64 LOP3, 32 IMAD.SHL, 31 `IMAD.U32 R,RZ,RZ,UR` constant re-materialisation — one set per call because
+48 registers cannot keep the LUT constants live —, 24 SHF, 8 UMOV, 4 IMAD.MOV); HMUL2 32; STS.128 +
+swizzled store addressing 34 (8 STS, 18 IMAD, 7 LOP3, 1); packed-row/scale LDS + swizzle addressing
+25; per-block `isFP4` predication + `LdGrain{}` zeroing 25 (14 CS2R, 4 BRA, 4 BSSY, 3 IMAD.MOV — the
+predicate survives a static format because the bad-page tag is still runtime); scale prep 13; lane
+index prep 5; misc 8.  The plan's "~140 essential / 48 PRMT" assumed a 6-SASS LUT; the cutlass LUT
+is 32 SASS per 8 values, so essential (decode + HMUL2 + LDS + STS) is ~303 and non-essential ~100.
+fp8 (287): per-pair chain 5 SASS x 32 pairs = 160 (the [16] target), store 34, LDS/addr 30,
+predication/zeroing 26, scale 14, misc 23.
+
+**Stall shares, all samples, K converter (V within 3 points).**
+
+| PC range | not_selected | selected | wait | math | short_sb | no_inst | dispatch | branch | mio | long_sb | lg / barrier |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| expansion fp4 | 25.5 | 22.3 | 18.3 | 15.4 | 7.3 | 7.0 | 2.5 | 1.7 | 0.1 | 0 | 0 |
+| expansion fp8 | 19.3 | 23.8 | 16.2 | 6.8 | 20.7 | 5.2 | 1.8 | 3.7 | 2.6 | 0 | 0 |
+| copy-issue body fp4 | 26.4 | 13.7 | 19.9 | 11.2 | 14.5 | 3.4 | 6.1 | 1.8 | 0.9 | 2.1 | 0 |
+| copy-issue body fp8 | 18.1 | 12.5 | 13.8 | 6.6 | 30.7 | 0.4 | 3.3 | 0.9 | 4.9 | 8.9 | 0 |
+| consumed.wait_parity K / V | 21-25 / 12-14 | 12-16 / 6-10 | 22-27 / 12-14 | | | | | | | 20-30 / 50-66 | |
+| loop overhead fp4 / fp8 | 7.6 / 5.4 | 3.4 / 4.4 | 7.6 / 7.3 | | | | | | 1.0 / 3.5 | 71.9 / 75.7 | |
+
+Hot spots: fp4 — ISETP after the format `LDS.U8` (138 samples, 64 % short_sb: the tag load gates
+every block's predicate), CS2R zeroing 14.6 samples/instr (40 % short_sb: WAR on registers still
+being read by the previous STS.128), STS.128 15/instr (35 % wait), PRMT/LOP3/SHF 7.7-8.9/instr
+(not_selected 27-28 %, math 16-23 %: ALU-pipe throttle), HMUL2 6.2/instr.  fp8 — `F2FP.F16.E4M3`
+first use after LDS.128 (short_sb 34 %), CS2R 19.4/instr (51 % short_sb), STS.128 13/instr (mio
+34 %), HMUL2 10.5/instr (not_selected 43 %).  Copy issue: the ISETP after the metadata LDS carries
+83-96 % short_sb (106 / 215 samples).
+
+**Converter time split (share of K-converter samples, fp4 / fp8):** expansion 54.8 / 42.4 %, copy-issue
+body 13.6 / 22.4, consumed.wait 3.0 / 3.2, loop overhead 23.8 / 24.2 (kLoadReady wait 10.4 / 8.3,
+`produced.arrive` 4.7 / 5.4, FENCE.VIEW.ASYNC 2.3 / 4.1, wait_group + counter 6.5 / 6.5), prologue +
+setup 4.8 / 7.7.  At the 3.0 us fp4 period: expansion 1.64 us (level-3 trace 1.69), copy issue 0.50
+(trace 0.64), loop overhead 0.71 (trace 0.17 + 0.45 + 0.09 = 0.71) — sampling and trace agree.
+Expansion rate: 1.69 us x 1.98 GHz / 405 = 8.3 cyc per warp-instruction (fp4); fp8 ~8.5.
+Non-converter roles issue 1250-1400 warp-instructions per converter tile-equivalent, of which
+SYNCS 380-470 + BRA 210-256 + NANOSLEEP 180-220 are barrier retry loops (the arbitration the
+converters lose).  `produced.arrive` compiles to one `SYNCS.ARRIVE.TRANS64.RED.A1T0` per warp
+(warp-reduced), i.e. 4 transactions per operand per tile, not 128.
+
+**Classification (plan P0.4 rule).** Not MIO/drain-bound: mio + lg <= 2.7 % in the expansion (short_sb
+7 % fp4 / 21 % fp8 is LDS-first-use and STS-source WAR exposure, not throttle).  Not
+no_instruction-bound (5-8 %).  The expansion is issue-arbitration-bound (selected + not_selected
+43-48 %; the converter is eligible about half the time and wins 45-55 % of those cycles) and
+dependency/ILP-bound (wait + math 34 % fp4 / 23 % fp8, plus fp8's 21 % short_sb).  Selected paths:
+count levers first (every fp4 SASS = 8.3 cyc; audit target is ~100 non-essential of 405: 31 constant
+re-materialisations, 25 predication/zeroing, 18 lane-constant store IMADs, 8 UMOV; fp8 [16] -32 plus
+~60), then [15] 64-register layout (what stops ptxas from keeping LUT constants live and hoisting
+the next block's LDS above the current STS).  [14] store-drain overlap is bounded by the measured
+fence + arrive share, 7-9.5 % of converter time (0.2-0.3 us/tile) — J1's -0.1..-0.2, not J2's
+-0.45.  Code-size cuts: not selected.  Spin/arbitration reduction (P0.5, [5]) is the remaining lever
+for the 20-27 % not_selected.
