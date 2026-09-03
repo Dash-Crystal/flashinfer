@@ -211,3 +211,94 @@ per operand (the IO group's two Q warps and two loader warps are idle most of
 the tile) or a four-warp-group layout (fewer threads → 64 registers each,
 loader merged into the converters).  Both are real work with a bounded payoff
 (~20–30 %); neither is a tuning knob.
+
+### P0.3 — consumer trace, tile-time multiplier, RT constants (H200, 2026-09-03)
+
+Method: `MIXED_KV_TRACE=1` build (`FLASHINFER_EXTRA_CUDAFLAGS`), bench shape
+(B=17, S=4096, 8 KV heads, GQA 4, q=1), one launch per measurement under the GPU
+lock, 10 launches per mode, cleanest launch reported.  The trace build now
+records per-CTA `%globaltimer`/`clock64` entry and main-loop-end stamps in a
+device buffer printed once by the last merging CTA (per-CTA `printf` at exit
+was measured to hold each slot for ~0.5 ms and destroyed the wave structure);
+`MIXED_KV_TRACE_TAIL=1` traces the last 8 tiles of CTA 0 instead of the first.
+Driver: `benchmarks/xqa_mixed_trace_once.py`; parser
+`benchmarks/microbench/parse_xqa_trace.py`.  The SM clock measured from the
+stamps was 1.79–1.80 GHz (not the 1.98 GHz nominal; VLLM co-tenant present at
+100 % SM on device 0 throughout).  Cycles below are at that clock (1000 cyc ≈
+0.56 µs).
+
+**(a) Consumer chain, CTA 0 steady state (tiles 2–7 medians, cycles).**
+
+| segment | FP4 production | FP4, converters skipped (EXPERIMENT=1) | A16 transport |
+|---|---|---|---|
+| s1−s0 gemm0 8× HGMMA (2 commit groups) | 738 | 589 | 542 |
+| s2−s1 colMax sync + softmax (2 mbarrier RT) | 800 | 609 | 458 |
+| s3−s2 xBar.consumed wait + X store + fence + arrive | 540 | 544 | 400 |
+| T_g0 = s3−s0 | 2048 | 1762 | 1407 |
+| s5−s4 gemm1 wait for X | 1140 | 566 | 130 |
+| s6−s5 rescale (2 mbarrier RT) | 514 | 473 | 400 |
+| s7−s6 PV 4×(2 HGMMA + commit + wait) | 740 | 636 | 544 |
+| gemm1 work = s7−s5 | 1261 | 1123 | 944 |
+| gemm0 K-wait = s0(t)−s3(t−1) | 622 | 192 | 2930 |
+| X hand-off lag = s5(t)−s3(t) | 67 | 69 | 1204 |
+| cadence s0(t)−s0(t−1) | 2672 (1.49 µs) | 1960 (1.09 µs) | 4330 (2.40 µs) |
+
+Cadence hypothesis: **max(), gemm0-bound**, not lock-step sum.  s3−s2 is
+identical (540 vs 544) whether gemm1 is busy or not and gemm1 has released
+X(t−2) 3–4k cycles before gemm0 needs the buffer, so gemm0 never waits on
+gemm1; s5−s4 is gemm1 waiting for gemm0's X (it observes X 67–123 cycles
+after gemm0's arrive).  cadence = T_g0 + K-wait; gemm1 has 840–1400 cycles of
+slack per tile.  Consequences: [11] (X depth 3) is not built; gemm1 levers
+[0]/[1] have no wall effect until T_g0 + K-wait < ~1150 cyc; gemm0 levers
+[2]/[4]/[6] and the converter period are the only wall-visible consumer
+levers.  Consumer floor (converters skipped) is 1.09 µs/tile, not 1.5.
+Converter pacing in production: gemm0 gets K 174–311 cycles after the K
+converter's last expansion stamp (fence + arrive + RT); K-wait 622–824.
+
+**(b) Tile-time multiplier and tail (FP4 production, cleanest launch, main-loop
+end 96.5 µs; bench 96.0–96.5).**  680 CTAs on 264 slots.  Wave 1 (264 CTAs)
+lifetime median 29.5 µs but bimodal: the two co-resident CTAs of an SM differ
+by 10.5 µs median (fast ≈ 24, slow ≈ 34; CTA 0 is a fast one) — the converter
+groups of the two CTAs share the SM unfairly.  A16 pairs differ by 0.4 µs,
+converters-skipped by 1.2 µs.  Wave 2 (263 CTAs, start 26–44 µs) lifetime
+27.6, wave 3 (153 CTAs, start 54–70 µs) 25.4 (fewer co-runners → faster).
+Per-SM last end: p10 80.7, median 82.9, p90 95.0, max 96.5 µs → the 39-tile
+model (3 rounds × 27.6 = 83) describes the median SM; the wall is 13.6 µs
+(14 %) later because the last 153 CTAs are handed slots as they free (50–75 µs)
+and the last ones start at ~70 µs.  Perfect balance (Σ lifetimes / 264) would
+be 71.7 µs.  Fixed cost per CTA: prologue to first K ready 4.36 µs FP4
+(7.75 µs A16: TMA landing under full-wave DRAM contention), epilogue after the
+last PV 0.11 µs; per-CTA lifetime = 13 × cadence + ~4.5 µs, so 3 rounds pay
+~13 µs of fills.  Converters skipped: wall 63.3 µs = wave-1 lifetime 19.8 ×
+~3 + tail; Σ/264 = 48.2 µs (31 % quantization loss).  A16: waves 36.3 / 25.5
+/ 18.4 µs (DRAM-bound: lifetime scales with co-runners), 112 two-CTA slots
+idle from ~65 µs.
+
+**(c) Zero-code calibration `XQA_NB_SUB_SEQ=3` vs default 5 (production build,
+5 repeats × 5 trials, two rounds).**  A16 82.6/82.7 → 82.8/82.7 (×1.00), FP8
+91.4/91.5 → 96.9/96.7 (×1.059), FP4 96.5/96.0 → 103.3/103.0 (×1.072), mixed
+114.8/114.7 → 127.2/126.8 (×1.107).  Predicted 44/39 = 1.128 for a pure
+tile-time model; with the measured ~4.5 µs per-CTA fill the model gives
+(44 T + 2 F)/(39 T + 3 F) ≈ 1.05 plus tail differences, matching 1.06–1.11.
+The wave model holds once the per-CTA fill is included; [8]'s payoff is 2 of
+3 fills (~9 µs) plus the 13.6 µs slot-assignment tail.
+
+**(d) RT constants (`benchmarks/microbench/sm90_rt_constants.cu`, nvcc
+sm_90a, 128-thread CTA, 4000 iterations, cycles per iteration).**
+
+| primitive | 1 CTA/SM | +4 co-resident spinning warp groups | +9 (40 warps/SM, XQA-like) |
+|---|---|---|---|
+| mbarrier arrive(release) + try_wait(acquire) poll, 128 threads | 87 | 88 | 140–154 |
+| bar.sync id, 128 | 20.7 | 20.7 | 21 |
+| __syncwarp | 2 | 2 | 2 |
+| mbarrier arrive only (128 arrivals/phase) | 14 | 17–19 | 17–20 |
+| wgmma.fence + 1× m64n8k16 SS bf16 + commit + wait_group 0 | 57.7 | 57.7 | 57.7 |
+| 4× m64n8k16 + commit + wait | 113.5 | 113.6 | 113.6 |
+| 8× m64n8k16 + commit + wait (+18.3 cyc per extra MMA) | 185.5 | 185.6 | 185.6 |
+| 2× atomicMax smem (4 lanes/warp) | 26 | 26 | 26 |
+
+In the kernel the two-RT segments measure 452–556 cycles (rescale) → loaded
+RT ≈ 200–230 cycles; replacing an mbarrier RT with bar.sync saves ~120–200
+cycles per site under load (~65 isolated).  gemm0's 8 HGMMAs take 589–738
+cycles against a 185–227-cycle microbenchmark floor: ~400 cycles of
+descriptor arithmetic/issue on the critical path per tile (candidate lever).

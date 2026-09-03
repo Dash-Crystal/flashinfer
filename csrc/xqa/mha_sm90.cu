@@ -106,6 +106,44 @@ constexpr uint32_t nbIOThrds = warp_size * nbIOWarps;
 #ifndef MIXED_KV_TRACE
 #define MIXED_KV_TRACE 0
 #endif
+// With MIXED_KV_TRACE_TAIL=1 the traced window is the last nbTraceTiles tiles
+// of CTA 0 instead of the first (epilogue attribution).
+#ifndef MIXED_KV_TRACE_TAIL
+#define MIXED_KV_TRACE_TAIL 0
+#endif
+#if MIXED_KV_TRACE
+// Per-CTA lifetime records: %globaltimer and clock64 at kernel entry and at
+// main-loop end, plus smid / tile count.  Thread 0 of every CTA stores its
+// record here; the CTA that completes the last multi-block merge (or the last
+// CTA to finish when not multi-block) prints all of them.  Printing from
+// every CTA at exit was measured to hold slots for ~0.5 ms per wave (device
+// printf serializes), which destroyed the wave structure being measured.
+struct MixedKvCtaTraceRec {
+  unsigned long long gt0, gt1;
+  long long clk0, clk1;
+  uint32_t smid, iters, sub, pad;
+};
+constexpr uint32_t kMixedKvTraceMaxCtas = 8192;
+__device__ MixedKvCtaTraceRec g_mixedKvCtaTrace[kMixedKvTraceMaxCtas];
+__device__ unsigned long long g_mixedKvMergeTraceGt[kMixedKvTraceMaxCtas];
+__device__ uint32_t g_mixedKvMergeTraceSmid[kMixedKvTraceMaxCtas];
+__device__ uint32_t g_mixedKvCtaTraceCount;
+__device__ uint32_t g_mixedKvMergeTraceCount;
+__device__ inline void mixedKvPrintCtaTrace(uint32_t nbCtas, uint32_t nbMerges) {
+  for (uint32_t i = 0; i < nbCtas && i < kMixedKvTraceMaxCtas; i++) {
+    MixedKvCtaTraceRec const r = g_mixedKvCtaTrace[i];
+    uint32_t const bx = i % gridDim.x;
+    uint32_t const by = (i / gridDim.x) % gridDim.y;
+    uint32_t const bz = i / (gridDim.x * gridDim.y);
+    printf("CTA %u %u %u sm %u iters %u sub %u gt %llu %llu clk %lld %lld\n", bx, by, bz, r.smid,
+           r.iters, r.sub, r.gt0, r.gt1, r.clk0, r.clk1);
+  }
+  for (uint32_t i = 0; i < nbMerges && i < kMixedKvTraceMaxCtas; i++) {
+    printf("MERGE %u %u sm %u gt %llu\n", i % gridDim.x, i / gridDim.x, g_mixedKvMergeTraceSmid[i],
+           g_mixedKvMergeTraceGt[i]);
+  }
+}
+#endif
 // Stage depths in whole 64-token tiles; two of each keeps two CTAs per SM.
 #ifndef MIXED_KV_KDEPTH
 #define MIXED_KV_KDEPTH 3
@@ -321,6 +359,11 @@ struct alignas(128) SharedMem {
 #if MIXED_KV_TRACE
   static constexpr uint32_t nbTraceTiles = 8;
   long long trace[nbTraceTiles][16];
+  // Per-CTA lifetime: %globaltimer (ns, GPU-global) and clock64 (SM cycles)
+  // at kernel entry and after the main loop joins.  Printed by thread 0 of
+  // every CTA at exit (tile-time multiplier and tail histogram).
+  unsigned long long ctaGlobalTimer[2];
+  long long ctaClock[2];
 #endif
 #endif
 
@@ -1168,16 +1211,12 @@ __launch_bounds__(128 * ctaWarpGroups)
   assert(dynamicSmemSize() >= sizeof(SharedMem));
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 #if MIXED_KV_TRACE
-  auto const traceStamp = [&](uint32_t slot, uint32_t idxIter, bool roleWarp0) {
-    if (roleWarp0 && laneId() == 0 && idxIter < SharedMem::nbTraceTiles) {
-      smem.trace[idxIter][slot] = clock64();
-    }
-  };
-#define TRACE_STAMP(slot, it, w0) traceStamp((slot), (it), (w0))
-#else
-#define TRACE_STAMP(slot, it, w0) \
-  do {                            \
-  } while (0)
+  if (threadIdx.x == 0 && threadIdx.z == 0) {
+    unsigned long long gt;
+    asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(gt));
+    smem.ctaGlobalTimer[0] = gt;
+    smem.ctaClock[0] = clock64();
+  }
 #endif
 
   constexpr uint32_t nbKBarWarps = SharedMem::nbKBuf;
@@ -1237,6 +1276,20 @@ __launch_bounds__(128 * ctaWarpGroups)
   assert(idxKTileInit < nbTiles);
   uint32_t const nbIters = divUp(nbTiles - idxKTileInit, nbSubSeq);
   assert(nbIters >= 1);
+#if MIXED_KV_TRACE
+  auto const traceStamp = [&](uint32_t slot, uint32_t idxIter, bool roleWarp0) {
+    uint32_t const slotIter =
+        MIXED_KV_TRACE_TAIL ? idxIter + SharedMem::nbTraceTiles - nbIters : idxIter;
+    if (roleWarp0 && laneId() == 0 && slotIter < SharedMem::nbTraceTiles) {
+      smem.trace[slotIter][slot] = clock64();
+    }
+  };
+#define TRACE_STAMP(slot, it, w0) traceStamp((slot), (it), (w0))
+#else
+#define TRACE_STAMP(slot, it, w0) \
+  do {                            \
+  } while (0)
+#endif
 
   constexpr uint32_t gmmaInstK = gmma::instK<MathElem>;
   constexpr uint32_t grainsPerInstK = exactDiv(sizeof(MathElem) * gmmaInstK, grainBytes);
@@ -2168,9 +2221,36 @@ __launch_bounds__(128 * ctaWarpGroups)
   }
 #if MIXED_KV_TRACE
   __syncthreads();
+  if (threadIdx.x == 0 && threadIdx.z == 0) {
+    unsigned long long gt;
+    asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(gt));
+    smem.ctaGlobalTimer[1] = gt;
+    smem.ctaClock[1] = clock64();
+    uint32_t smid;
+    asm volatile("mov.u32 %0, %%smid;\n" : "=r"(smid));
+    uint32_t const linearCta = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    uint32_t const nbCtas = gridDim.x * gridDim.y * gridDim.z;
+    if (linearCta < kMixedKvTraceMaxCtas) {
+      g_mixedKvCtaTrace[linearCta] =
+          MixedKvCtaTraceRec{smem.ctaGlobalTimer[0], gt, smem.ctaClock[0], smem.ctaClock[1], smid,
+                             nbIters, nbSubSeq, 0};
+    }
+    __threadfence();
+    if (!isMultiBlockMode) {
+      uint32_t const old = atomicAdd(&g_mixedKvCtaTraceCount, 1U);
+      if (old + 1 == nbCtas) {
+        __threadfence();
+        mixedKvPrintCtaTrace(nbCtas, 0);
+        g_mixedKvCtaTraceCount = 0;
+      }
+    }
+  }
   if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 &&
       threadIdx.z == 0) {
     long long const t0 = smem.trace[0][8];
+    printf("TRACE cta0 clk0->t0(kl:start of first traced tile) %lld  t0->cta_end %lld  cta_total %lld  tiles %u  tail_window %d\n",
+           t0 - smem.ctaClock[0], smem.ctaClock[1] - t0, smem.ctaClock[1] - smem.ctaClock[0],
+           nbIters, int(MIXED_KV_TRACE_TAIL));
     for (uint32_t t = 0; t < SharedMem::nbTraceTiles && t < nbIters; t++) {
       printf("TRACE tile %u g0:kwait %lld mma %lld smax %lld xarr %lld | g1:vwait %lld xwait %lld rs %lld mma %lld | kl:start %lld iss %lld | vl:start %lld iss %lld | kc:ready %lld done %lld | vc:ready %lld done %lld\n",
              t, smem.trace[t][0] - t0, smem.trace[t][1] - t0, smem.trace[t][2] - t0,
@@ -2304,6 +2384,28 @@ __launch_bounds__(128 * ctaWarpGroups)
               outData;
         }
       }
+#if MIXED_KV_TRACE
+      __syncwarp();
+      if (wid == 0 && lane == 0) {
+        unsigned long long gt;
+        asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(gt));
+        uint32_t smid;
+        asm volatile("mov.u32 %0, %%smid;\n" : "=r"(smid));
+        uint32_t const idxMerge = blockIdx.x + gridDim.x * blockIdx.z;
+        uint32_t const nbMerges = gridDim.x * gridDim.z;
+        if (idxMerge < kMixedKvTraceMaxCtas) {
+          g_mixedKvMergeTraceGt[idxMerge] = gt;
+          g_mixedKvMergeTraceSmid[idxMerge] = smid;
+        }
+        __threadfence();
+        uint32_t const old = atomicAdd(&g_mixedKvMergeTraceCount, 1U);
+        if (old + 1 == nbMerges) {
+          __threadfence();
+          mixedKvPrintCtaTrace(gridDim.x * gridDim.y * gridDim.z, nbMerges);
+          g_mixedKvMergeTraceCount = 0;
+        }
+      }
+#endif
     } else if (wid < nbMathWarps + MultiBlockSMem::nbIOWarps) {
       static_assert(MultiBlockSMem::nbIOWarps <= MultiBlockSMem::nbBuf);
       ScratchMem const scratchMem{scratch, maxNbSubSeq * nbKHeads * batchSize, nbInputSeqSplit};
