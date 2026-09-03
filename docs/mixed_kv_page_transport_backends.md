@@ -177,3 +177,37 @@ Shared-memory budget (2 CTAs/SM ⇒ ≤ 112.5 KB): K/V stage 16 KB each, P entry
 4 KB, Q 8 KB, scales ring 1 KB/entry.  (K3, V3, X2) and (K3, V2, X4) both fit;
 (K3, V3, X4) does not.  The P ring was sized 4 because at 2 the two consumer
 groups run in lock step; which trade wins is measured, not assumed.
+
+### Converter budget, resolved by the full profile
+
+Level-3 trace (converter sub-stamps, fp4, steady state): landed → ready 0.17 µs,
+expansion 1.69, proxy fence + `produced` arrive 0.45, copy issue 0.64 (was 1.25
+before the lean issue path), commit → next tile landed 0.09.  Sum ≈ 3.0 µs =
+the cadence; landing is fully hidden by the two-ahead copies.
+
+Kernel-level scheduler statistics (`ncu --set full`): Issue Slots Busy 58 %,
+IPC 2.78, 9.2 active warps per scheduler, 1.7 eligible, **13.3 cycles per issued
+instruction per warp**.  The converter's ~230 instructions per lane per tile at
+13 cycles each *is* its fair share of a busy scheduler.  What keeps the
+scheduler busy: the barrier retry loops — `SYNCS.PHASECHK … TRYWAIT`,
+`SYNCS.CCTL.IV`, `BRA` — are *issued* instructions (stall reasons `selected` /
+`not_selected` / `long_sb` on the try-wait result, not `sleeping`), ~45 % of all
+samples.  XQA's sm90 `MBarrier::poll` spins on `mbarrier.try_wait` with a
+suspend hint the implementation caps; waiting warps steal issue from the
+converter warps they are waiting for — or so the sample mix suggested.  A bounded
+exponential `__nanosleep` backoff (32 → 512 ns) in the poll loop was measured and
+**rejected**: fp4 96.2 → 101.1 µs, mixed 114.4 → 124.3, issue-active 58 → 66 %,
+`sleeping` still 0.00, converter expansion unchanged at 1.6 µs.  The retry loop
+is not what paces the converter.
+
+**Where this leaves the sm90 decode host.**  FP8 (≈100 converter instructions per
+lane per tile) and FP4 (≈200) expand in the same ~1.6 µs, so the converter's
+wall time is not its ALU count either; it is the cost of the warp group's
+shared-memory writes, proxy fence and barrier traffic under a scheduler shared
+with 36 other warps.  With the converter warp group pacing the pipeline the
+cadence is ≈ 2.9 µs/tile → FP8 91 / FP4 96 / mixed 114 µs at q=1 against A16 83
+(consumer floor ≈ 62).  The remaining structural levers are more converter lanes
+per operand (the IO group's two Q warps and two loader warps are idle most of
+the tile) or a four-warp-group layout (fewer threads → 64 registers each,
+loader merged into the converters).  Both are real work with a bounded payoff
+(~20–30 %); neither is a tuning knob.
