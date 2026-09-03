@@ -58,23 +58,20 @@ struct SharedStorageQKVOMixed {
     cutlass::arch::ClusterBarrier barrier_O;
     typename MainloopPipeline::SharedStorage pipeline_k;
     typename MainloopPipeline::SharedStorage pipeline_v;
-    cutlass::arch::ClusterTransactionBarrier mixed_tma_bar_k[NUM_STAGES];
-    cutlass::arch::ClusterTransactionBarrier mixed_tma_bar_v[NUM_STAGES];
-    uint32_t mixed_phase_k;  // bit s: parity to wait for on mixed_tma_bar_k[s]
-    uint32_t mixed_phase_v;
   };
   alignas(16) uint8_t mixed_scales_k[NUM_STAGES][CTA_KV][8];
   alignas(16) uint8_t mixed_scales_v[NUM_STAGES][CTA_KV][8];
   // Tile metadata ring (shared by K and V of a tile): page indices, format
-  // tags, valid token count.  Three entries: the pair (K(t-1), V(t)) in flight
-  // plus tile t-2 being gathered for the next pair.
-  IdType mixed_meta_pages[3][CTA_KV / 16];
-  uint8_t mixed_meta_formats[3][CTA_KV / 16];
-  uint32_t mixed_meta_valid[3];
+  // tags, valid token count.  Four entries: the pending pair, the current pair
+  // (sharing one tile) and the tile gathered one pair ahead.
+  static constexpr uint32_t kMixedMetaRing = 4;
+  IdType mixed_meta_pages[kMixedMetaRing][CTA_KV / 16];
+  uint8_t mixed_meta_formats[kMixedMetaRing][CTA_KV / 16];
+  uint32_t mixed_meta_valid[kMixedMetaRing];
 
-  // D1: a page's 16 rows of one 64-element D-block must be one contiguous,
-  // 1024 B aligned 2 KB region (two SW128 atoms) so TMA SWIZZLE_128B boxes land
-  // in CuTe's layout, and the stage arrays must be 1024 B aligned.
+  // D1: the stage is tiled from 8-row x 128 B SW128 atoms (a page's 16 rows of
+  // one 64-element D-block are one contiguous 2 KB region) and 1024 B aligned,
+  // which is what the copies, the in-place expansion and wgmma all assume.
   // One stage = (CTA_KV/8 row groups) x (D/64 D-blocks) atoms of 8 rows x 128 B.
   static_assert(cute::cosize_v<SmemLayoutK> * sizeof(DTypeKV) / NUM_STAGES ==
                     (CTA_KV / 8) * (cute::size<1>(SmemLayoutK{}.shape()) / 64) * 1024,

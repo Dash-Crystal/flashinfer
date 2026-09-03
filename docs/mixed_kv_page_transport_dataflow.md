@@ -270,3 +270,43 @@ On sm120 only the XQA host exists; see `mixed_kv_page_transport_backends.md`.
   first `cp.async` producer overwrote the pending tile's record when issuing the
   next pair (fix: two records, `staged` → `pending`, rotated after the finish).
 - `cuobjdump -sass` counts: `UTMALDG` = Q only, `LDGSTS` > 0, `LDL`/`STL` = 0.
+
+### A5. C7 — the first K tile of a work item is committed before `barrier_O.wait`
+
+The consumer arrives on `barrier_O` for `work_idx > 0` only after it has
+received K(last) of the new item and issued the first QK GEMM
+(`mainloop_mma.cuh`).  The producer waits on `barrier_O` before it may write
+V (smem_v aliases smem_o).  A K(last) left *pending* across that wait therefore
+deadlocks: consumer ← K(last) ← producer ← `barrier_O` ← consumer.  Stock never
+hits this because its K(last) is committed at issue.  With deferred expansion
+the K(last) tile is finished (waited, expanded, committed) immediately after
+issue — one exposed copy latency per work item — and the conformance matrix must
+contain a case with more work items than CTAs (persistent scheduler) so that a
+CTA's *second* item begins with a compressed tile; the original 64-case matrix
+(one item per CTA) could not see this.
+
+Found by running the hung reproducer under `cuda-gdb`: all consumer warps on
+`full_k`, all producer warps on `barrier_O`.  Symptom before diagnosis: the
+trace build "worked" (timing) and the plain build hung only at benchmark scale.
+
+### A6. C6 — producer issue budget
+
+The producer warp group shares the SM's four schedulers with eight consumer
+warps, so its executed instructions per tile must stay near stock's (~6 per
+16 B copy: one address add, one predicate, one `LDGSTS`) for the consumer to
+remain the bound.  Every earlier producer violated this differently — TMA
+acceptance cost (~100–200 ns per box), per-copy 64-bit address arithmetic,
+per-copy CuTe address evaluation, rolled-loop control — and none of the fixes
+moved the total until the per-tile instruction count fell.  Copy ownership
+constants (D6) make every source `thread_const + page_term` and every
+destination `thread_const + i * PAGE_REGION_BYTES (+ ATOM_BYTES)`.  Checked with
+the per-item `%globaltimer` trace (`iss` segment) and PC sampling of the
+producer region, not by timing the kernel.
+
+Code-shape rules that fell out of the same measurements: one inlined copy of
+the pair routine (a lambda inlines at every call site); no runtime-selected
+`Operand` reference (forces both structs into local memory); decode writes
+`uint4` outputs per branch (an array assigned in two branches of a runtime
+format switch is materialised in local memory); the expansion is one body with
+the format as data (a fully unrolled block loop with a format branch inside is
+unswitched into two bodies).
