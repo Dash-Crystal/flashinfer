@@ -131,6 +131,16 @@ constexpr uint8_t kMixedBadPageFormat = 0xFF;
 #ifndef MIXED_KV_EXPERIMENT
 #define MIXED_KV_EXPERIMENT 0
 #endif
+#if MIXED_KV_TRACE
+// Per-SM count of resident CTAs of this kernel (trace builds only): +1 at CTA
+// start, -1 at CTA end; CTA 0 samples its SM's count mid-run and prints it.
+__device__ uint32_t mixedKvTraceSmResident[1024];
+__device__ inline uint32_t mixedKvTraceSmId() {
+  uint32_t r;
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(r));
+  return r;
+}
+#endif
 #endif
 constexpr uint32_t nbConvertWarps =
     ENABLE_MIXED_KV_CACHE ? 2 * convertWarpsPerOperand : 0;
@@ -321,6 +331,10 @@ struct alignas(128) SharedMem {
 #if MIXED_KV_TRACE
   static constexpr uint32_t nbTraceTiles = 8;
   long long trace[nbTraceTiles][16];
+  // SM residency probe: this CTA's %smid and the number of CTAs of this kernel
+  // resident on that SM when tile 4's slot 0 stamp is taken (includes self).
+  uint32_t traceSmId;
+  uint32_t traceResidentMid;
 #endif
 #endif
 
@@ -1171,6 +1185,9 @@ __launch_bounds__(128 * ctaWarpGroups)
   auto const traceStamp = [&](uint32_t slot, uint32_t idxIter, bool roleWarp0) {
     if (roleWarp0 && laneId() == 0 && idxIter < SharedMem::nbTraceTiles) {
       smem.trace[idxIter][slot] = clock64();
+      if (slot == 0 && idxIter == 4) {
+        smem.traceResidentMid = atomicAdd(&mixedKvTraceSmResident[smem.traceSmId], 0U);
+      }
     }
   };
 #define TRACE_STAMP(slot, it, w0) traceStamp((slot), (it), (w0))
@@ -1229,6 +1246,12 @@ __launch_bounds__(128 * ctaWarpGroups)
 #endif
     }
   }
+#if MIXED_KV_TRACE
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    smem.traceSmId = mixedKvTraceSmId();
+    atomicAdd(&mixedKvTraceSmResident[smem.traceSmId], 1U);
+  }
+#endif
   __syncthreads();
 
   uint32_t const nbPages = divUp(cacheSeqLen, tokensPerPage);
@@ -2180,6 +2203,12 @@ __launch_bounds__(128 * ctaWarpGroups)
              smem.trace[t][12] - t0, smem.trace[t][13] - t0, smem.trace[t][14] - t0,
              smem.trace[t][15] - t0);
     }
+    printf("TRACE cta0 smid %u residentCtasAtTile4 %u nbIters %u nbSubSeq %u grid %u x %u x %u\n",
+           smem.traceSmId, smem.traceResidentMid, nbIters, nbSubSeq, gridDim.x, gridDim.y,
+           gridDim.z);
+  }
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    atomicSub(&mixedKvTraceSmResident[smem.traceSmId], 1U);
   }
 #endif
   __syncthreads();

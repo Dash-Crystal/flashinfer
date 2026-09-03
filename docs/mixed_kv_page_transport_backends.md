@@ -288,3 +288,46 @@ the next block's LDS above the current STS).  [14] store-drain overlap is bounde
 fence + arrive share, 7-9.5 % of converter time (0.2-0.3 us/tile) — J1's -0.1..-0.2, not J2's
 -0.45.  Code-size cuts: not selected.  Spin/arbitration reduction (P0.5, [5]) is the remaining lever
 for the 20-27 % not_selected.
+
+### P0.5 [34] — fair-share vs latency-bound discriminator (nkcut2 H200, fp4 build, converters skipped)
+
+Build: `-DMIXED_KV_EXPERIMENT=1 -DMIXED_KV_TRACE=1` (expansion skipped, copies still issued and
+landed; `kc:done - kc:ready` = 26-31 cyc), `xqa_mha_sm90.cuda.o` REG 48.  q=1, S=4096, 8 KV heads,
+bf16, 5x5 bursts under the GPU lock, SM clock 1980 MHz throughout (co-tenant VLLM at 100 % SM).
+Cadence = `slot0(t+1) - slot0(t)` (gemm0 warp 0, after `kBar.produced` wait), tiles 2-7 of CTA 0,
+median over 25 timed launches; `slot7` (gemm1) agrees within 5 cyc.  Parser:
+`benchmarks/parse_xqa_trace.py --mode <bench mode> --skip-launches 6`.  Occupancy of CTA 0's SM
+was *measured*, not assumed: a trace-only probe (`mixedKvTraceSmResident[%smid]`, +1 at CTA start,
+-1 at end, sampled at tile 4) prints `residentCtasAtTile4`.
+
+| config | CTAs | CTAs on CTA 0's SM (probe) | warps / scheduler | fp4 cadence | A16 cadence |
+|---|---|---|---|---|---|
+| B=17 `XQA_NB_SUB_SEQ=1` (the plan's "136 CTAs = 1/SM") | 136 | **2** (136 > 132 SMs: the 4 excess CTAs land on SMs 124/128 where CTA 0 runs) | 10 | 1981 cyc = **1.001 us** | 1851 = 0.935 us |
+| B=17 default (n=5) | 680, 3 waves | 2 | 10 | 1986 cyc = **1.003 us** | 3443 = 1.739 us (DRAM-bound) |
+| B=16 `XQA_NB_SUB_SEQ=2` | 256, 1 wave | 2 | 10 | 1981 cyc = **1.001 us** | 3505 = 1.770 us (DRAM-bound) |
+| B=16 `XQA_NB_SUB_SEQ=1` | 128, 1 wave | **1** | 5 | 1662 cyc = **0.839 us** | 1598 = 0.807 us |
+
+The fp4 cadence with data always ready (the converter releases tile t 2267 cyc at 1 CTA/SM /
+2716 cyc at 2 CTAs/SM *before* gemm0 passes its wait; gemm0's end(t-1) -> kwait-done(t) is 158 /
+190 cyc, gemm1's 214 / 252, xBar produced -> xwait-done 42 / 65: no consumer wait is on data) is
+**1.00 us at 10 warps/scheduler and 0.84 us at 5**: halving the warps per scheduler removes 16 %
+(320 cyc) of the tile, not 50 %.  Every intra-tile segment shrinks by the same 4-19 % (gemm0 mma
+596 -> 529, colMax 660 -> 550, xarr 446 -> 420; gemm1 xwait 624 -> 502, rescale 446 -> 376, mma
+592 -> 570), none halves.  **Verdict: latency-bound** (round trips + dependent chains; issue-share
+tax <= 0.16 us/tile).  Per the plan's P0.5 mapping: only round-trip-removal levers pay ([4] [0] [2]
+[1] [33c] [11]); spin/warp-removal as an issue-relief argument ([9], [38]'s 1-CTA/SM arithmetic,
+[15]/[34] justified by "converters starved by spinners") is rejected — at most 0.16 us/tile of the
+consumer chain, and 0 of the converter's fair share is recoverable that way.
+
+Two corrections to the plan's numbers: (i) the plan's thresholds ("~1.0 -> fair-share, ~1.7 ->
+latency-bound") assumed a 10-warp baseline of 1.5-1.7 us/tile (62 us / 39); the measured
+converters-skipped consumer cadence is 1.00 us, so the absolute values must not be read against those
+thresholds — the ratio is the discriminator.  (ii) Wall vs cadence (no-trace `EXPERIMENT=1` build,
+same bursts): fp4 default 57.1 us = 39 tile-times x 1.0 + 18 us; B=16 n=4 (512 CTAs, 2 waves x 16)
+47.2 = 32 + 15; B=16 n=2 (256, 1 wave x 32) 42.85 = 32 + 11; B=16 n=1 (128, 1 x 64 at 0.84)
+51.2 (< 64 x 0.84 = 53.7: the trace window, tiles 2-7, runs ~10 % slower than the run average at
+1 CTA/SM); B=17 n=1 (136, the 4 doubled SMs pace the wall at 1.0 us) 71.9.  A16 transport (same
+build): default 82.3, n=1 84.5, B=16 n=1/2/4: 71.0 / 73.1 / 77.2 (3.4-4.0 TB/s).  The per-wave fixed
+cost (fill ~1.1-1.3 us to slot0(t=0), drain, merge) is 6-11 us and is P0.3's multiplier question.
+The `MIXED_KV_TRACE=1` build's own wall numbers are unusable (device printf: 950-990 us for every
+mode and split).
