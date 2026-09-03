@@ -149,6 +149,16 @@ constexpr uint32_t multiBlockMinNbTilesPerCta = 1;  // 3; // @fixme: need tuning
 constexpr uint32_t multiBlockMinNbTiles = multiBlockMinNbTilesPerCta * 2;
 constexpr uint32_t nbWarps = gemm0NbWarps + gemm1NbWarps + nbIOWarps + nbConvertWarps;
 
+// Hardware named barriers for the intra-warp-group syncs of the two GEMM warp
+// groups.  bar.sync id,128 replaces the mbarrier arrive + try_wait round trip
+// of the per-tile colMax / rescale exchanges; ids 1/2 are unused (the converter
+// groups sync with __syncwarp) and 0 is __syncthreads.  bar.sync orders shared
+// memory like membar.cta, so the exchanges it protects need no extra fence.
+constexpr uint32_t gemm0NamedBarId = 3;
+constexpr uint32_t gemm1NamedBarId = 4;
+__device__ inline void gemm0WarpGrpSync() { namedBarSync(gemm0NamedBarId, gemm0NbThrds); }
+__device__ inline void gemm1WarpGrpSync() { namedBarSync(gemm1NamedBarId, gemm1NbThrds); }
+
 constexpr uint32_t cacheHeadPartBytes = mha::min(paddedCacheHeadBytes, 128U);
 constexpr uint32_t cacheHeadNbParts =
     exactDiv(paddedCacheHeadBytes, cacheHeadPartBytes);  // @fixme: support divUp in the future
@@ -599,8 +609,7 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
 
 #if SWAP_AB
-__device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
-                                                   Gemm0Acc const& src);
+__device__ RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMax, Gemm0Acc const& src);
 __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t validRowBeg,
                                  uint32_t validRowEnd);
 __device__ void warpGrpOnlineSoftmax(Gemm0Acc& acc, RegColWiseVec const& colMax);
@@ -867,8 +876,7 @@ using Gemm1Acc = GmmaAcc<headElems, ctaNbQHeads>;
 __device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec const& shmXColMax,
                                                  ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
                                                  ShmQWiseVec& shmAccColMax, Gemm1Acc& acc,
-                                                 ShmQWiseVec& shmAccColSum,
-                                                 CtaBarrier& gemm1WarpGrpBar);
+                                                 ShmQWiseVec& shmAccColSum);
 template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(
     uint32_t threadRank, uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
@@ -1416,8 +1424,7 @@ __launch_bounds__(128 * ctaWarpGroups)
 #endif
       // update colMax in shared mem and get a register copy
 #if SWAP_AB
-      RegColWiseVec const colMax =
-          computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
+      RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0CurrentSeqMax, acc);
       warpGrpOnlineSoftmax(acc, colMax);
       TRACE_STAMP(2, idxIter, warpRank == 0);
 #else
@@ -1583,8 +1590,7 @@ __launch_bounds__(128 * ctaWarpGroups)
       // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc
       // instead.
       rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
-                                       smem.gemm1AccColMax, acc, smem.gemm1AccColSum,
-                                       smem.gemm1WarpGrpBar);
+                                       smem.gemm1AccColMax, acc, smem.gemm1AccColSum);
       TRACE_STAMP(6, idxIter, warpRank == 0);
 #else
       rescaleGemm1AccForNewRowMax_sync(warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf],
@@ -2988,8 +2994,7 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif  // SPEC_DEC
 
 // smemColMax is persistent across multiple iterations
-__device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar,
-                                                          ShmQWiseVec& smemColMax,
+__device__ inline RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMax,
                                                           Gemm0Acc const& src) {
   auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
@@ -3027,7 +3032,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar
       }
     }
   }
-  warpGrpBar.arrive_and_wait();
+  gemm0WarpGrpSync();
   uint32_t const idxInQuad = lane % 4;
 
 #pragma unroll
@@ -3038,7 +3043,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar
       colMax[n][j] = smemColMax[8 * n + 2 * idxInQuad + j];
     }
   }
-  warpGrpBar.arrive_and_wait();
+  gemm0WarpGrpSync();
   return colMax;
 }
 
@@ -3592,13 +3597,11 @@ __device__ inline void storeShmRowWiseVecNoDup(
 #if SWAP_AB
 __device__ inline void rescaleGemm1AccForNewColMax_sync(
     uint32_t warpRank, ShmQWiseVec const& shmXColMax, ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
-    ShmQWiseVec& shmAccColMax, Gemm1Acc& acc, ShmQWiseVec& shmAccColSum,
-    CtaBarrier& gemm1WarpGrpBar) {
+    ShmQWiseVec& shmAccColMax, Gemm1Acc& acc, ShmQWiseVec& shmAccColSum) {
   auto accColSum = loadShmColWiseVecNoDup(shmAccColSum);
 
   auto const xColMax = loadShmColWiseVecNoDup(shmXColMax);
   auto const accColMax = loadShmColWiseVecNoDup(shmAccColMax);
-  auto token = gemm1WarpGrpBar.arrive();
   auto const needRescaleVec = (accColMax < xColMax);
   UniformNeedRescaleMask rescaleMask;
   bool anyNeedRescale = false;
@@ -3641,7 +3644,10 @@ __device__ inline void rescaleGemm1AccForNewColMax_sync(
     }
     accColSum = accColSum * scaleVec;
   }
-  gemm1WarpGrpBar.wait(mha::move(token));
+  // Every warp has loaded the previous accColMax/accColSum and rescaled its
+  // accumulator; the group syncs once here (a split arrive -> work -> wait
+  // cannot be expressed with bar.sync) before warp 3 overwrites the smem copy.
+  gemm1WarpGrpSync();
 
   // @fixme: with atomic, we can let the first warp reaching here to do the update, instead of
   // always warp 3.
@@ -3656,7 +3662,7 @@ __device__ inline void rescaleGemm1AccForNewColMax_sync(
     }
     storeShmColWiseVecNoDup(shmAccColSum, accColSum);
   }
-  gemm1WarpGrpBar.arrive_and_wait();
+  gemm1WarpGrpSync();
 }
 #else
 __device__ inline void rescaleGemm1AccForNewRowMax_sync(uint32_t warpRank,

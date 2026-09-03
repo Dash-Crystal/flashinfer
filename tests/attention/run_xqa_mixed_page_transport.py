@@ -34,18 +34,28 @@ def _run(name, fn, *args):
 
 
 def main() -> int:
-    failures = 0
-    n = 0
+    # Optional `--shard i/n`: run only the cases whose index % n == i, so the
+    # per-module JIT compiles can be spread over several processes.
+    shard_idx, shard_n = 0, 1
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--shard":
+        shard_idx, shard_n = (int(x) for x in args[1].split("/"))
+    cases = []
     for mode in PAGE_MODES:
         for q_len, layout in SPANS:
-            n += 1
-            failures += _run(f"[{mode}-{layout}-{q_len}]",
-                             _mod.test_xqa_mixed_page_transport_matches_register_expansion,
-                             q_len, layout, mode)
+            cases.append((f"[{mode}-{layout}-{q_len}]",
+                          _mod.test_xqa_mixed_page_transport_matches_register_expansion,
+                          (q_len, layout, mode)))
     for q_len in (1, 64):
+        cases.append((f"[native_fp8-{q_len}]",
+                      _mod.test_xqa_native_block_fp8_matches_a16_expansion, (q_len,)))
+    failures = 0
+    n = 0
+    for i, (name, fn, fn_args) in enumerate(cases):
+        if i % shard_n != shard_idx:
+            continue
         n += 1
-        failures += _run(f"[native_fp8-{q_len}]",
-                         _mod.test_xqa_native_block_fp8_matches_a16_expansion, q_len)
+        failures += _run(name, fn, *fn_args)
     print(f"{n - failures} passed, {failures} failed")
     return failures
 
