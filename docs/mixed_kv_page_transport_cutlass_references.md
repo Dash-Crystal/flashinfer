@@ -215,25 +215,39 @@ drifting baseline.
 H200 burst measurements (Section 7 discipline; co-tenant present), q = 1, all 34
 transport cases bit-exact:
 
-| mode | before (cp.async gather) | now | tiles/s note |
+| mode | cp.async gather (start) | now | note |
 | --- | ---: | ---: | --- |
-| static A16 through the mixed kernel | 92 µs | 88-91 µs | reference cadence |
-| static E4M3 | 318 µs | ~104 µs | 3.1x faster; parity with A16 |
-| static E2M1 | 455 µs | ~111 µs | 4.1x faster; parity with A16 |
-| dynamic mixed pages | 477 µs | ~148 µs | 3.2x faster |
+| static A16 through the mixed kernel | 92 µs | 84 µs | DRAM-bound reference |
+| static E4M3 | 318 µs | 91 µs | 3.5x; A16 + 8% |
+| static E2M1 | 455 µs | 95 µs | 4.8x; A16 + 13% |
+| dynamic mixed pages | 477 µs | 108 µs | 4.4x |
 
-What was fixed, in order of measured effect: (1) per-lane `cp.async` gather replaced by
-one elected-lane TMA per page (byte-typed maps for compressed pages, whole-head rows
-once per tile); (2) the load warp no longer waits for its scale copies before issuing
-the TMA (that serialized two DRAM round trips per part and alone accounted for the
-E4M3 deficit); (3) the grid is split by an occupancy-aware chooser so the ~83 KB CTA
-(two per SM) fills every SM without a straggler wave — 136 CTAs at two per SM had been
-running on 68 SMs.
+Data flow as shipped (per CTA, 64-token tile, 2 CTAs per SM, ~100 KB smem):
 
-What remains: the compressed kernels now run at the same per-tile cadence as the A16
-kernel (~1.4 µs per 64-token tile per CTA), which is latency- rather than
-bandwidth-bound; K stage depth 3 and 4 measured identical to 2 (4 also drops to one CTA
-per SM). Turning the byte reduction into wall-clock therefore needs the cadence itself
-shortened — more tiles in flight per SM through the softmax/X hand-off, not deeper K/V
-staging — and that change applies to the A16 kernel equally. Compile time for
-`mha_sm90.cu` is ~4 s.
+```
+1 K-load warp: smem page-metadata chunk (refilled per 16 tiles) -> per tile: wait stage,
+               one TMA batch (A16 parts / whole-head compressed rows into the stage's last
+               part buffer), block scales two tiles ahead via cp.async, one wait_group
+4 K-convert:   wait stage -> one lane per (token, head part): 64 values, one tag, one scale
+               word, in-place expansion (read all, named barrier, write all) -> release
+gemm0 (4):     one wait per tile -> GMMA both parts -> softmax -> P into a 4-deep X ring
+gemm1 (4):     wait V stage + X -> rescale -> GMMA -> release           (V mirrors K)
+```
+
+Where the time goes now — measured, not inferred (ncu, FP4, per 64-token tile per CTA):
+~5750 warp-instructions issued at 66% issue-slot utilization; converters are 3350 of
+them (~420 per lane per 64 values: the prmt-LUT E2M1 decode is ~3 instructions per value,
+the block-scale multiply 0.5, the rest addressing/predication), the consumer skeleton
+(GMMA descriptors, softmax reductions, X hand-off, barriers) ~2100 — the same as the A16
+kernel, where it hides under DRAM time. The compressed kernel is therefore
+**instruction-issue-bound**, not latency-bound: converters-idle runs 82 µs, everything
+off 62 µs. Stage depth (K 3, V 3), in-place vs. separate packed buffers, and scale
+hoisting each changed the result by <5%.
+
+Consequences: (1) at this tile shape the remaining lever is the consumer skeleton's
+~2100 instructions per 64 tokens, which a 128-row consumer (FA3's) amortizes twice as
+well — that is the q>1 mainloop anyway; (2) per-value decode cost is at the software
+floor for Hopper (no native E2M1 conversion), so E2M1 will always carry ~3 ALU
+instructions per value on sm90; on sm120 the native `cvt` removes that. Compile time for
+`mha_sm90.cu` is ~4 s. `MIXED_KV_TRACE=1` prints per-role clock64 stamps for CTA 0;
+`MIXED_KV_EXPERIMENT` bits 1/2/4 idle converters / compressed TMA / scale copies.

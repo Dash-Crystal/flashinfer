@@ -125,10 +125,25 @@ CUtensorMap makeTensorMapForPackedKVPages(void const* addr, uint32_t rowBytes, u
   uint64_t const globalStrides[] = {stride_head_bytes, stride_token_bytes, stride_page_bytes};
   uint32_t const boxDims[] = {partBytes, 1, tokensPerPage, 1};
   uint32_t const elemStrides[] = {1, 1, 1, 1};
+  // Swizzle whole rows so consumers reading one 16 B chunk per token across
+  // 8 consecutive tokens hit distinct banks.  The box inner extent must equal
+  // the swizzle span.
+  auto const swizzle = [&] {
+    switch (partBytes) {
+      case 128:
+        return CU_TENSOR_MAP_SWIZZLE_128B;
+      case 64:
+        return CU_TENSOR_MAP_SWIZZLE_64B;
+      case 32:
+        return CU_TENSOR_MAP_SWIZZLE_32B;
+      default:
+        return CU_TENSOR_MAP_SWIZZLE_NONE;
+    }
+  }();
   checkCu(cuTensorMapEncodeTiled(&tensorMap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
                                  const_cast<void*>(addr), globalDims, globalStrides, boxDims,
-                                 elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                 CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                 elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE,
                                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return tensorMap;
 }

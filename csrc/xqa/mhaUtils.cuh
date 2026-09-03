@@ -477,41 +477,84 @@ __device__ inline uint32_t scaleA16x2Pair(uint32_t a16x2Bits, uint8_t scaleBits0
 }
 
 template <flashinfer::KVPageFormat format, typename A16>
+__device__ inline void expandCompressedBlock16WithScale(uint32_t sf2, LdGrain& first,
+                                                        LdGrain& second);
+
+// Broadcast an A16 scale to both halves once per block; the per-pair multiply
+// is then a single mul.rn.{bf16,f16}x2.
+template <typename A16>
+__device__ inline uint32_t broadcastA16Scale(uint16_t a16ScaleBits) {
+  return uint32_t(a16ScaleBits) | (uint32_t(a16ScaleBits) << 16);
+}
+
+template <typename A16>
+__device__ inline uint32_t mulA16x2(uint32_t x, uint32_t sf2) {
+  uint32_t ret;
+  if constexpr (mha::is_same_v<A16, half>) {
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(ret) : "r"(x), "r"(sf2));
+  } else {
+    static_assert(mha::is_same_v<A16, __nv_bfloat16>);
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(ret) : "r"(x), "r"(sf2));
+  }
+  return ret;
+}
+
+// Four E4M3 block scales (one 32-bit word) -> four A16 scales, bit-identical to
+// static_cast<A16>(float(scale) * globalScale) per element.
+template <typename A16>
+__device__ inline Vec<uint16_t, 4> convertE4M3x4ScalesToA16Bits(uint32_t scaleWord,
+                                                               float globalScale) {
+  uint32_t lo16x2, hi16x2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo16x2) : "h"(static_cast<uint16_t>(scaleWord)));
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi16x2) : "h"(static_cast<uint16_t>(scaleWord >> 16)));
+  float2 const lo = __half22float2(reinterpret_cast<__half2 const&>(lo16x2));
+  float2 const hi = __half22float2(reinterpret_cast<__half2 const&>(hi16x2));
+  Vec<uint16_t, 4> out;
+  auto const pack = [&](float a, float b, uint32_t idx) {
+    A16 const sa = static_cast<A16>(a * globalScale);
+    A16 const sb = static_cast<A16>(b * globalScale);
+    out[idx] = reinterpret_cast<uint16_t const&>(sa);
+    out[idx + 1] = reinterpret_cast<uint16_t const&>(sb);
+  };
+  pack(lo.x, lo.y, 0);
+  pack(hi.x, hi.y, 2);
+  return out;
+}
+
+template <flashinfer::KVPageFormat format, typename A16>
 __device__ inline void expandCompressedBlock16InPlace(
     uint8_t scaleBits, float globalScale, LdGrain& first, LdGrain& second) {
+  expandCompressedBlock16WithScale<format, A16>(
+      broadcastA16Scale<A16>(convertE4M3ScaleToA16Bits<A16>(scaleBits, globalScale)), first,
+      second);
+}
+
+// sf2: the block's A16 scale broadcast to both 16-bit halves.
+template <flashinfer::KVPageFormat format, typename A16>
+__device__ inline void expandCompressedBlock16WithScale(uint32_t sf2, LdGrain& first,
+                                                        LdGrain& second) {
   using flashinfer::KVPageFormat;
   static_assert(format == KVPageFormat::kBlockScaledFP8 ||
                 format == KVPageFormat::kBlockScaledFP4);
-  uint16_t const a16ScaleBits =
-      convertE4M3ScaleToA16Bits<A16>(scaleBits, globalScale);
-  auto storeScaledA16Pair = [&](uint32_t pair, uint32_t a16x2Bits) {
-    uint32_t const scaled =
-        applyF16ScalingFactor<A16>(a16x2Bits, a16ScaleBits);
-    if (pair < 4) {
-      first[pair] = scaled;
-    } else {
-      second[pair - 4] = scaled;
-    }
-  };
   if constexpr (format == KVPageFormat::kBlockScaledFP8) {
     LdGrain const packed = first;
 #pragma unroll
     for (uint32_t pair = 0; pair < 8; ++pair) {
-      uint16_t const fp8x2 =
-          reinterpret_cast<uint16_t const*>(&packed)[pair];
-      storeScaledA16Pair(pair, convertE4M3x2ToA16<A16>(fp8x2));
+      uint16_t const fp8x2 = reinterpret_cast<uint16_t const*>(&packed)[pair];
+      uint32_t const scaled = mulA16x2<A16>(convertE4M3x2ToA16<A16>(fp8x2), sf2);
+      if (pair < 4) {
+        first[pair] = scaled;
+      } else {
+        second[pair - 4] = scaled;
+      }
     }
   } else {
-    uint32_t const packedLo = first[0];
-    uint32_t const packedHi = first[1];
-    Vec<uint32_t, 4> const convertedLo =
-        convertE2M1x8ToA16<A16>(packedLo);
-    Vec<uint32_t, 4> const convertedHi =
-        convertE2M1x8ToA16<A16>(packedHi);
+    Vec<uint32_t, 4> const convertedLo = convertE2M1x8ToA16<A16>(first[0]);
+    Vec<uint32_t, 4> const convertedHi = convertE2M1x8ToA16<A16>(first[1]);
 #pragma unroll
-    for (uint32_t pair = 0; pair < 8; ++pair) {
-      storeScaledA16Pair(pair,
-                         pair < 4 ? convertedLo[pair] : convertedHi[pair - 4]);
+    for (uint32_t pair = 0; pair < 4; ++pair) {
+      first[pair] = mulA16x2<A16>(convertedLo[pair], sf2);
+      second[pair] = mulA16x2<A16>(convertedHi[pair], sf2);
     }
   }
 }
