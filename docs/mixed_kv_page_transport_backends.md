@@ -115,3 +115,65 @@ A16 (237 µs) to 1.24× faster:
 Open on sm120: no prefill-shaped host exists for mixed pages (the FA3 host is
 sm90-only); q ≥ 64 through XQA is 1.6–2× slower than A16 and should route to the
 sm12x prefill backend once one carries the page-transport contract.
+
+## sm90 (H200) XQA decode host: where the compressed-format time goes
+
+Measured on H200 (B=17, S=4096, 8 KV heads, GQA 4, q=1; bursts; 34/34 bit-exact).
+Byte roofline at 4.8 TB/s: A16 59 µs, FP8 32, FP4 17, mixed 36.
+
+### Attribution with the kernel's built-in experiment bits
+
+| mode | production | converters skipped | no compressed TMA | no TMA, no scales |
+|---|---|---|---|---|
+| A16 transport | 83.7 | 83.6 | 83.8 | 83.7 |
+| FP8 | 90.6 | 65.2 | 80.9 | 75.0 |
+| FP4 | 94.9 | 61.8 | 86.0 | 80.6 |
+| mixed | 108.5 | 73.8 | (n/a) | (n/a) |
+
+Read as a stack for FP4: ≈47 µs is the consumer chain itself (gemm0 → softmax →
+P hand-off → gemm1 at 2 CTAs/SM; 45 % of PC samples are barrier spins), ≈15 µs
+exposed compressed loads, ≈33 µs exposed conversion.  Mixed-dtype-ness adds
+nothing beyond its share of conversion.  E2M1/E4M3 arithmetic is ~10 % of samples.
+
+### Per-tile timeline (MIXED_KV_TRACE, CTA 0, steady state)
+
+| | FP4 | A16 |
+|---|---|---|
+| consumer cadence per 64-token tile | 1.95 µs | 1.6 µs (bandwidth-bound: 5–7 µs landing) |
+| loader TMA issue per tile (8 boxes) | 1.0–1.7 µs | 1.0 µs |
+| TMA issue → bytes landed | ~1.7 µs | 5–7 µs |
+| converter ready → done | 1.0–1.6 µs | 0.1 µs |
+
+With two K stages the compressed chain per stage is issue + landing + conversion
+≈ 4.3 µs → one tile every ~2 µs: pipeline-depth-bound, not ALU- or bandwidth-bound.
+
+### Structural changes made, and what each measured
+
+1. **Converter warps copy compressed pages themselves** (cp.async, one warp per
+   page, warp-contiguous chunk ownership, scales included); the loader's TMA is
+   A16-only.  Loader issue per tile fell 1.0–1.7 → 0.2 µs.  cp.async landing
+   under the saturated memory system measured **~1.9 µs**, so with two stages the
+   cadence became landing + expansion = 2.8 µs — worse.  Landing latency at
+   3.4 TB/s of aggregate traffic is a fact to cover with depth, not to remove.
+2. **Copies two tiles ahead → three K and V stages.**  +32 KB of shared memory
+   (84 → 114 KB) cost the second CTA per SM (limit 112.5 KB), which cost more
+   than it gained; with the P ring 4 → 2 (110.6 KB) two CTAs fit again — but
+   only after the register budget was fixed (below).  Converter period is then
+   ≈ (landing + expansion) / 2 ≈ 1.5 µs, at gemm0's floor.
+3. **Register budget.** The kernel has no `setmaxnreg`; every warp lives with the
+   launch allocation, so `__launch_bounds__` minBlocksPerSM *is* the register
+   budget.  The mixed build declared 1 (and `OPTIMIZE_FOR_LATENCY=1` drops the
+   floor entirely), so the allocation floated to 58 registers/thread and two
+   640-thread CTAs (≤ 51) no longer fit; the driver then also chose a one-block
+   shared-memory carveout.  Declaring `(640, 2)` unconditionally gives 48
+   registers and both occupancy limits = 2.  The SPEC_DEC (q > 1) variant wants
+   226 registers statically and spills heavily (`LDL` hot in PC sampling; mixed
+   q=4 935 µs vs FP4 276) — a separate item.
+4. **Converter hazard barrier**: the read-before-write hazard of in-place
+   expansion is intra-warp (a warp covers one page's (token, head-part) lanes),
+   so the 128-thread named barrier per tile per operand is a `__syncwarp`.
+
+Shared-memory budget (2 CTAs/SM ⇒ ≤ 112.5 KB): K/V stage 16 KB each, P entry
+4 KB, Q 8 KB, scales ring 1 KB/entry.  (K3, V3, X2) and (K3, V2, X4) both fit;
+(K3, V3, X4) does not.  The P ring was sized 4 because at 2 the two consumer
+groups run in lock step; which trade wins is measured, not assumed.
