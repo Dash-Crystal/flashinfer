@@ -671,3 +671,48 @@ are gone since [45c]).  Expected SASS: `LDG` in `loadPages` 1 (+1 tag, dyn) per 
 4 + 1 (K) / 2 + 1 (V); `R2UR` fed by the page-index `LDG` 0; `LDGSTS` count unchanged.
 Registers: K -6, V -2 per stage pair if the vectors were vector registers (0 if ptxas held them in
 URs, which the `R2UR` suggests); +0 otherwise.
+
+### 8.5 [45a] — one fold vote per call (commit "[45a]")
+
+File: `csrc/xqa/mhaUtils.cuh`, `expandMixedPartialHeadsInPlaceBF16Placement` body (the
+signature, lane constants and entry / exit `__syncwarp` are [44]'s; the stock helper is
+untouched).  `foldScalePairFinite` is replaced by `kMixedFoldBound = 255.5 * 2^120` and
+`foldScalesFinite(finite, foldOk) = __all_sync(~0, foldOk && finite)`.  Four building-block
+lambdas with compile-time format / fold tags: `block(fmt, fold, p, a, b, sf2)` (decode + two
+`STS.128`), `loadBlock(fmt, addr, p)` (`LDS.128` / `LDS.64`), `scalePair(fmt, fold, s01, sf2_0,
+sf2_1)` (the span's two bf16x2 scale broadcasts from its scale word), `spanFinite(s01, gFold)`
+(`fmaxf(|s_0 g 2^k|, |s_1 g 2^k|) < bound` — the [44] per-span compare, so a NaN pair (zero
+scales with `|g| >= 2^8`) still fails and forces the fallback).
+
+```
+static fp8 / fp4:
+  s01[s] = LDS.U16 [scaleAddr + 64 s]  for s < nbSpans          (4 K / 2 V, independent)
+  packed[0] = LDS [addr0], packed[1] = LDS [addr2]              (span 0, before the vote: loads-first)
+  finite = AND_s spanFinite(s01[s], g 2^k)                       (F2FP.E4M3, 2 HADD2, 2 FMUL, FMNMX, FSETP per span)
+  fold = VOTE.ALL(foldOk && finite)                              (ONE per call; was one per span)
+  spans<fold>: for s (unrolled): s > 0 ? LDS [addr0 + 2048 s], LDS [addr2 + 2048 s]
+               sf2 pair = scalePair(s01[s])                      (recompute: 1 F2FP + 2 HADD2 + 2 FMUL + 2 PACK)
+               block(packed[0] -> addr0, addr1); block(packed[1] -> addr2, addr3)
+dynamic:
+  pre-vote (unrolled over the 4 spans): fmt = byte s of formatWord; s01 = LDS.U16;
+     finite &= (fmt is FP8 | FP4) ? spanFinite(s01, fmt == FP8 ? g8 2^120 : g4 2^126) : true   (SELECT)
+     foldOk &= fmt == FP8 ? |g8| >= 2^-117 : fmt == FP4 ? |g4| >= 2^-117 : true
+  fold = VOTE.ALL(foldOk && finite)
+  for span (rolled, #pragma unroll 1): fmt byte -> if FP8 / FP4: expandSpan<fmt>:
+     s01 = LDS.U16 (again; a register array indexed by the rolled span would go to local memory),
+     packed = LDS x2, fold ? body<true> : body<false>  (uniform branch on the call-level flag)
+```
+
+Exactness: unchanged — both bodies give the reference's single rounding `bf16_rn(x *
+bf16_rn(s g))` ([44] rev 2), so moving a span from the fold body to the fallback body changes no
+bit; the call takes the fallback iff some span's pair fails its own per-span compare (evaluated
+exactly as before) or a present format has `|g| < 2^-117`.  Dyn A16 / BAD spans contribute
+`true` by select, never through a multiply of their (unwritten) scale word.  Static BAD spans
+(tail parts) keep their pre-existing stale word: bit-identical to [44] for that span, and a
+possible perf-only fallback of the other spans of that call (section 3.1 follow-up).
+Live set across the vote (static): `s01[nbSpans]` (4) + span 0's payload (8) = 12 vs [44]'s `s01,
+r0, r1, f0, f1` (5) + payload (8): **-1 register**; the dyn pre-vote temporaries die before the
+loop.  Expected SASS (A1): `VOTE.ALL` in the expansion 2 per module (K call, V call; fp8 module
+had 6), `F2FP.F16.E4M3` in the static K body 4 before the vote + 1 per span in each fold body,
+one `BRA` on the vote per call; `LDS.U16` per K call 4 (static) / 8 (dyn: pre-vote + body);
+`LDS.128` / `LDS.64` 2 and `STS.128` 4 per span unchanged; no LDL / STL.
