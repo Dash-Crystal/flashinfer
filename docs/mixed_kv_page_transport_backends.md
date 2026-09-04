@@ -683,3 +683,149 @@ instruction-fetch stall, which is a code-size / dispatch problem of the sm90
 SPEC_DEC dynamic build (287 KB of SASS), and the plan's step 3 (route q=4 mixed
 to `mha_sm90.cu`, whose converters are format-uniform per stage) or a
 code-size lever in `mha.cu`'s dynamic path is the next item.**
+
+### Track S step 3 — [40] per-page format dispatch in the mha.cu dynamic path (2026-09-04, nkcut2 H200, worktree E)
+
+**Route decision (arithmetic before any build).**  Plan step 3 proposed routing
+q=4 mixed pages to `mha_sm90.cu` SPEC_DEC after deepening its `nbKBuf = nbVBuf = 2`.
+`sizeof(SharedMem)` of `mha_sm90.cu` with the mixed build's flags
+(`CACHE_ELEM_ENUM=5 SPEC_DEC=1 SPEC_Q_SEQ_LEN=4 HEAD_GRP_SIZE=4 HEAD_ELEMS=128`,
+`ctaNbQHeads` = 16, `nbXBuf` = 2), measured by compiling a copy of the file with
+`nbKBuf/nbVBuf` forced to `MIXED_KV_KDEPTH/VDEPTH` and an incomplete-type print
+of the constants (cap for two CTAs per SM: 112.5 KB = 115,200 B):
+
+| stages K / V | K bufs | V bufs | X/out ring (2 x max(2 KB X, 4 KB out)) | Q | rest (scales 4 KB, meta 1.25 KB, colmax/sum, barriers) | sizeof(SharedMem) | 2 CTAs/SM |
+|---|---|---|---|---|---|---|---|
+| 2 / 2 (today) | 32,768 | 32,768 | 8,192 | 4,096 | ~7,168 | **84,992 B (83.0 KB)** | yes |
+| 3 / 2 | 49,152 | 32,768 | 8,192 | 4,096 | ~7,168 | **101,376 B (99.0 KB)** | yes |
+| 3 / 3 | 49,152 | 49,152 | 8,192 | 4,096 | ~7,168 | **117,760 B (115.0 KB)** | **no (+2,560 B over the cap)** |
+
+(q=1 control from the same method: K3/V3 = the shipping 108.5 KB layout, `ctaNbQHeads` 8, X entry 2 KB, Q 2 KB.)
+So 3/3 only fits at 2 CTAs/SM with a 4 KB `OutSwizzleBuf` aliasing change to the
+K ring (X entries back to 2 KB -> 113,664 B); 3/2 fits as is.  But the smem is
+not the blocker: in the mixed q=4 module the compiled `xqa_mha_sm90.cuda.o`
+kernel is a **16-instruction, 4-register stub** — `mha_sm90.cu:1089` guards the
+body with `(IS_SUPPORTED_F16_CASE || CACHE_ELEM_ENUM == 2)`, and
+`IS_SUPPORTED_F16_CASE` (`:53`) requires `!SPEC_DEC` for enum 5.  Routing q=4
+mixed pages there means writing the SPEC_DEC (SWAP_AB) variant of the mixed
+loader/converter kernel in a Track A/B-owned file, on top of the known
+full-draft-mask defect of that path (upstream #4199 / #4198, the reason
+`xqa.py:566-575` forces `mha.cu` for `swap_ab_eligible` shapes).  Prediction if
+it were built (q=1 cadences fp8 91 / fp4 96 / mixed 114 are converter-bound at
+~1.0-1.3 us/tile; the SWAP_AB consumer at N=16 instead of 8 adds elementwise
+softmax work, not GMMA issue): fp8 ~95-110, fp4 ~100-115, mixed ~120-135 us at
+2 CTAs/SM with K3/V2 — attractive, but a multi-day kernel item, not a step-3
+routing change.  **Route taken: (b), the code-size lever in `mha.cu`.**
+
+**Attribution of the 17.9 K instructions (`-lineinfo` cubins, `nvdisasm
+--print-line-info-inline`, instructions bucketed by the `kernel_mha_impl`-level
+call site; sm90 q=4, per module).**  On sm90 `compactMixedPages` is false, so
+the MMA loop was already the stock A16 loop; the excess is entirely in the copy
+and expansion helpers, which were instantiated with a per-block runtime format
+branch inside their fully unrolled block loops (8 iterations x 3 predicated
+LDGSTS variants per K part, 8 x 2 expansion bodies), and the dynamic module in
+addition carried the stock A16 `copyPartialHeadsAsync` path at every site:
+
+| call site (mha.cu, a93d090e lines) | dyn (-1) | fp4 (2) | a16 (0) |
+|---|---|---|---|
+| `runGemm0` :2576 total | 6,031 | 2,957 | 1,620 |
+| .. `loadKTilePart` inside gemm0 :2497 (2 parts) | 3,105 | 1,150 | 1,321 |
+| .. K `expandMixedPartialHeadsInPlace` :2519 | 2,543 | 1,481 | 2 |
+| .. `smemQKPartGemm` :2559 | 373 | 316 | 289 |
+| V `expandMixedPartialHeadsInPlace` :3179 | 2,686 | 1,449 | 0 |
+| `loadVTilePart` in loop :3076 | 2,338 | 698 | 1,409 |
+| `loadKTilePart` prologue :2443 | 1,604 | 531 | 752 |
+| `loadVTilePart` prologue :3014 | 1,250 | 357 | 817 |
+| everything else (softmax, rescale, merge, output) | ~3,660 | ~3,395 | ~3,405 |
+| **total** | **17,912** | **9,968** | **8,552** |
+
+dyn - fp4 = 7,944: copy paths +5.5 K (A16 fast path 2.1 K at K + 2.3 K at V, the
+FP8 LDGSTS variant and its address math), expansion +2.3 K (the FP8 bodies).
+The hot footprint of one tile iteration (mixed copy + both expansion bodies for
+2 K parts + V + consumer) was ~145 KB of the 287 KB dyn kernel vs ~108 KB (fp4)
+and ~75 KB (a16), which matches the "instruction fetch" stall appearing only
+for the dynamic module.
+
+**Lever [40] (`csrc/xqa/mhaUtils.cuh copyMixedPartialHeadsAsync`,
+`expandMixedPartialHeadsInPlace`; `csrc/xqa/mha.cu` K/V copy call sites).**
+A warp instruction of either helper covers blocks of a single page (blocksPerSpan
+= 16 tokens x blocksPerPart >= 32 for every supported part width), so the format
+is warp-uniform per page.  Both loops are now page-outer: per page span, read
+`pages[]`/`formats[]` once (`selectByIndex` chain), branch once, and run a
+format-specialised body (`MixedFormatTag<f>` generic lambda; `if constexpr` on
+A16/FP8/FP4) over that page's unrolled block iterations.  The page loop is
+`#pragma unroll 1` in the dynamic module (`mixedPageLoopUnroll` = 1 when
+`MIXED_PAGE_STATIC_FORMAT < 0`) and fully unrolled in the static modules, where
+the tag is the build constant, the branch vanishes and the code shape is the
+previous one.  The dynamic module routes every tile through the per-page copy
+(`kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0` gates the stock
+`copyPartialHeadsAsync` call), its A16 body being the stock two-grain (2 x 16 B)
+copy; FP8 2 x 8 B and FP4 1 x 8 B per block are unchanged from [29].  A16-only
+tiles still skip the expansion via `kNeedsExpansion`.  Prediction: dyn SASS
+17.9 K -> 6-8 K (a16 base ~4.3 K non-copy code + one copy of each body per
+site), hot footprint ~70 KB, no_instruction stall -> the static modules' level,
+warp-cycles/instruction 10 -> ~5, mixed q=4 420 -> 220-250 us (<= 1.05x fp4);
+static modules within +-2 %.
+
+**Artifact (sm90 q=4, `cuobjdump -sass` / `-res-usage` of `xqa_mha.cuda.o`).**
+
+| module | SASS instr before -> after | LDGSTS static | BRA | REG | STACK / LDL / STL |
+|---|---|---|---|---|---|
+| dyn (format -1) | **17,912 -> 8,824** | 455 -> 137 | 306 -> 206 | 239 -> 249 | 0 / 0 / 0 |
+| fp4 (2) | 9,968 -> 9,792 | 119 -> 119 | 130 -> 132 | 254 -> 240 | 0 / 0 / 0 |
+| fp8 (1) | 9,016 -> 8,912 | 191 -> 191 | 140 | 254 -> 238 | 0 / 0 / 0 |
+| a16 (0) | 8,552 -> 8,552 (identical) | 221 | 98 | 236 | 0 / 0 / 0 |
+
+dyn after, by call site: `runGemm0` 2,308 (copy 1,251 for 2 parts, K expansion
+718, MMA 327); the dynamic module is now smaller than the fp4 static module.
+
+**ncu (sm90 q=4, one launch of 136 CTAs, `--launch-skip 1 --launch-count 1`,
+co-tenant present so durations are ncu-serialized; the same metric list on the
+pristine a93d090e checkout `dash-flashinfer-claude-wtEs3base` and on the patched
+tree):**
+
+| metric | mixed before (a93d090e) | mixed after | fp4 after |
+|---|---|---|---|
+| smsp__average_warp_latency_per_inst_issued (warp-cycles / issued instr) | 10.01 (record 10.04) | **4.52** | 5.06 |
+| smsp__average_warps_issue_stalled_no_instruction_per_issue_active | 6.21 (record: "6.3 cycles waiting to be selected to fetch an instruction") | **0.52** | 0.77 |
+| smsp__inst_executed.sum | 48.11 M | 46.36 M | 48.31 M |
+| smsp__inst_executed_op_ldgsts.sum (issued) | 924,800 | 555,648 | 361,216 |
+| issued warp per scheduler | 0.20 | 0.44 | 0.39 |
+| registers / achieved occupancy | 239 / 12.3 % | 249 / 12.2 % | 240 / 12.3 % |
+| gpu__time_duration (serialized) | 545.6 (record 540.7) | 283.6 | 311.0 |
+
+The fetch stall is gone (0.52 warps stalled per issue-active cycle, below the
+fp4 module's 0.77); the dynamic module now issues 4 % fewer instructions than
+fp4 (no predicated-off LDGSTS address math for the other two formats: issued
+LDGSTS 924,800 -> 555,648 = the real 2 x 1/3 FP8 + 1 x 1/3 FP4 + 2 x 1/3 A16 copies
+plus scales).
+
+**Timing (flock'd, `--repeats 2 --trials 5`, three rounds interleaved with other
+agents' GPU use; medians per round; q=1 is the untouched `mha_sm90.cu` control):**
+
+| mode | q=4 a93d090e (prev. record r1/r2/r3) | q=4 [40] r1 / r2 / r3 | q=4 [40] min / max over rounds | q=1 control before -> after |
+|---|---|---|---|---|
+| transport_a16 (a16 module, byte-identical SASS) | 131.4 / 131.3 / 131.5 | 136.4 / 136.4 / 136.8 | 135.9 / 137.6 | 83.0 -> 82.9 |
+| fp8 | 198.8 / 198.2 / 197.6 | 199.2 / 198.7 / 198.0 | 196.4 / 199.5 | 91.4 -> 91.2 |
+| fp4 | 239.5 / 238.9 / 239.8 | 237.5 / 236.1 / 236.9 | 234.8 / 238.6 | 96.1 -> 96.0 |
+| mixed | 424.8 / 422.8 / 422.2 | **217.1 / 216.4 / 216.0** | 214.8 / 218.3 | 115.9 -> 115.6 |
+
+Same-session pristine-baseline round (`dash-flashinfer-claude-wtEs3base`, SASS 17,912 confirmed, one locked round after the three [40] rounds): a16 136.2, fp8 201.3, fp4 242.7, mixed 426.6 — so within this session mixed is 426.6 -> 216.4 (0.507x), fp4 242.7 -> 236.9 (-2.4 %), fp8 201.3 -> 198.7 (-1.3 %), a16 136.2 vs 136.4 (byte-identical module, +0.1 %).  The a16 module is
+byte-identical, so its +3.8 % against the record is the session's co-tenant/clock
+offset (the record's rounds were 137.7 before [29]); against the same-session
+baseline fp8/fp4 gain 1-2 % from the per-page copy (page-stride products once
+per page instead of once per block).
+**mixed q=4: 422.8 -> 216.4 us (0.51x), 0.915x fp4 q=4 — Track S acceptance
+(<= 1.5x fp4) met; the mixed stream (2/3 compressed pages) is now faster than
+the pure fp4 stream, as its expansion work is smaller.**  Correctness:
+`run_xqa_mixed_page_transport.py` 34/34 bit-exact (fresh workspace, includes
+the q=4 NHD/HND mixed cases).
+
+**Against the q=4 targets (FP8 <= 94, FP4 <= 59, mixed <= 101; A16 135):** FP8
+198, FP4 236, mixed 216 — none pass; all three sit at 1 CTA/SM (255-register
+SPEC_DEC build, 12 % occupancy, 0.4 issued instructions per scheduler-cycle,
+DRAM 7-14 %).  The remaining lever set for sm90 q=4 is occupancy/waves, not the
+mixed dispatch: `XQA_NB_SUB_SEQ=4` (0.85x on every mode, needs the host
+`nbSubSeqPerSeq` default from the per-CTA fixed-cost model), and a 2-CTA/SM
+SPEC_DEC build (register budget 128 with the C2-free code, or the `mha_sm90.cu`
+SPEC_DEC mixed path whose smem arithmetic is above).

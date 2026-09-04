@@ -67,13 +67,19 @@ def _run_many_items(mode: str) -> int:
         last = torch.full((B,), kv_len - (pages_per_req - 1) * P, dtype=torch.int32, device=dev)
         q = torch.randn(B, H * 4, D, dtype=dtype, device=dev)
         ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
-        w = BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="fa3",
-                                                jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D))
-        w.plan(qo_indptr, kv_indptr, kv_indices, last, H * 4, H, D, P, causal=False,
-               q_data_type=dtype, kv_data_type=dtype)
+        static = {"fp8": 1}.get(mode)
+        w_ref = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=0))
+        w = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=static))
+        for x in (w_ref, w):
+            x.plan(qo_indptr, kv_indptr, kv_indices, last, H * 4, H, D, P, causal=False,
+                   q_data_type=dtype, kv_data_type=dtype)
         a16 = t._replace(page_format=torch.zeros_like(t.page_format))
-        ref = w.run(q, (rk, rv), *mixed_page_prefill_run_args(a16, D ** -0.5, 0, "NHD"))
-        out = w.run(q, (ck, cv), *mixed_page_prefill_run_args(t, D ** -0.5, {"fp8": 1}.get(mode), "NHD"))
+        ref = w_ref.run(q, (rk, rv), *mixed_page_prefill_run_args(a16, D ** -0.5, 0, "NHD"))
+        out = w.run(q, (ck, cv), *mixed_page_prefill_run_args(t, D ** -0.5, static, "NHD"))
         torch.cuda.synchronize()
         assert torch.equal(out, ref), "not bit-exact"
         print(f"PASS {name}", flush=True)

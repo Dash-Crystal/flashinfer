@@ -86,6 +86,12 @@ constexpr bool compactMixedPages = MIXED_COMPACT_PAGES && tokensPerPage == 16;
 #else
 constexpr bool compactMixedPages = false;
 #endif
+// [40] (Track S step 3): the dynamic module (static format -1) routes every tile
+// through copyMixedPartialHeadsAsync, whose per-page A16 body is the stock two-grain
+// copy, so it carries no separate copyPartialHeadsAsync instantiations (their code
+// sat between the hot mixed copy/expansion bodies of a kernel that stalled on
+// instruction fetch).  Static modules keep the stock A16 path.
+constexpr bool kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0;
 
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
@@ -2387,11 +2393,11 @@ CUBIN_EXPORT __global__
         smem.kFormats[warpIdx.x][idxNextSMemKBuf] = pageFormats;
       }
       __syncwarp();
-      if (!needsExpansion && isFullTile) {
+      if (kA16CopyFastPath && !needsExpansion && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
                               grainBytes, grainBytesGmemCache, qkSwizzle, true>(
             warp, dst, dstHeadOffset, src, idxPart);
-      } else if (!needsExpansion) {
+      } else if (kA16CopyFastPath && !needsExpansion) {
         uint32_t const nbHeadsAvail =
             seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
@@ -2923,7 +2929,7 @@ CUBIN_EXPORT __global__
                      ? cacheSeqLen - seqOffset
                      : 0U);  // may also be full but it can be handled correctly anyway
 #if ENABLE_MIXED_KV_CACHE
-      if (!needsExpansion) {
+      if (kA16CopyFastPath && !needsExpansion) {
         copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp,
                        grainBytes, grainBytesGmemCache, vSwizzle, false>(
             warpIdxInGrp, dst, src, nbHeadsAvail);
@@ -2956,12 +2962,12 @@ CUBIN_EXPORT __global__
                : 0U);  // may also be full but it can be handled correctly anyway
       bool const isFullTile = (seqIter + 1 < nbSeqIters);
 #if ENABLE_MIXED_KV_CACHE
-      if (!needsExpansion && isFullTile) {
+      if (kA16CopyFastPath && !needsExpansion && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
                               gemm1WarpsPerGrp, grainBytes, grainBytesGmemCache,
                               vSwizzle, true>(warp, dst, dstHeadOffset, src,
                                               warpIdxInGrp);
-      } else if (!needsExpansion) {
+      } else if (kA16CopyFastPath && !needsExpansion) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
                               gemm1WarpsPerGrp, grainBytes, grainBytesGmemCache,
                               vSwizzle, false>(
