@@ -155,7 +155,13 @@ possible for any assignment of whole tiles.  The CTA containing tile `x` is
 `c(x) = floor(x * P / T)` (proof: `ceil(cT/P) <= x  <=>  cT/P <= x  <=>  c <=
 xP/T`).  For sequence `s` with linear extent `[L_s, L_s + tiles(s))`:
 
-    c0 = c(L_s),  c1 = c(L_s + tiles(s) - 1),  nbPartials(s) = c1 - c0 + 1
+    c0 = c(L_s),  c1 = c(L_s + tiles(s) - 1),  nbPartials(s) = min(c1 - c0 + 1, tiles(s))
+
+(Review fix: when T < P a CTA holds at most one tile, so CTAs strictly inside
+[c0, c1] can be empty — `x_c == x_{c+1}` — and never arrive on the semaphore;
+the count of non-empty CTAs is then exactly tiles(s).  When T >= P no CTA is
+empty and the `min` is the identity.  The merger enumerates the i-th non-empty
+CTA as `c0 + i` (T >= P) or `c(L_s + i)` (T < P).)
 
 **Why static and not an atomic pull.**  A pull queue of equal items of `s`
 tiles gives max load `ceil(N/P) * s`: with today's 13-tile items (680 of them)
@@ -483,6 +489,10 @@ per-item reset exists anywhere (requirement (a)).
 | IO warp 3 (merge) | 40 | cursor 8 + 8 fp32 acc + 4 data + sum/max/ptrs | ~28 |
 | converters | 56 | head LDS at copy issue (transient) | unchanged (188 / 187 SASS expansion) |
 
+(Outcome, recorded at confirmation in section 10: none of the fallbacks in
+this section — smem cursor, IO at 48 — was needed; every module is 40/56 with
+0 stack / 0 spill and two `USETMAXREG`.)
+
 If the IO group does not fit 40 with the cursor in registers and the smem
 cursor also spills, the pool admits IO at 48 with the GEMM groups at 40:
 2x128x40 + 128x48 + 2x128x56 = 30720 exactly; the `.dec 40` at :1207 then
@@ -543,12 +553,22 @@ Build checks (each module: static a16 / fp8 / fp4 and the mixed module):
 1. `ptxas -v` on the TU with the ninja flags (`/tmp/main_ptx/ninja_flags.py`):
    no C7507; 0 bytes stack frame, 0 spill stores, 0 spill loads.
 2. `cuobjdump -sass`: `USETMAXREG` = 2 (`DEALLOC 0x28`, `TRY_ALLOC 0x38`); `LDL`
-   = `STL` = 0; `UTMALDG` count unchanged per module (A16 K/V boxes in the a16
-   and mixed modules; 0 in the fp8/fp4 static modules, `mixedLoaderTma` false);
-   `LDGSTS` > 0; exactly one `ATOM...INC` (the
-   semaphore) and no `ATOMS`; gemm0/gemm1 SYNCS.PHASECHK / ARRIVE / BAR.SYNC
-   counts unchanged from the round-2 baseline (gemm0 1 / 3 / 12, gemm1 1 / 7 /
-   11; HGMMA 8 + 8) — the item loop adds no barrier sites to the GEMM roles.
+   = `STL` = 0; `UTMALDG` = 8 in the a16 and mixed modules (the K and V loaders
+   are one code path with operand-selected addresses, so the 16 sites of the
+   baseline halve; the dynamic box count per tile is unchanged) and 0 in the
+   fp8/fp4 static modules (`mixedLoaderTma` false); `LDGSTS` > 0; exactly one
+   `ATOM...INC` (the semaphore) and no `ATOMS`.  Barrier sites **per role**
+   (`xqa_sm90_converter_sass.py`-style split of the SASS by the warp-group
+   branch, not kernel totals — the totals fall with the loader merge and the
+   deleted `MultiBlockSMem` epilogue and cannot show whether a GEMM role gained
+   a site): gemm0 SYNCS.PHASECHK / ARRIVE / BAR.SYNC 1 / 3 / 12 as the baseline;
+   gemm1 1 / 7 / 11 plus the in-loop finalize's `warpGrpBar` syncs, executed
+   once per item (the finalize moved from the epilogue into the loop; its
+   per-tile path gains no site); HGMMA 8 + 8.  Accepted cost: five
+   `CALL.REL.NOINC` sites to ptxas' 64-bit division subroutine (prologue scan
+   x0 / x1; merge warp c0 / c1 / x_{c1+1}) plus one in the T < P branch of the
+   merge enumeration — once per CTA or once per partial item, on no per-tile
+   path.
 3. `cuobjdump -res-usage`: REG 48 (launch cap), STACK 0; smem = the new
    `sizeof(SharedMem)`; `cudaOccupancyMaxActiveBlocksPerMultiprocessor` = 2.
 
@@ -625,10 +645,12 @@ ncu (one kernel, `--launch-skip` past warm-up): `launch__grid_size` = 264,
 7. The conformance runner cannot take the `XQA_PERSISTENT_CTAS` override:
    without the P = 1 / P = 3 / T < P cases the persistent path's item
    boundaries are untested (the existing matrix has one item per CTA).
-8. `ctaNbValidQHeads > 8` or `isHeadPadded` builds are requested on this path:
-   the register merge (16 elements per lane) is sized for headGrpSize <= 8 x
-   D=128; other configurations keep the existing grid (compile-time
-   `MIXED_KV_PERSISTENT` off, `static_assert`).
+8. (Withdrawn for head counts by 8.6; replaced by:) the Q warp is written for
+   `needInputCvt == false` (bf16 KV cache, `CACHE_ELEM_ENUM = 5`, the only
+   configuration of this matrix): `static_assert(nbQLdWarps == 1 && nbQLdThrds
+   == warp_size)` in the Q warp.  An fp8-cache mixed build (`nbQLdWarps` > 1)
+   fails to compile rather than misbehave; extending the Q warp to a multi-warp
+   converter is out of this round's scope.
 9. The semaphore region is not zero at first use in the target deployment —
    the same requirement the current multi-block path has; not new, but with
    P-indexed scratch a stale semaphore now corrupts a different sequence's
@@ -636,6 +658,10 @@ ncu (one kernel, `--launch-skip` past warm-up): `launch__grid_size` = 264,
 
 Scope: `ENABLE_MIXED_KV_CACHE && !SPEC_DEC` only; SPEC_DEC (Track S) and the
 non-mixed sm90 kernel keep `chooseNbSubSeq` and the `1 x n x (B*H)` grid.
+Unverified by this change: the sliding-window bookkeeping (`seqSkipTokens`,
+`seqTilesInUse`, `validBeg = skip % 64` on `t == 0`) is compiled out in every
+module of the matrix (`SLIDING_WINDOW = 0`); it is written to the same
+arithmetic as the non-persistent path but has no conformance case.
 
 ---
 
@@ -706,6 +732,15 @@ gemm0 consumed 32(f+1)+16c-7 -> converters produced it -> they passed
 `issue(32f+16c)` (their wait on phase f) — the waiter is never two phases
 behind.  The fill loop itself is two-phase so its latency does not scale with
 the number of items in the chunk (8.4).
+
+Slack budget, stated: the fill's synchronous page-table pair blocks the loader
+for ~0.75-1.25 us at iteration 16k-4, which delays its `consumed.arrive` for
+tile 16k-3; the converters' `issue(16k-2)` parity wait needs that arrive, so
+the slack is two tile periods (~2.3 us fp8 / fp4) against a 1.25 us worst
+case — adequate, not large.  The confirmation trace with `TILE0 = 11` and
+`TILE0 = 27` must show `kc_ready(16)` and `kc_ready(32)` at the steady-state
+period; if it does not, the fallback is `MIXED_KV_META_LEAD` 6-8 (WAR-safe
+for any lead <= 15 by 8.1), not a change of protocol.
 
 ### 8.3 `ItemCursor` (blocker 2 and notes)
 

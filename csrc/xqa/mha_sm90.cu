@@ -2299,8 +2299,14 @@ __launch_bounds__(128 * ctaWarpGroups)
           uint32_t const Lend = Lseq + item.tiles;
           uint32_t const c0 = static_cast<uint32_t>(uint64_t(Lseq) * nbCtas / nbTotalTiles);
           uint32_t const c1 = static_cast<uint32_t>(uint64_t(Lend - 1) * nbCtas / nbTotalTiles);
-          uint32_t const nbPartials = c1 - c0 + 1;
+          // Partials = non-empty CTAs in [c0, c1].  T >= P: |R_c| >= 1, so every CTA
+          // in the range holds a tile (c1 - c0 + 1 <= tiles).  T < P ("sparse"):
+          // |R_c| <= 1, so exactly item.tiles of them are non-empty and the empty
+          // ones (x_c == x_{c+1}) never arrive on the semaphore.
+          bool const sparse = nbTotalTiles < nbCtas;
+          uint32_t const nbPartials = mha::min(c1 - c0 + 1, item.tiles);
           assert(nbPartials >= 2 && c0 <= blockIdx.x && blockIdx.x <= c1);
+          assert(sparse || nbPartials == c1 - c0 + 1);
           // 1. This CTA's chunk for item j is written (gemm1 -> st.release.cta).
           for (;;) {
             uint32_t fin;
@@ -2329,6 +2335,9 @@ __launch_bounds__(128 * ctaWarpGroups)
           if (old == nbPartials - 1) {
             // 3. Last arriver: combine chunks {2c+1 | c0 <= c < c1} and the c1 chunk
             //    (2c1+1 iff CTA c1's range ends with the sequence, else 2c1) (C11).
+            //    The i-th non-empty CTA is c0 + i (T >= P) or the owner of sequence
+            //    tile i, floor((Lseq + i) * P / T) (T < P; c(x) is then strictly
+            //    increasing and c(Lend - 1) == c1).
             ScratchMem const scratchMem{scratch, 2 * nbCtas, 1};
             uint32_t const xC1End = static_cast<uint32_t>(
                 (uint64_t(c1 + 1) * nbTotalTiles + nbCtas - 1) / nbCtas);
@@ -2351,7 +2360,10 @@ __launch_bounds__(128 * ctaWarpGroups)
                 Acc8 acc = Acc8::filled(0.f);
                 float sum = 0.f;
                 float mx = safeInitRowMax;
-                for (uint32_t c = c0; c <= c1; c++) {
+                for (uint32_t i = 0; i < nbPartials; i++) {
+                  uint32_t const c =
+                      sparse ? static_cast<uint32_t>(uint64_t(Lseq + i) * nbCtas / nbTotalTiles)
+                             : c0 + i;
                   uint32_t const chunk = (c < c1) ? 2 * c + 1 : lastChunk;
                   if (valid) {
                     float2 const sm = __ldcg(reinterpret_cast<float2 const*>(
