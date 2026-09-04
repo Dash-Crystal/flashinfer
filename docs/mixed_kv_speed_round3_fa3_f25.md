@@ -1305,3 +1305,54 @@ Count per pair per warp (bench mix): ~790 (3.5).
 5. Tests: 104 cases (`run_fa3_mixed_page_transport.py`; exit code = failures):
    64 matrix + 2 many-items + 6 parity-tail + 4 extremes-tail + 18 extremes + 6
    NaN-tail + 4 dynamic-uniform.
+
+### F25e results (2026-09-04, nkcut2 H200, wt/F25 @ dd583e36; full tables in docs/mixed_kv_page_transport_backends.md, "Track F [25]")
+
+Run order as in section 6 and the open items above: 104 / 104 bit-exact
+(three builds), SASS + `ptxas -v` gates, gate 6.0, bench, trace, ncu.  Builds
+2 and 3 changed only source forms after reading build 1's SASS (commit
+dd583e36: `page_src` / `compressed_base` as PTX `mad.wide.u32`, vote chains
+bitwise): the C++ 64-bit address form had compiled to `IMAD.WIDE.U32` + a
+high-word `VIADD` of a materialised zero + `LDC` + `MOV`s (~7 per copy), and
+the `&&` chains to `BSSY` / `@P BRA` / `BSYNC`.
+
+| gate (rev 2, section 6) | measured | verdict |
+|---|---|---|
+| 6.5 tests | 104 / 104, every build | met |
+| `USETMAXREG` 0x88 / 0xB8; ptxas no C7507; STACK 0 | as designed for fp8, fp4, dyn (a16 0x48 / 0xD8); 0 B frame, 0 spills, 168 launch regs, all four modules | met |
+| region 2100-2400 | fp8 **2584**, fp4 2664, dyn 5528 | miss (+184 / +264): copies 3 instr each (below) + protocol |
+| body (C12): `VOTE.ALL` per operand, no `BRA.DIV`, no `UMOV` / `IMAD.MOV` in bodies, hot 258 / cold 258 | hot 210 / cold 267 / vote prep 52 (fp8); `VOTE.ALL` 2 (loop), 0 in bodies; `BRA.DIV` 0, `WARPSYNC` 0 (a `NOP` at the `__syncwarp` point), `UMOV` 0 in bodies | met |
+| C12 addendum (landing `LDS.64` x 12 -> `__syncwarp` -> scale `LDS.32` x 6) | read at all four operand sites | met |
+| copy path: `IMAD.WIDE.U32` 24, `IADD3.X` <= 4, `VIADD` <= 4, `LDGSTS` 24 (12 predicated), `BSSY` 0 | 24 / 3 / 7 / 24 (12) / **1** (the [23] gather); **plus `IADD3` 29 + `IMAD.X` 21**: ptxas lowers `mad.wide.u32 d, page, stride, base64` as `IMAD.WIDE.U32 d, page, UR, RZ` + `IADD3` + `IMAD.X` - the per-item base never sits in an aligned pair (two source forms tried); peel folded (loop `LDGSTS` without src-size predicates) | `IMAD.WIDE` met; adds miss (+48 per pair) |
+| protocol <= 70 | ~143 (loop site 1294 - 2 x 529 bodies - 48 copies - 45 split adds) | miss |
+| dyn: 36 predicated `LDGSTS` per operand, `SEL` 0 on addresses, no `FLO` in copies, `LDL/STL` 0, 4 `VOTE.ALL` per finish site | 36 (71 / 72 predicated per pair) / 0 / 0 / 0 / 4; `BRA.DIV` 1 + `WARPSYNC` 1 per pair in `chunk_store`'s `REDUX.OR` ([24c] table build) | met except the table-build `BRA.DIV` |
+| a16 module, stock kernel byte-identical to 5cc416fd | stock: identical (2 kernels x 4 objects); **a16: 56 / 3832 instructions differ, all a permutation of four uniform registers** (same opcodes, same order); PTX alpha-equivalent up to one swapped `selp` / `xor` pair (pipeline-state advance) at 8 sites - nvcc's schedule under the peeled loop; the shared-file diff vs 5cc416fd is `kernel_traits.cuh` + the `constexpr` hook in `prefill_sm90.cuh` only (md5 of the other five files equal) | stock met; a16 miss on the letter, identical instruction stream; `transport_a16` bench unchanged (282.8 / 289.5) |
+| 6.0 (a16 `LDGSTS` PCs: mio + lg throttle <= 5 %) | 0.0 % (dispatch 42, wait 23, not_selected 23) | met: keep 12 warps |
+| 6.2 trace fp8 (q=1): `iss` <= 0.30, `fin` <= 1.1, `acq` >= 0.25, `wait` <= 0.05 | **0.38** / 0.96-1.01 / 0.57 / 0.02 (F24: 0.66 / 1.0-1.16 / 0.10 / 0.03); fp4 `fin` 1.14-1.20 (expK 0.68, expV 0.38); mixed `iss` 1.63-1.78 unchanged from F24c | `fin`, `acq`, `wait` met; `iss` miss; the `acq` is a kernel-start reading (ncu below) |
+| 6.3 ncu fp8: producer `inst_executed` per pair 2500-2750 | **2865** (716 / warp; F24 4432; [23] 3417); fp4 2959; **dyn 4842** (1211 / warp vs ~790 modelled) | fp8 +4 % over the band; dyn count model wrong |
+| producer `selected` >= 25 % | fp8 22.7 (F24 15.2), fp4 22.3, dyn 23.9 | miss by 2.3 points |
+| stall mix: branch_resolving <= 1, no_inst <= 2, dispatch <= 12, mio+lg <= 5, short_sb <= 10 | fp8: < 1 / 2.7 / **17.1** / 0 / 8.8; dyn: `no_inst` **10.2** (+ 8.8 not-issued) | dispatch miss; dyn instruction-cache miss |
+| consumer K-wait PC <= 3 % | fp8 **10.2 %** (F24 16.5), fp4 18.0 %, dyn 37.3 %, a16 2.5 % | miss: the producer paces |
+| consumer `inst_executed` == 3301 per pair | 3301 / 3301 / 3302 (a16 3316) | met (184 registers cost the consumer nothing) |
+| LSU shared wavefronts per pair <= 2050; op_st <= 450; `STS.128` <= 4.5 / instr | fp8 1871 / **512** / **5.41** (fp4 1961 / 408 / 4.31; dyn 1945 / 263 / 4.16) | total met; fp8 st miss (same store pattern as fp4: not the addresses) |
+| tensor pipe within 3 % of a16 (67.1 %) | 47.2 / 44.8 / 29.2 % | miss |
+| 6.4 bench (us, q=1 / q=64 medians): stock 297-303 / 306-312; a16 281-290 / 284-292; fp8, fp4 <= 330; mixed centre 340 | stock 300.9 / 310.9; a16 282.8 / 289.5; **fp8 402.8 / 414.9; fp4 422.2 / 429.7; mixed 650.0 / 664.4** (F24 460 / 476, 496 / 512, 718 / 728) | controls hold; **fp8 / fp4 / mixed reject** (-12.5 / -14.8 / -9.5 % vs F24) |
+
+Reading of the miss (section 9's model was count x IPC): the count is 716 per
+warp against 655 (+9 %: +48 split adds, ~+70 protocol, vote prep 52 vs 14) and
+the IPC 0.23 against 0.27 (-15 %): 716 / 0.23 = 3113 cycles = 1.57 us per pair
+(model 655 / 0.27 = 1.22 us), against a consumer tile of ~1.35 us -> the
+producer paces (K-wait 10 %).  The IPC shortfall sits at two chains the pc
+samples name: the scale-load -> `PRMT` -> `F2FP` -> `HADD2` -> `FMUL` ->
+`FSETP` -> `VOTE` chain (the top producer PC, 5.4 % of samples, `short_sb`
+behind the first scale `LDS.32`: the C12-addendum order puts six scale loads
+and their latency between the landing loads and the vote, once per operand)
+and the copy address chain (`IMAD.WIDE` / `IADD3` / `IMAD.X`, `dispatch` /
+`wait`, ~6 %).  The dynamic module additionally misses the instruction cache
+(`no_inst` 10 %: eight rolled loop variants over three sites = 5528
+instructions) and its `iss` did not move (1.6-1.8 us).  Follow-ups (backends
+doc, numbered 1-5): scale loads under the landing loads; a 32-bit page offset
+when the host bounds `page x stride`; one loop body per format with the
+hot / exact choice predicated (or the 6.4 sorted-page table) for the dynamic
+module; read the fp8 `STS.128` PCs; the a16 letter-identity via the [23] loop
+text under `STATIC_A16` if required.

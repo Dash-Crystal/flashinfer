@@ -2018,3 +2018,174 @@ top 28.
   `__syncwarp` is provably converged again and the 22 `BRA.DIV` guards
   disappear), (d) the a16-style 12-warp layout re-measured with (a)-(c) before
   deciding whether the second warp group pays for its protocol duplication.
+
+### Track F [25] — FA3 compressed prefill: 12-warp producer at 136 / 184 registers, one fold vote per operand, per-item copy bases, predicated dynamic copies (2026-09-04, nkcut2 H200, worktree F25, design docs/mixed_kv_speed_round3_fa3_f25.md)
+
+Commits dbb91659 (F25a), fe35a0e4 (F25b), 2f199e5f (F25c), f5855609 (F25d),
+086fc064 (review fixes), dd583e36 (F25e copy-path forms) on wt/F25 over
+64a70b9c (wt/F24 merged).  F24b's second producer warp group is reverted: of
+the shared Hopper files only `kernel_traits.cuh` (MixedAttentionKernelTraits:
+PRODUCER_REGS / CONSUMER_REGS + the pool static_assert) and `prefill_sm90.cuh`
+(the `kMixedTraits` register hook, `constexpr`) differ from `5cc416fd`;
+`named_barrier.cuh`, `epilogue.cuh`, `sparse_mainloop.cuh`, `variants.cuh`,
+`mainloop_mma.cuh` are byte-identical to `5cc416fd` (md5).  Verification order
+as in design section 6 / "Open items for F25e": tests, SASS + ptxas gates, gate
+6.0, bench, trace, ncu.  Three builds were made; builds 2 and 3 changed only the
+copy-address source form and the vote chains after reading build 1's SASS
+(commit dd583e36); every build was 104 / 104 bit-exact.  Artifacts
+`nkcut2:/tmp/mixedkv-wtF25-art/` (`run1/`, `run2/` = earlier builds; the top
+level = the final build dd583e36: `sf{-1,0,1,2}_mask1.sass`, `counts.log`,
+`loopsite_{fp8,fp4,dyn}.log`, `ptxas_*.log`, `sass_all.log`, `tests.log`,
+`bench_final.txt`, `trace_q1.txt`, `ncu_a16*`, `ncu_fp8*`, `a16_f2{3,5}.ptx`).
+
+**Correctness.**  `run_fa3_mixed_page_transport.py`: **104 / 104 bit-exact**
+(64 matrix + 2 many-items + 6 parity-tail + 4 extremes-tail + 18 extremes + 6
+NaN-tail + 4 dynamic-uniform), on objects built after each run's start (`.o`
+mtimes checked), all three builds.
+
+**SASS gates (design 6.1, rev 2; `cuobjdump -sass` of the `*_paged_sm90_kernel_mask_1`
+persistent kernel; producer region = `USETMAXREG.DEALLOC .. EXIT`; loop site =
+the pair loop's back-edge body).**
+
+| gate | fp8 (`static_format_1`) | fp4 (`_2`) | dynamic (`_-1`) | accept | verdict |
+|---|---|---|---|---|---|
+| `USETMAXREG` | `DEALLOC 0x88` / `TRY_ALLOC 0xB8` | same | same | 0x88 / 0xB8 | met (a16 keeps 0x48 / 0xD8) |
+| `ptxas -v` | no C7507, `0 bytes stack frame, 0 spill`, 168 regs at launch | same | same (F24's 32 B frame gone) | no C7507, STACK 0 | met |
+| region count | **2584** (F24: 2093 single-arm; [23] 2687) | 2664 | 5528 (F24 3235) | 2100-2400 | **miss** (+184 / +264): copies +48 per site x 5 sites (below) and protocol |
+| loop site | **1294** = 2 x (52 vote prep + 210 hot + 267 cold) + 24 `IMAD.WIDE.U32` + 24 `LDGSTS` + 45 `IADD3`/`IMAD.X` (the split 64-bit adds) + ~143 protocol | 1343 (hot 222 / cold 279) | 2391 (4 loops x 2 operands, hot 235 / cold 268 per format loop) | | |
+| per body (fp8 hot, 6 blocks) | 210 = 6 x {`F2FP.PACK` 1, `PRMT` 8, `IMAD.SHL` 7-8, `LOP3` 8, `HMUL2` 8, `STS.128` 2}; cold 267 = hot + 48 `HMUL2` + 6 `FMUL` + `LDC.64` + `LDG.E` + `BRA`; vote prep 52 = 12 `LDS.64`, `NOP` (the `__syncwarp` point), 6 `LDS.32`, 6 `PRMT`, 6 `F2FP.E4M3`, 6 `HADD2`, 6 `FMUL`, 6 `FSETP`, 2 `PLOP3`, `VOTE.ALL`, `@P0 BRA` | as fp8 with `IMAD.SHL` 8 + `SHF` 2 per block, `LDGSTS.64` payload | two pages per step, `FLO` (`__ffs`) x 5 per loop | design: hot 258 / cold 258 / 14 | met (hot 210 < 258) |
+| C12 (`VOTE` only at operand level, no `BRA.DIV`, no `UMOV` / `IMAD.MOV` in bodies) | `VOTE.ALL` 2 in region (both at the loop's operand votes), 0 in bodies; `BRA.DIV` 0; `UMOV` 0 in bodies; `IMAD.MOV` <= 3 per arm | same | `VOTE.ALL` 8 = 4 in the loop (2 formats x 2 operands) + 2 + 2 at the single-operand sites; **`BRA.DIV` 2 + `WARPSYNC` 2**, both in `chunk_store`'s mask `REDUX.OR` (the [24c] table build, one per pair, not in any body or copy) | 0 / 2 / 0 | met (static); dynamic: 1 `BRA.DIV` per pair in the table build (pre-existing F24c) |
+| C12 addendum (scale-slot order) | every operand site: 12 `LDS.64` -> `NOP` -> 6 `LDS.32`; no scale `LDS` precedes the landing loads (4 sites read) | same | same (loop prologue) | | met |
+| copy path | `IMAD.WIDE.U32` 24 per loop pair, `IADD3.X` 3, `VIADD` 7; **`IADD3` 29 + `IMAD.X` 21**: ptxas lowers `mad.wide.u32 d, page, stride, base64` as `IMAD.WIDE.U32 d, page, UR, RZ` + `IADD3` + `IMAD.X` (3 per copy) - it never keeps the per-item base in an aligned register pair; `LDGSTS` 24 (12 predicated = scale rows by the leader lane), `[R+imm]` 50 / 60 in the region; `BSSY` 1 in the loop (the [23] chunk-table gather `LDG`, `@P BRA` around it - the `pending` / `FULL` tests are gone: loop `LDGSTS` carry no src-size predicate, the 24 predicated-size copies are the two PARTIAL sites) | same | 72 `IMAD.WIDE.U32` + 72 `LDGSTS` (71 predicated) per loop pair, `SEL` 0 on the address chain, `FLO` 0 in the copy path, `LDL/STL` 0 | 24 / <= 4 / <= 4 / 24 / 0 | `IMAD.WIDE` met; adds **miss** (+2 per copy); `BSSY` 1 vs 0 (gather, pre-existing) |
+| protocol (loop site - bodies - copies) | **~143** (gather + table row `LDS.128` x 2 + `valid` math + 2 acquires + arrive x 2 + fence + pending words + loop counters + landing/store base `IMAD`s) | ~150 | | <= 70 | **miss** |
+| a16 module vs `5cc416fd` | 2 kernels x 3 mask objects **DIFFERENT in 56 of 3832 / 3880 instructions**: same count, same opcodes, same order; only a permutation of four uniform registers (`UR7<->UR8`, `UR5<->UR6` ...) in the item-loop's uniform state.  PTX (`nvcc -ptx` of both trees, alpha-renamed): 513 lines differ, all register numbers except **one pair of adjacent independent instructions swapped** (`selp` / `xor` of the pipeline-state advance, 8 sites) - nvcc's schedule of the same statements changed with the peeled first pair around them; ptxas then allocated the URs differently.  Stock paged kernel: byte-identical (2 kernels x 4 mask objects). | | | byte-identical | **miss on the letter** (UR allocation), met on the instruction stream; the `transport_a16` bench row is unchanged (282.8 / 289.5 vs 282.5 / 288.4) |
+
+**Gate 6.0 (`transport_a16`, q=1, third launch, pc sampling at the producer's
+`LDGSTS` PCs; `ncu_a16*`).**  75 `LDGSTS` sites, 3330 samples: dispatch 42.3 %,
+wait 23.3 %, not_selected 22.6 %, selected 11.8 %; **`mio_throttle` +
+`lg_throttle` = 0.0 %**; producer region overall: long_scoreboard 32.4 %, wait
+23.4 %, dispatch 13.8 %.  LSU shared wavefronts 40.4 % of peak, tensor pipe
+67.1 %, issue-active 44.3 %.  Accept row met: the copy phase is per-warp
+latency / dispatch, not LSU-pipe serialisation -> the 12-warp design's
+premise holds; 2E / 2G not indicated by this gate.
+
+**Bench** (`bench_fa3_mixed_page_transport.py --q-lens 1 64 --repeats 1
+--trials 5`, nkcut2 lock, 1980 MHz, co-tenant `VLLM::EngineCore` resident;
+us, min / median / max; `bench_final.txt`):
+
+| mode (us) | F24 (35706f8a) q=1 / q=64 medians | **F25 (dd583e36)** q=1 min / med / max | q=64 min / med / max | design 6.4 row | verdict |
+|---|---|---|---|---|---|
+| stock_a16 | 299.8 / 310.5 | 299.5 / 300.9 / 301.7 | 310.0 / 310.9 / 311.9 | 297-303 / 306-312 | control holds |
+| transport_a16 | 282.5 / 288.4 | 282.1 / 282.8 / 283.4 | 289.1 / 289.5 / 290.5 | 281-290 / 284-292 | holds (module differs only in UR allocation) |
+| fp8 | 460.2 / 475.6 | **402.3 / 402.8 / 402.9** | **414.1 / 414.9 / 415.2** | <= 330 (band 288-318 / 292-322) | **reject** (-12.5 %; > 345 -> "count model wrong") |
+| fp4 | 495.7 / 512.4 | **422.1 / 422.2 / 423.3** | **428.9 / 429.7 / 433.7** | <= 330 (288-325 / 292-330) | **reject** (-14.8 %) |
+| mixed | 718.1 / 728.2 | **649.2 / 650.0 / 651.1** | **663.2 / 664.4 / 665.3** | <= 330, centre ~340 (320-370) | **reject** (-9.5 %; > 370 -> "re-read the dyn SASS row") |
+
+**Trace** (`MIXED_FA3_TRACE` build, q=1, us per pair, CTA 0 items 0/1 = kernel
+start, w0 / w1 = thread 0 of producer warps 0 / 1; `trace_q1.txt`; segments are
+comparable with F24's trace, not with T_c):
+
+| mode | us/pair | acq (K / V) | bar | gat | iss | fin = wait / expK / expV / fence+commits | gap | 6.2 gate |
+|---|---|---|---|---|---|---|---|---|
+| transport_a16 | 2.03 | 1.01-1.05 (0.95-0.98 / 0.065) | 0.045 | 0.05 | 0.72-0.76 | 0 | 0.14-0.20 | (F24: identical) |
+| fp8 | 2.17-2.22 (F24 2.59-2.89) | **0.56-0.58** (0.51-0.53 / 0.05) (F24 0.10) | 0.02 | 0.03 | **0.37-0.38** (F24 0.62-0.69) | **0.96-1.01** = 0.01-0.02 / 0.42-0.45 / 0.43-0.46 / 0.09 (F24 1.00-1.16) | 0.19-0.24 | `iss` <= 0.30 **miss** (0.38); `fin` <= 1.1 met; `acq` >= 0.25 met at kernel start (but see ncu: the consumer K-wait says the producer paces in steady state); `wait` <= 0.05 met |
+| fp4 | 2.24-2.31 (F24 2.75-2.94) | 0.46-0.50 | 0.03 | 0.03 | 0.35-0.37 | 1.14-1.20 = 0.01 / **0.66-0.71** / 0.37-0.39 / 0.09 (F24 1.27-1.32) | 0.19-0.25 | `fin` <= 1.1 miss by 0.1; expK is 1.8x expV: the K operand's body follows the K acquire + copies of the next pair, expV follows expK (see ncu `no_inst`) |
+| mixed (dynamic) | 3.70-3.92 (F24 4.59-5.17) | 0.09-0.14 | 0.06 | 0.15-0.17 | **1.63-1.78** (F24 1.71-2.15) | 1.44-1.59 = 0.01 / 0.73-0.82 / 0.66-0.73 / 0.03 | 0.20-0.30 | `iss` unchanged from F24 despite the unrolled predicated copies: the dynamic copy body is 36 `IMAD.WIDE` + 36 predicated `LDGSTS` + 46 `IMAD.X` + 53 `IADD3` per operand and its issue is `dispatch`-bound (below); one w0 item shows `iss` 58.8 us = a co-tenant time slice |
+
+**ncu** (q=1, `--repeats 1`, third launch, `--clock-control none`, 1980 MHz;
+`f25_run_ncu.sh` metric set + pc sampling; per pair = / 23936 pairs = 544 items
+x 44; `ncu_{a16,fp8,fp4,mixed}*`):
+
+| metric | transport_a16 | **fp8** | fp4 | mixed | 6.3 accept | verdict |
+|---|---|---|---|---|---|---|
+| `gpu__time_duration` | 279.6 us | 397.2 us | 418.9 us | 645.7 us | | |
+| producer-region `inst_executed` per pair (per warp) | 671 (168) | **2865 (716)**; F24 4432 (554 / 8 warps); [23] 3417 (854) | 2959 (740) | **4842 (1211)** | 2500-2750 (4 x 655 +- 5 %); dyn model ~790 / warp | fp8 +4 % over the band (+9 % over centre); dyn **+53 %**: count model wrong for the dynamic module |
+| producer `selected` share (~ per-warp IPC) | 7.6 % | **22.7 %** (F24 15.2, [23] 22.8) | 22.3 % | 23.9 % | >= 25 % | miss by 2.3 points (F24's 15.2 -> 22.7 is the register / branch-free change working; the design centre 0.27 not reached) |
+| producer stall mix (pc samples, region) | long_sb 32.4, wait 23.4, dispatch 13.8, not_sel 10.7 | selected 22.7, **wait 19.8**, **dispatch 17.1**, long_sb 13.1, not_selected 10.4, short_sb 8.8, math 3.0, no_inst 2.7, branch_resolving < 1 | selected 22.3, wait 21.6, dispatch 15.6, long_sb 13.5, short_sb 8.7 | selected 23.9, **dispatch 21.4**, wait 20.9, **no_inst 10.2** (+8.8 not-issued), short_sb 8.6 | branch_resolving <= 1, no_inst <= 2, dispatch <= 12, mio+lg <= 5, short_sb <= 10 | branch_resolving met (BRA.DIV 0 works), mio+lg 0 met, short_sb met; **dispatch miss** (17 %); **dyn no_inst 10 %** = instruction-cache misses on the 5528-instruction region with eight loop variants |
+| top producer PCs (fp8) | `@!P2 BRA` try_wait loops (28 %) | `PRMT R27, R32, R7` after the first scale `LDS.32` (short_sb, **5.4 %** of producer samples: the scale-slot load latency is exposed between the 12 landing `LDS.64` + `__syncwarp` and the vote), chunk-table `LDS.128` (long_sb, 2.2 %), acquire `@!P0 BRA` x 2 (long_sb, 3.8 %), `IMAD.WIDE.U32` / `IADD3` / `IMAD.X` address chain (dispatch / wait, ~6 % over ~12 PCs), `SYNCS.ARRIVE` + `FENCE` (long_sb, 2.8 %), landing `LDS.64` (long_sb, ~1.8 %) | | | | the expansion bodies (`HMUL2` 68 % selected, `LOP3` 41 % selected) are not where the samples land: the pre-body chain (scale loads -> vote) and the copy address chain are |
+| consumer `inst_executed` per pair | 3316 | **3301** | 3301 | 3302 | == F24b's 3301 | met: the consumer at 184 registers rematerialises nothing |
+| consumer K-wait PC (`@P0 BRA` at `consumer_wait`, long_sb) | 2.5 % | **10.2 %** (F24 16.5) | **18.0 %** | **37.3 %** | <= 3 % | **miss: the producer still paces** (steady state; the trace's `acq` is a kernel-start artefact) |
+| consumer first-`HGMMA` `barrier` stall | 2.6 % | 10.9 % | 9.8 % | 7.2 % | | the warpgroup waits for its K-waiting warps |
+| tensor pipe active | 67.1 % | **47.2 %** | 44.8 % | 29.2 % | within 3 % of a16 | miss |
+| `smsp__issue_active` | 44.3 % | 48.4 % (F24 52.9 with 16 warps) | 46.7 % | 39.6 % | 55-65 % | miss |
+| LSU shared wavefronts per pair (op_ld / op_st / gmma) | 1118 (85 / 12 / 1001) | **1871** (441 / **512** / 1001) (F24 1974: 455 / 418 / 1001) | 1961 (284 / 408 / 1001) | 1945 (364 / 263 / 1001) | total <= 2050, op_st <= 450 | total met; fp8 op_st miss |
+| `STS.128` wavefronts per instruction (st bank conflicts) | | **5.41** (0.53 M conflicts; F24 4.41 / 0.58 M) | 4.31 (0.12 M) | 4.16 (0.02 M) | <= 4.5 | fp8 miss (fp4 / dyn met with the same store pattern: not the address pattern) |
+| `LDGSTS` bank conflicts | 25.8 K | 231 K (F24 290 K) | | | | |
+| ALU / FMA / XU pipe (SM) | | 33.0 / 23.3 / 24.6 % | | | | XU 24.6: `F2FP` + `PRMT`? (PRMT is ALU); not binding |
+
+**Verdict against the design's rows (6.0-6.5):**
+
+- **6.5 / 6.1 structure: met** - 104 / 104 bit-exact; `USETMAXREG` 0x88 / 0xB8;
+  no C7507, STACK 0, LDL / STL 0 (the dynamic module's F24 frame is gone);
+  `BRA.DIV` 0 in the static modules (F24's 22 are gone: the branch-free bodies
+  let ptxas prove the `__syncwarp` converged - `WARPSYNC` 0, a `NOP` at its
+  program point); `VOTE.ALL` exactly one per operand per pair, none inside a
+  body; scale-slot order per C12 addendum; the peel folded (loop `LDGSTS`
+  without src-size predicates; the 24 predicated-size copies are the two
+  PARTIAL sites); 24 `IMAD.WIDE.U32` per pair; 36 predicated `LDGSTS` per
+  dynamic operand, `SEL` 0 on the address chain, `FLO` only in the decode
+  loops.  **Not met:** region 2584 / 2664 / 5528 vs 2100-2400, protocol ~143 vs
+  <= 70, and the copy adds (ptxas lowers `mad.wide.u32` with a 64-bit
+  accumulator as `IMAD.WIDE.U32` + `IADD3` + `IMAD.X`: 3 per copy, 48 per pair
+  over the design; two source forms tried, commit dd583e36); the a16 module
+  differs from `5cc416fd` by a uniform-register permutation (56 instructions,
+  same stream; PTX alpha-equivalent up to one swapped instruction pair from
+  the peeled loop), the stock kernel is byte-identical; the dynamic module has
+  1 `BRA.DIV` per pair in the [24c] table build.
+- **6.0: met** (a16 `LDGSTS` PCs: mio + lg throttle 0 %): the copy phase is not
+  LSU-pipe serialised; 2E / 2G are not indicated by this gate.
+- **6.2 / 6.3 / 6.4: reject.**  fp8 402.8 / 414.9, fp4 422.2 / 429.7, mixed
+  650.0 / 664.4 us against <= 330 (F24: 460 / 476, 496 / 512, 718 / 728; [23]:
+  474 / 483, 507 / 517, 880 / 907).  The producer still paces (consumer K-wait
+  10 / 18 / 37 %).  Where the model missed, from the counters: (i) the
+  per-warp count is 716 vs the 655 centre (+9 %): +48 for the split 64-bit
+  adds, ~+70 of protocol over the 70 budgeted (gather + table row + `valid`
+  math + pending words + landing / store base `IMAD`s), the rest the 52-instruction
+  vote prep per operand (budgeted 14 + the body's share); (ii) the per-warp IPC
+  is 0.23 (F24 0.10, [23] 0.13) against the 0.27 centre: `dispatch` 17 % and
+  `wait` 20 % at the address chain and at the scale-load -> vote chain (5.4 %
+  of samples on one `PRMT` behind the first scale `LDS.32`: the C12-addendum
+  order (landing loads -> `__syncwarp` -> scale loads) puts the six scale loads
+  and their ~30-cycle latency on the critical path to the vote, once per
+  operand, and the bodies cannot start before the vote); (iii) the dynamic
+  module's count is 1211 per warp vs ~790 modelled (+53 %) with `no_inst` 10 %
+  (+ 8.8 % not-issued): eight rolled loop variants x two operands x three
+  sites make a 5528-instruction producer region that misses the instruction
+  cache; its `iss` (1.6-1.8 us) did not move from F24c's despite the unrolled
+  predicated copies, and its per-operand copy body is 36 `IMAD.WIDE` + 36
+  `LDGSTS` + 99 add / select instructions.
+- Design predictions vs measured: fp8 300 (band 288-318) -> 403; fp4 305
+  (288-325) -> 422; mixed 340 (320-370) -> 650.  Improvement over F24: -12.5 %
+  / -14.8 % / -9.5 %; over [23]: -15 % / -17 % / -26 %.  The 12-warp,
+  136-register, one-vote-per-operand structure moved the producer IPC from 0.10
+  to 0.23 and cut the executed count 30 % vs F24 (4432 -> 2865 per pair), but
+  the count is still 4.3x the a16 producer's 671 per pair with the same
+  consumer, and 0.23 x 716 leaves 1.57 us per pair against the consumer's
+  ~1.35.
+
+**Follow-ups, each derived from a counter above (not built here):**
+
+1. Scale loads under the landing loads: order `__syncwarp` -> 6 scale `LDS.32`
+   -> 12 landing `LDS.64` -> vote (A9 holds: the `__syncwarp` still precedes
+   the scale loads; the landing loads read this thread's own copies and need no
+   barrier), so the scale latency hides under 12 issue slots instead of
+   heading the vote chain (removes the top producer PC, 5.4 % + the `F2FP` /
+   `HADD2` / `FMUL` / `FSETP` dependents behind it).
+2. Copy address form: the base halves as a uniform-register pair is not
+   possible (per-thread rows); the alternative is one `IADD3` + `IADD3.X` of a
+   32-bit page offset when the host can bound `page * stride < 2^32` per span
+   (a host-asserted property, not a kernel test), or keep the 3-instruction
+   form and count it (48 per pair).
+3. Dynamic module: the eight loop variants (hot / exact x two formats x K / V)
+   at three sites are the `no_inst` 10 %; one loop body per format with the
+   hot / exact choice as a per-step predicate (`@P HMUL2` x 8 extra), or the
+   sorted-page table with unrolled per-class bodies already listed in 6.4,
+   would shrink the region below the 32 KB instruction cache; the count model
+   for the dynamic module must be re-derived from the loop-site SASS (2391
+   instructions, 4 votes) before either is built.
+4. `STS.128` wavefronts 5.41 per instruction in fp8 (4.31 fp4, 4.16 dyn) with
+   the same store pattern: read the fp8 `STS.128` PCs in the ncu source view
+   before attributing it to the address pattern.
+5. The a16 byte-identity: if the letter matters, the a16 module needs the
+   [23] non-peeled loop text under `if constexpr (STATIC_A16)` (two loop
+   shapes in the source) - the instruction stream is already identical.
