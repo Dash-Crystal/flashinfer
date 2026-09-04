@@ -233,7 +233,21 @@ def _get_xqa_module_cached(
 
     return SimpleNamespace(
         xqa=xqa,
+        # JIT module URI (== cached_ops directory name), for attribution.
+        uri=spec.name,
     )
+
+
+# Kernel family and JIT module of the most recent xqa() call (set right before
+# the launch).  Benchmarks read it so every timing line names the kernel it
+# measured; the sm90 path forks inside xqa_wrapper.cu, invisible to callers.
+_last_dispatch: Optional[dict] = None
+
+
+def last_xqa_dispatch() -> Optional[dict]:
+    """Return ``{"kernel_family", "module_uri", "spec_dec", "module_q_seq_len"}``
+    of the most recent :func:`xqa` dispatch, or ``None`` before the first call."""
+    return _last_dispatch
 
 
 @flashinfer_api(trace=xqa_trace)
@@ -573,6 +587,17 @@ def xqa(
             # both under sliding windows and in SWAP_AB. Causal masks can't
             # be exempted without inspecting the device-side mask.
             run_sm90_fp8_mha = False
+
+    # Record the dispatch so a measurement can be attributed to the kernel
+    # that ran: xqa_wrapper.cu takes the mha_sm90.cu (Hopper GMMA) branch iff
+    # run_sm90_fp8_mha, otherwise the architecture-neutral mha.cu mainloop.
+    global _last_dispatch
+    _last_dispatch = {
+        "kernel_family": "mha_sm90.cu" if run_sm90_fp8_mha else "mha.cu",
+        "module_uri": xqa_module.uri,
+        "spec_dec": q_seq_len > 1,
+        "module_q_seq_len": module_q_seq_len,
+    }
 
     xqa_module.xqa(
         run_sm90_fp8_mha,
