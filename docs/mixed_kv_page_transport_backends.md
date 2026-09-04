@@ -2442,3 +2442,34 @@ fp4 422.4 / 428.4, mixed 650.6 / 662.6 — equal to the wt/F25 record.  Target
 <= 330 open; F26 (scale-load ordering, 2-instruction copy addresses, protocol
 <= 70, fp4 expK/expV asymmetry, fp8 STS wavefronts, dynamic-module loop
 consolidation) in design.
+
+### sm90 q=1 rounds 3-5 — synthesis (2026-09-04)
+
+Production stays at lever [8] (039ba5c7): transport_a16 79.4, fp8 67.9, fp4
+60.6, mixed 64.6 us (targets <= 58 / <= 36 / <= 62).  Every lever designed
+after [8] was either rejected by measurement or refuted at the design stage:
+
+| round | lever | outcome | deciding evidence |
+|---|---|---|---|
+| 3 | pair asymmetry attribution | fact | slow CTA = physical warp slots 20-39 (396/396 pairs); issue-bound segments +16-28 %, memory segments equal |
+| 3 | per-SM tile pool | REJECT (85.8 / 80.9 / 105.1) | serial claim->fill producer chain paces the frontier; PAIR_DISABLE does not recover [8] |
+| 3 | fill/prologue cut | REJECT (a16 -1.1 only; mixed +2.3) | kMetaReady[0] behind the LDGSTS burst; trace build hangs intermittently |
+| 3 | [15]/[34] one CTA per SM | NO-GO | lone CTA slower (72.7 / 68.0 / 73.4): GEMM chains lose the other CTA's overlap |
+| 4 | [7] two fused consumer groups | NO-GO (rev 2: 64.6 / 60.5 / 63.8) | cadence 0.83-0.85 us; converters 63 % of SM instructions |
+| 4 | mixed-module I-fetch footprint | rejected at design | prediction band excludes 62; clock domains mixed |
+| 4 | pipelined pool | no-go at design | body ceiling -1..-2 us |
+| 5 | copy-issue chain 720 -> ~320 | rejected at design | SM is arbitration-limited (issue-active 56-63 %, 1.58 eligible warps/scheduler), not slot-saturated; S6 pattern unanswered; accept/reject gate had a gap |
+| 5 | expansion 188 -> ~150 | rejected at design | same model objection; register budget vs r5copy unreconciled |
+| 5 | wgmma-descriptor arithmetic 668 -> ~150 | rejected at design | chain effect double-counted; uniformity of the hoist unverified |
+
+Reading of the whole: at 2 CTAs/SM with 5 warp groups the SM runs every role's
+dependent chain with ~1.6 eligible warps per scheduler; the wall is the slow
+dispatch slot's chain latency (fill 8.5 + 33 x 1.73 + 2.8), and neither
+scheduling (rounds 3-4) nor instruction count (round 5, per the Track S step 6
+lesson) changes chain latency.  A third CTA per SM would need <= 75 KB smem and
+<= 34 registers per thread — infeasible for this layout.  fp8 <= 58 and
+fp4 <= 36 are therefore not reachable on this host by the levers designed;
+mixed <= 62 sits 2.6 us away with no approved design.  Gate status for the
+50 % rule: sm120 (RTX 5090) passes all six rows; H200 FA3 A16 parity passes,
+compressed parity pending F26 (predicted 293 / 295 / 300); H200 q=1 and q=4
+compressed rows fail.
