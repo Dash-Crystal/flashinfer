@@ -40,9 +40,24 @@ struct SharedStorageQKVO {
   };
 };
 
-// Shared storage for the mixed-page producer: per-stage TMA transaction
-// barriers and their phases (the producer waits for its own TMA before
-// expanding), plus one 8 B whole-head block-scale word per token per stage.
+// Shared storage for the mixed-page producer: one 8 B whole-head block-scale
+// word per token per stage, and the page-metadata chunk table.
+//
+// Chunk table: metadata (page index, format tag, valid-token count) for 16
+// consecutive KV tiles per buffer, two buffers.  The producer fills the next
+// chunk's buffer while it issues the current chunk (one dependent global round
+// trip per 16 tiles instead of one per pair), and a pair reads its two tiles'
+// rows with four LDS.128.  One row is 32 B: 6 page indices, 6 tags, the valid
+// count and a flags byte (bit 0: any compressed page; bit 1: row filled).
+template <typename IdType, int CTA_KV>
+struct alignas(16) MixedTileMeta {
+  static constexpr int kPages = CTA_KV / 16;
+  IdType pages[kPages];
+  uint8_t tags[kPages];
+  uint8_t valid;
+  uint8_t flags;
+};
+
 template <typename MainloopPipeline, typename DTypeQ, typename DTypeKV, typename DTypeOut,
           typename IdType, int CTA_KV, int NUM_STAGES, typename SmemLayoutQ,
           typename SmemLayoutK, typename SmemLayoutV, typename SmemLayoutO>
@@ -61,13 +76,12 @@ struct SharedStorageQKVOMixed {
   };
   alignas(16) uint8_t mixed_scales_k[NUM_STAGES][CTA_KV][8];
   alignas(16) uint8_t mixed_scales_v[NUM_STAGES][CTA_KV][8];
-  // Tile metadata ring (shared by K and V of a tile): page indices, format
-  // tags, valid token count.  Four entries: the pending pair, the current pair
-  // (sharing one tile) and the tile gathered one pair ahead.
-  static constexpr uint32_t kMixedMetaRing = 4;
-  IdType mixed_meta_pages[kMixedMetaRing][CTA_KV / 16];
-  uint8_t mixed_meta_formats[kMixedMetaRing][CTA_KV / 16];
-  uint32_t mixed_meta_valid[kMixedMetaRing];
+  static constexpr uint32_t kMixedMetaChunkTiles = 16;
+  static constexpr uint32_t kMixedMetaBuffers = 2;
+  using TileMeta = MixedTileMeta<IdType, CTA_KV>;
+  static_assert(sizeof(TileMeta) == 32 && sizeof(IdType) == 4 && CTA_KV == 96,
+                "the chunk-table row is two LDS.128 for 6 pages of int32 indices");
+  TileMeta mixed_meta[kMixedMetaBuffers][kMixedMetaChunkTiles];
 
   // D1: the stage is tiled from 8-row x 128 B SW128 atoms (a page's 16 rows of
   // one 64-element D-block are one contiguous 2 KB region) and 1024 B aligned,

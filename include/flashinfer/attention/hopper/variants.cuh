@@ -168,6 +168,17 @@ template <bool use_logits_soft_cap>
 using DefaultAttention = std::conditional_t<use_logits_soft_cap, LogitsSoftCap, StandardAttention>;
 using DefaultFP8Attention = StandardFP8Attention;
 
+// DefaultAttention plus the mixed-page producer's compile-time page format
+// (sparse_mixed_mainloop.cuh reads kMixedStaticFormat through Ktraits::AttentionVariant):
+// -1 per-page tags (dynamic module), 0 A16, 1 block-scaled E4M3, 2 block-scaled E2M1.
+// The module URI carries the value (flashinfer/mixed_page_prefill.py).
+template <int STATIC_FORMAT, bool use_logits_soft_cap = false>
+struct MixedPageAttention : DefaultAttention<use_logits_soft_cap> {
+  using Base = DefaultAttention<use_logits_soft_cap>;
+  using Base::Base;
+  static constexpr int kMixedStaticFormat = STATIC_FORMAT;
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_HOPPER_VARIANTS_CUH_

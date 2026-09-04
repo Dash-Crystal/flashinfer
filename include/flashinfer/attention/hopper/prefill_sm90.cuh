@@ -150,12 +150,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
   }
 
-  constexpr bool kMixedMainloop =
-      mainloop_has_init_shared_v<CollectiveMainloop, typename Ktraits::SharedStorage>;
+  // The mixed-page producer (sparse_mixed_mainloop.cuh) uses the stock 72/216
+  // register split of the gather producer (P0.7: the producer fits 72 with STACK 0).
   if (warp_group_idx == 0) {  // Producer
-    if constexpr (kMixedMainloop) {
-      cutlass::arch::warpgroup_reg_dealloc<CollectiveMainloop::kProducerRegs>();
-    } else if constexpr (use_tma_load_kv) {
+    if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else {
       cutlass::arch::warpgroup_reg_dealloc<72>();
@@ -212,10 +210,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
     }
   } else {  // Consumer
-    if constexpr (kMixedMainloop) {
-      static_assert(Ktraits::NUM_WARPS == 12, "mixed register split assumes 1 producer + 2 consumer WGs");
-      cutlass::arch::warpgroup_reg_alloc<CollectiveMainloop::kConsumerRegs>();
-    } else if constexpr (use_tma_load_kv) {
+    if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
     } else {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
