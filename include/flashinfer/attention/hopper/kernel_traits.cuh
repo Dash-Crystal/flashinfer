@@ -74,8 +74,13 @@ struct SharedStorageQKVOMixed {
     typename MainloopPipeline::SharedStorage pipeline_k;
     typename MainloopPipeline::SharedStorage pipeline_v;
   };
-  alignas(16) uint8_t mixed_scales_k[NUM_STAGES][CTA_KV][8];
-  alignas(16) uint8_t mixed_scales_v[NUM_STAGES][CTA_KV][8];
+  // [23] block scales: per stage, per page, one 4 B word per producer thread (the
+  // word holding the thread's block; the four owners of a word each copy it to
+  // their own slot, so a warp's copy and read are 128 contiguous bytes: one
+  // wavefront, no same-address LDGSTS replays, and D3 holds for the scales).
+  static constexpr uint32_t kMixedScaleStageBytes = (CTA_KV / 16) * 128 * 4;
+  alignas(16) uint8_t mixed_scales_k[NUM_STAGES][kMixedScaleStageBytes];
+  alignas(16) uint8_t mixed_scales_v[NUM_STAGES][kMixedScaleStageBytes];
   static constexpr uint32_t kMixedMetaChunkTiles = 16;
   static constexpr uint32_t kMixedMetaBuffers = 2;
   using TileMeta = MixedTileMeta<IdType, CTA_KV>;

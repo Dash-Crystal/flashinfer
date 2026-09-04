@@ -310,3 +310,92 @@ the pair routine (a lambda inlines at every call site); no runtime-selected
 format switch is materialised in local memory); the expansion is one body with
 the format as data (a fully unrolled block loop with a format branch inside is
 unswitched into two bodies).
+
+### A7. [23] Block-granular copy-owner expansion (amends D2, D3, A2/D6, C3)
+
+The unit of ownership for compressed pages is one **scale block** (16
+coefficients) of one row, for copy and expansion alike; the expansion is done by
+the copy owner, so no thread waits on another warp and the pair body has no
+group barrier.  Where this section conflicts with D2/D3/A2/C3 above, it wins.
+
+- **D2 (packed rows) is replaced.** Thread `t` owns block `b = t%8` of row
+  `r = t/8` of every page (eight consecutive lanes = one row).  Its packed bytes
+  (FP8 16 B, FP4 8 B) land in the **row's D-block 1 line**: FP8 block `b` at
+  physical chunk `b ^ (r&7)`, FP4 block `b` as the 8 B half `b&1` of chunk
+  `(b/2 + 4*(r&1)) ^ (r&7)`; each thread also copies the 4 B word of the page's
+  16 x 8 B block scales that holds its block into its own slot
+  (`scales[stage][page][t]`, 512 B per page).  Rows past `kv_len` are copied with
+  `cp.async` src-size 0 (payload and scale word zero-filled, D4), so the
+  expansion has no tail case.
+  *Measured rules behind the layout (ncu source counters, `L1 Wavefronts
+  Shared` per instruction):* a `cp.async` lane octet coalesces into the ideal
+  wavefront count only when its eight destinations lie in one 128 B smem line -
+  the A16 copies and this landing run `LDGSTS.128` at 4.00 wavefronts per warp
+  instruction; two earlier layouts that landed each block in one of its *own*
+  output chunks (spread over the row's two D-block lines, in either lane order)
+  ran at 31.9, one wavefront per lane, i.e. +1300 wavefronts per pair.  Sub-16 B
+  `cp.async` is intrinsically expensive: 4 B scale words cost 7.95 wavefronts per
+  warp instruction (ideal 1), FP4's 8 B blocks 3.98 (ideal 2).  `LDS.128`/`LDS.64`
+  of the landings are at their ideal (the row's eight chunks are eight bank
+  groups; FP4's odd rows use chunks 4..7 so 16-lane 64-bit phases are disjoint);
+  the two `STS.128` of a block are 2-way conflicted (8.0 per instruction, ideal
+  4: a row's output chunks `2b ^ (r&7)` are four groups twice, D-block 1 being
+  12288 B = 0 mod 128 B away) - the cheaper side of the trade by an order of
+  magnitude.
+- **D3 (ownership).** Block `(r, b)` is expanded by the thread that copied it: it
+  reads its landing chunk and its scale slot (both written by its own `cp.async`,
+  so `cp.async.wait_group` on its own groups is the only wait; **barrier B is
+  gone**), decodes, and writes chunks `2b`, `2b+1` of row `r` with `STS.128` at
+  immediate offsets.  The landing chunk it reads is the output chunk of block
+  `4 + b/2` of the same row, i.e. of a lane of its own warp: every lane's loads
+  of a page precede any lane's stores of it in program order, made explicit with
+  `__syncwarp()` before the stores (no CTA barrier).  One `fence.proxy.async`
+  per thread per pair precedes the two commits.
+- **A2/D6 (copy ownership).** FP8/FP4: block `t%8` of row `t/8`, 16 B / 8 B per
+  thread per page plus its 4 B scale word; A16 ownership unchanged.  Compressed
+  sources are 16 B (FP8) / 8 B (FP4) / 4 B (scales) aligned across page, token
+  and head strides (host check).
+- **C3 (register budget / code shape).** All expansion addresses are
+  `[R + imm]` with 32-bit shared-window registers: per operand and stage two
+  output bases (`chunk 2b`, `chunk 2b+1`; the second is base +-16 by row parity,
+  so it is its own register), the landing base and the scale-slot base, each
+  `thread_const + stage * bytes`, page `i` at `+ i * PAGE_REGION_BYTES`
+  (`+ i * 512` for scales).  No generic `LD.E`/`ST.E`, no CuTe address evaluation
+  in the pair body.  The static modules decode two pages per step (16 independent
+  chains) with the next two pages' loads issued before the step's stores (the
+  dynamic module pipelines one page ahead); the six scale words are loaded first.
+  Decode: FP8 `cvt.rn.f16x2.e4m3x2`, then `a = h >> 3; a + 7 * (a & 0x10001000)`
+  (the f16 pattern read as bf16 is the value x 2^-112 exactly, since an E4M3
+  value has <= 3 significant mantissa bits; the sign moves from bit 12 to 15)
+  with 2^112 folded into the block scale (`bf16_rn(f32(scale) * global * 2^112)`,
+  exact while `block_scale * global < 2^16`; the sealer caps FP8 block scales at
+  128, the host checks the global); one `HMUL2.BF16` rounds the exact product
+  once, as the reference does.  FP4: a 20-instruction prmt LUT per 8 nibbles.
+  Per FP8 block 49 instructions (LDS.128, LDS.32, 5 scale, 8 x {F2FP, SHF, LOP3,
+  IMAD}, 8 HMUL2, 2 STS.128), per FP4 block ~57; 12 blocks per thread per pair.
+  SASS (fp8 module, persistent kernel, producer region): 2687 instructions
+  (from 3879), BAR.SYNC 4 (chunk table + item boundaries only), FENCE.VIEW.ASYNC
+  3 (one per inlined finish site), LD.E/ST.E 0, STACK 0, LDGSTS 36+36, STS.128
+  60 all `[R+imm]`.  The dynamic module keeps a 16 B stack (four chunk-table
+  store addresses spilled across the item prologue's gather; 8 instructions per
+  work item, none in the pair loop).
+- **Result and re-stated requirement (P0.7 branch "fin > 1 us with counts as
+  predicted").** Counts are as predicted (ncu producer `inst_executed` 3417
+  warp-instructions per pair vs 3320 predicted; landing wait 0.02 us; fence +
+  commits 0.06 us) but the expansion takes 0.57-0.63 (K) + 0.48-0.53 (V) us per
+  pair on the trace build, not 0.5-0.65 for both: the producer's four warps issue
+  at ~0.22 IPC each (stall mix in the producer region: wait 27 %, selected 23 %,
+  dispatch 15 %, not_selected 10 %, short_sb 9 %, long_sb 9 %, math 3 %), so a
+  pair costs ~2.6 us against the consumer's ~1.55 and FP8/FP4 land at 1.6-1.7x
+  stock (see targets: FP8 474/483, FP4 507/517, mixed 880/907 us at q=1/64;
+  ncu fp8 468 us, fp4 502 us).  The bound is neither the smem port (raw
+  `l1tex__data_pipe_lsu_wavefronts_mem_shared` 61.5M = 2570 per pair incl. the
+  2-way STS, ~49 % of the port at the measured cadence)
+  nor the XU pipe (F2FP; `math` 3 %): it is dependent-issue latency on one
+  producer warp per SMSP sharing issue with two consumer warps.  Parity therefore
+  requires either ~2x the per-warp IPC of the expansion (more independent work
+  per warp than the 72-register budget admits) or moving the decode off the
+  producer warp group (the consumer warps issue at ~35 % and are starved; cf.
+  Track W's [29], where the compute warps expand).  The dynamic (mixed) module
+  is additionally bound by its copy-issue phase (2.0-2.2 us per pair of per-page
+  format branches and three formats' address setup), a [21]/[22]-side cost.

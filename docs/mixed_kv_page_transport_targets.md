@@ -20,7 +20,7 @@ mixed stream used by the benchmarks 1.66x (172 MB vs 285 MB).
 | H200 sm90 XQA, q=4 (SPEC_DEC, runs mha.cu) | 135 | <= 94 | <= 59 | <= 101 | FP8 231, FP4 277, mixed 437 (co-tenant-corrected; after [29]: 198/240/420) |
 | RTX 5090 sm120 XQA decode, q=1 | 180 (175 after [29]) | <= 125 | <= 79 | <= 135 | **after [29]: FP8 118.8, FP4 65.5, mixed 126.4 - all pass** (were 139/84/146) |
 | RTX 5090 sm120 XQA, q=4 | 184 (179) | <= 128 | <= 81 | <= 138 | **after [29]: FP8 125.0, FP4 81.9, mixed 132.3** (FP8/mixed pass, FP4 within 1%) |
-| H200 FA3 prefill, q>=64 | 300 (stock) | parity | parity | parity | **after [21][22]: A16 282-287 (0.94x stock, passes)**, FP8 737-748, FP4 944-964, mixed 1760 (awaiting [23]) |
+| H200 FA3 prefill, q>=64 | 300 (stock) | parity | parity | parity | **after [21][22]: A16 282-287 (0.94x stock, passes)**; after [23]: FP8 474-483, FP4 507-517, mixed 880-907 (were 737-748 / 944-964 / 1760; producer issue-bound at ~0.22 IPC per producer warp, see dataflow A7) |
 
 Byte rooflines, corrected by the P0.1 host probe (measured achievable streaming
 read at each footprint on nkcut2: 4.23 TB/s at 285 MB, 4.5 sustained): A16 67.5,
