@@ -2652,3 +2652,180 @@ wt/F26 only.  Target <= 330 remains open on all compressed modes; the F26
 readings name the residual: top-of-pair protocol 367 cycles (budget 120), arm
 segments 1414 (835; post-STS.128 short-scoreboard / dispatch), octet scale
 copies at 11.9 wavefronts per instruction.
+
+
+### Track S step 7 — [45] register-only dependency cuts, sm90 SPEC_DEC q=4 (2026-09-04, nkcut2 H200 + ws-1 RTX 5090, worktree wt/S7)
+
+Design: `docs/mixed_kv_speed_round5_trackS_step7.md` (rev 2 + section 9 "as measured").  Six
+items were committed in the design's order ([45c] `bcbc3487` -> [45e] `a027a0c1` -> [45f]
+`9976dcf6` -> [45d] `42708231` -> [45a] `0cbe2933` -> [45b] `075a9477`, review fixes `1287b295`);
+the verification then applied three design-prescribed fallbacks, so the **tree kept is [45c] +
+[45e] + [45f] + [45a] (static-module call vote)**: [45b] is off (`MIXED_EXPANSION_PIPELINED_SPANS
+0`, A1 WAR gate), [45d] is reverted (`0148a3bf`, A2 counter migrated + bisect), the dynamic module
+votes per span (`MIXED_DYN_CALL_VOTE 0`, bisect).  Base for every comparison: pristine `659eacfa`
+built in the same session with its own JIT workspace (memory: a cached workspace rebuilds from the
+checkout's source).
+
+**Register gate per commit (sm90 q=4 modules dyn / a16 / fp8 / fp4; `cuobjdump -res-usage`,
+STACK 0, LDL 0, STL 0 everywhere; SASS = instruction count).**
+
+| tree | REG | SASS |
+|---|---|---|
+| base `659eacfa` | 124 / 127 / 126 / 126 | 4,760 / 3,928 / 4,600 / 4,640 |
+| [45c] | 122 / 127 / **128** / **128** | 4,624 / 3,784 / 4,224 / 4,280 |
+| + [45e] | 122 / 127 / 128 / 128 | 4,528 / 3,688 / 4,136 / 4,184 |
+| + [45f] | 124 / 128 / 128 / 127 | 4,544 / 3,720 / 4,152 / 4,200 |
+| + [45d] | 127 / 128 / 128 / 128 | 4,240 / 3,720 / 4,008 / 4,056 |
+| + [45a] | 127 / 128 / 128 / 128 | 4,352 / 3,720 / 4,048 / 4,096 |
+| + [45b] (`1287b295`) | 127 / 128 / 128 / 128 | 4,352 / 3,720 / 4,048 / 4,096 (fp8 / fp4 SASS differs from + [45a]: reordered, same count) |
+| fallback 1: [45b] off (`29b7ddc4`) | 127 / 128 / 128 / 128 | fp8 / fp4 objects byte-identical to + [45a] |
+| **final: [45d] reverted, dyn per-span vote (`d453cbcb`)** | **124 / 128 / 128 / 128** | 4,552 / 3,720 / 4,184 / 4,232 |
+
+The static fp8 / fp4 modules sit at the 128 cap from [45c] on (the design expected -1 there;
+ptxas spent the freed registers), STACK stays 0 at every commit, so the section-4 "stop if REG >
+128 after [45c]+[45e]+[45f]+[45d]" rule was never triggered and no item was dropped for registers.
+
+**A0 (pristine tip, ncu `SourceCounters`, fp8, `XQA_NB_SUB_SEQ=1` vs default 5; base-fmt1.nvdis
+addresses).**  Produced-wait group (`0x2e20` TRYWAIT + `0x2e30` + `0x2e40 @!P0 BRA` + out-of-line
+`0x11770 NANOSLEEP`): n = 5 **1,293 samples = 13.0 %** (905 on the BRA, 265 on the NANOSLEEP);
+n = 1 **765 = 7.9 %** (687 on the BRA, **4** on the NANOSLEEP) — a 1.7x drop, not the ~5x the
+fill reading predicted and not the unchanged ~12 % of the slack reading.  The NANOSLEEP part is
+fill (gone at 16 tiles per CTA); the ~690 samples that stay on the TRYWAIT branch at n = 1 are
+gemm1 waiting on gemm0 in steady state (at n = 1 only 136 CTAs are resident, one per SM on most
+SMs, so part of that is the 1-CTA/SM exposure).  `R2UR` at `getPage` (`mhaUtils.cuh:1519`) 203
+(2.0 %) -> 381 (3.9 %): per-load, share rises as the CTA-start work shrinks, as predicted.  The
+rev-2 accept table was kept as the gate (the design says the code is the same either way); the
+reading "0-2 % steady-state slack" is amended to "~5 % gemm1-on-gemm0 wait survives the fill".
+
+**A1 (SASS class counts, final tree vs base; fp8 / fp4 / dyn / a16 modules).**  `VOTE.ALL` 6 / 6
+/ 4 / 0 -> **2 / 2 / 4 / 0** (static: one per call site; dyn: per span, the fallback);
+`MATCH.ANY` 1 -> 0 and `BRA.DIV` 2 -> 0 in every module ([45e]); tag `LDG.E.U8` 5 -> **0** static, 5
+dyn (one per `loadPages` site); `WARPSYNC` 14 -> 0 (loader `__syncwarp` gone); flag `STS.U8` /
+`LDS.U8` in the loaders 0 (one `LDS.U8` / `STS.U8` pair remains: the multi-block `isLastCta`
+epilogue, pre-existing); `SHFL.IDX` 31 -> 16 (the tag broadcast's 4 per call gone; no `PRMT`
+after them); `REDUX` 0 static / 4 dyn (`packMixedPageTags`); `R2UR` 22 / 22 / 42 / 4 -> 7 / 7 /
+31 / 7 (the static modules' page-index `R2UR` is gone with the tags, the dyn module keeps
+`getPage`'s); `LDGSTS` **46 / 46 / 54 / 64 unchanged**, `DEPBAR.LE SB0, 0x1` 3 unchanged,
+`LDS.128`+`LDS.64` 35 / 35 / 23 / 15 and `STS.128` 54 / 54 / 38 / 6 unchanged per span-call;
+`F2FP.E4M3` 6 -> 14 static (4 pre-vote + 1 per span in each of the two bodies: the recompute);
+lineinfo build == production SASS for all four modules (both sessions); `xqa_mha_sm90.cuda.o`
+and q=1 `xqa_mha.cuda.o` byte-identical base vs new for all four formats.  **[45b] WAR gate
+(`sass_gate.py`, LDS destination vs `STS.128` sources within 10 instructions): on the [45b] tree
+the fp4 fold body had one genuine hit — `0xc090 STS.128 [R51], R36` -> `0xc100 LDS.64 R36,
+[R60+0x1000]` (span 0's block-1 store, span 2's block-0 load, distance 7; `mhaUtils.cuh:1285`
+inside the fold body `:1297`), exactly the incomplete-argument case of section 8.6; the fp8
+module's two reported hits were a cross-branch pair (`0xb930` STS at the tail of one body, `0xb990`
+LDS at the entry of the other, `BRA` in between) and the mha.cu prologue, i.e. not collisions.
+Fallback `MIXED_EXPANSION_PIPELINED_SPANS 0` taken; the single-set [45a] body shows 9 such pairs
+per static module (the base's per-span body showed 4): the STS -> LDS register reuse the item
+was meant to remove is still there, as it was in [44].**
+
+**A3 (correctness, byte-identity).**  `run_xqa_mixed_page_transport.py` **72/72** on nkcut2
+(default and `XQA_NB_SUB_SEQ=2`) and 72/72 on ws-1, on the [45b] tree, the fallback-1 tree and the
+final tree.  ws-1: all eight sm120 `xqa_mha` modules (formats -1/0/1/2 x q=1/q=4) byte-identical to
+the pristine `659eacfa` build (`cb834699b703`, `8a1d81c7c984`, `6482f918e3d7`, `131adf054253`,
+`1511fad7c2ab`, `fb216bd02cab`, `89d03a4fcee4`, `fe78aff5c0b8`; also equal to the step-6 pristine
+`5cc416fd` build), at every one of the three trees.  No spills, no C7507.
+
+**A4 timing (nkcut2, `flock`, `--repeats 2 --trials 5` = 2 x 117 us per event pair, three rounds
+interleaved new / base, co-tenant VLLM::EngineCore resident; median of the three round medians,
+min-max over all rounds).**
+
+| mode | base `659eacfa` (same session) | [45b] tree `29b7ddc4` (3 rounds) | **final tree `d453cbcb`** | ratio vs base | design band | accept row (rev 2) | target |
+|---|---|---|---|---|---|---|---|
+| transport_a16 | 86.7 (85.2-87.7; 86.7 / 86.7 / 86.7) | 85.4 (83.7-86.0) | **85.3** (83.3-86.2; 84.9 / 85.3 / 85.3) | 0.984x | 80-82 | 84 < t <= 87: keep, confirmed faster than the interleaved base | 135 (pass) |
+| fp8 | 116.5 (114.5-118.5; 115.4 / 117.6 / 116.5) | 112.2 (110.1-113.7) | **110.3** (108.4-111.3; 110.5 / 110.3 / 109.8) | **0.947x** | 99-105 (**missed**) | 110 < t <= 113.5 by 0.3 us (spread 109.8-110.5): fp4 / mixed not in their accept rows -> the commit whose counter did not move was reverted ([45d]); every remaining item's counter moved -> keep, target open | <= 94 (open, 1.17x) |
+| fp4 | 103.7 (102.8-105.5; 103.7 / 104.5 / 103.7) | 95.6 (94.8-97.0) | **95.2** (93.5-96.8; 95.2 / 96.0 / 94.7) | **0.918x** | 88-93 (missed) | 90 < t <= 96: keep, open | <= 59 (open; not this kernel) |
+| mixed | 110.3 (109.5-111.5; 110.4 / 110.3 / 110.2) | 104.2 (102.8-105.3) | **102.5** (100.9-103.7; 102.5 / 102.8 / 102.1) | **0.929x** | 92-97 (missed) | 101 < t <= 105: keep, open, bisected (below) | <= 101 (open, 1.01x) |
+| q=1 control (a16 / fp8 / fp4 / mixed) | 79.4 / 68.0 / 60.6 / 64.9 | 79.3 / 68.3 / 60.5 / 64.9 | 79.1 / 67.8 / 60.6 / 64.7 | equal | | untouched `mha_sm90.cu` | |
+
+Reject rows (fp8 > 115.8, fp4 > 103.5, mixed > 110, a16 > 87): none triggered.  The same-session
+base runs 3.0 / 2.2 / 2.5 / 3.3 us above the record (113.5 / 101.5 / 107.8 / 83.4, merged-tree
+confirmation @ `67a6b4aa`); against that offset the final tree is at ~107 / ~93 / ~100 / ~82
+record-equivalent, which the table above does not use (the accept rows are read on the raw
+medians).
+
+**Per-commit bisect (locked, `--repeats 2 --trials 5`, two rounds interleaved over the seven
+trees; medians of the two round medians; round-to-round spread ~1 us).**
+
+| tree | a16 | fp8 | fp4 | mixed |
+|---|---|---|---|---|
+| base `659eacfa` | 86.7 | 116.2 | 104.4 | 110.6 |
+| [45c] | 85.1 | 111.1 | 97.2 | 103.5 |
+| + [45e] | 84.8 | 110.6 | 96.5 | 102.4 |
+| + [45f] | 85.0 | 111.0 | 96.1 | 101.9 |
+| + [45d] | 85.3 | **114.4** | **98.2** | 101.3 |
+| + [45a] | 85.6 | 111.7 | 95.7 | **104.1** |
+| [45b] off (`29b7ddc4`) | 85.6 | 112.7 | 96.2 | 103.8 |
+
+[45c] carries nearly all of the gain (fp8 -5.1, fp4 -7.2, mixed -7.1, a16 -1.6); [45e] -0.5..-1.1;
+[45f] neutral (+0.4 / -0.4 / -0.5 / +0.2); **[45d] costs fp8 +3.4 and fp4 +2.1** (mixed -0.6);
+**[45a] gains fp8 -2.7 / fp4 -2.5 in the static modules and costs mixed +2.8 in the dynamic one**;
+[45b] is within noise of + [45a] (its fp8 / fp4 SASS is byte-identical to + [45a] once off).
+
+**A2 counters (ncu one launch, final tree vs base; predicted band from the design).**
+
+| metric | fp8 | fp4 | mixed | a16 |
+|---|---|---|---|---|
+| `smsp__inst_executed.sum` | 35.99 -> **32.55 M** (0.90x; band 34-35.5: more than predicted) | 36.53 -> **33.10 M** (0.91x; 34.5-36) | 42.44 -> **39.64 M** (0.93x; 39.5-41.5) | 29.91 -> **27.38 M** (0.92x; 28.8-29.9) |
+| warp-cycles per issued instruction | 8.13 -> **8.36** (<= 7.3 missed) | 7.31 -> 7.18 (<= 6.6 missed) | 6.51 -> 6.43 (<= 6.0 missed) | 6.67 -> 7.06 |
+| short_scoreboard | 2.01 -> **1.75** (<= 1.5 missed) | 1.65 -> **1.32** (<= 1.25 missed) | 0.71 -> 0.52 | 0.29 -> 0.22 |
+| long_scoreboard | 1.81 -> **2.48** (<= 1.45 missed; rose) | 1.47 -> 1.91 | 1.38 -> 1.44 (<= 1.05 missed) | 2.83 -> 3.48 |
+| wait / mio_throttle / no_instruction | 0.97 / 0.29 / 0.42 -> 0.94 / 0.37 / 0.18 | 0.96 / 0.18 / 0.45 -> 0.96 / 0.17 / 0.24 | 1.42 / 0.15 / 0.46 -> 1.40 / 0.20 / 0.40 | 0.92 / 0.01 / 0.14 -> 0.91 / 0.01 / 0.13 |
+| issue-active (% of active cycles) | 42.9 -> 42.0 | 47.5 -> 47.6 | 51.5 -> 52.8 | 50.3 -> 47.1 |
+| `gpu__time_duration` (serialized under ncu) | 139.6 -> **127.9** | 125.8 -> **118.0** | 134.0 -> **122.3** | 98.0 -> 97.5 |
+| occupancy limits / smem per block / `LDGSTS` executed | 2 / 2, 115,456 B, 402,560 (unchanged) | 2 / 2, 115,456, 402,560 | 2 / 2, 115,456, 522,624 | 2 / 2, 115,456, 635,936 |
+
+PC sampling by the section-2 regions (final tree, fp8 unless noted; base = same-session default
+run): (i) gemm0 tile-loop samples per warp-tile **0.423 -> 0.368** (3,679 -> 3,206 / 8,704;
+predicted 0.39-0.41), gemm1 busy **~3,660 -> ~3,460** (loop 4,690 -> 4,295 minus the produced
+wait; predicted 3,350-3,500): both roles shrank, the lock-step model's sign.  (ii) `xBar.produced`
+wait 1,170 -> **~980 samples (10.6 %)**: stays in absolute terms as predicted.  (iii)
+`xBar.consumed` TRYWAIT fp8 0.0 %, fp4 0.0 %, mixed 1.8 -> 1.9 %, **a16 0.0 -> 3.6 %** (above the
+3 % mark: in the a16 module gemm1 now paces part of the time).  (iv) `R2UR` at the page loads
+2.4 % -> 0.3 % in the static modules, **but the same load's round trip re-appears on the BAD
+select of `getPageUngated` (`SEL ..., 0xffffffff`, `mhaUtils.cuh:1760`): 428 samples = 4.7 %
+fp8, 4.1 % fp4, 5.6 % a16; the dyn module keeps `getPage`'s `R2UR` at 5.5 % (base 5.3 %)** — the
+exposed-latency-at-load bucket did not shrink; flag `ISETP` after the DEPBAR 2.4 % -> 0; `PRMT <-
+SHFL` tag broadcast 2.4 % -> 0 (total `PRMT` samples 542 -> 621: the placement-decode `PRMT`s now
+carry the payload-`LDS` short-scoreboard wait); `F2FP.E4M3` + fold `BRA` 6.7 % -> **5.0 %** (target
+<= 2 %: missed — the `LDS.U16 -> F2FP` wait is paid once per call instead of once per span but
+its per-site cost tripled, 154 + 127 samples on the two pre-vote `F2FP.E4M3`); `MATCH.ANY` group
+0.8 % -> 0; the three DEPBAR neighbourhoods 0 long_sb.  Expansion helper: fp8 2,099 (21.1 %) ->
+2,284 samples (24.8 %) with fewer instructions — its time share rose again, as in step 6.
+
+**What the [45d] / [45f] reading got wrong (recorded for the next step).**  Rev 2 attributed the
+long-scoreboard at the page-index load to ptxas parking the warp-uniform value in a uniform
+register (`R2UR` 12 instructions after the `LDG`).  With [45d] the value never enters the uniform
+datapath and the `R2UR` is gone — and the wait sits on the `SEL` that produces the BAD-or-loaded
+index right after the load (fp8 3.5 %, mixed 5.0 % on the [45d] tree), plus a new `SHFL.IDX ->
+ISETP` page-valid chain in the copy (~250 short-scoreboard samples per module); with [45f] alone
+the same `SEL` takes 4.7 %.  Whatever instruction first consumes the loaded index is scheduled
+right behind the load, so the L2 round trip is exposed there regardless of where the copy is; the
+prefetch distance (two tiles) is not being used.  The fix would be to defer the first consumer to
+the copy (keep the raw loaded vector, select BAD at the use) — not attempted here (no tuning in a
+verification pass), and it is the natural first item of a follow-up.
+
+**ws-1 (RTX 5090, sm120): interleaved pristine `659eacfa` / new rounds, `--repeats 5 --trials
+5`, three rounds, identical binaries (sm120 SASS byte-identical at every tree, so the run made on
+the [45b] tree stands for the final tree).**  q=1 base 173.3 / 100.7 / 59.9 / 113.8 vs new 173.6 /
+100.7 / 59.9 / 113.5; q=4 base **176.1 / 114.9 / 65.6 / 119.5** vs new **176.1 / 115.1 / 65.9 /
+119.2** (a16 / fp8 / fp4 / mixed; medians of three; min-max fp8 q=4 base 113.0-118.3, new
+113.8-119.3).  Equal within 0.3 us; the sm120 q=4 targets stay passed.
+
+**Verdict.**  Kept: the final tree is faster than the interleaved base on every sm90 q=4 mode
+(fp8 0.947x, fp4 0.918x, mixed 0.929x, a16 0.984x) with q=1, sm120 and the sm90 q=1 objects
+untouched; the fp8 <= 94, fp4 <= 59 and mixed <= 101 targets stay open (mixed at 102.5 is 1.5 us
+short on the raw median and ~1 us inside on the session-corrected one; not claimed).  Model:
+missed on the stall side (instruction counts fell more than predicted, stall-per-instruction did
+not fall; long_scoreboard rose), as in step 6 — the removed stalls migrated to the next consumer.
+
+**Artifacts.**  nkcut2: `/tmp/mixedkv-wtS7-a0/` (`base-fmt*.nvdis`, `base-fp8-n{1,5}.source.csv`
++ `.ncu-rep` (A0), final `new-fmt*.{sass,nvdis}`, `new-{fp8,fp4,mixed,transport_a16}.source.csv`,
+`fb1/` = the same for the [45b]-off tree with [45d], `pre-fallback/` = the [45b] SASS,
+`bench-*.jsonl` (stage 2 final; `fb1/bench-*` stage 2 first run; `bench-bisect-*`), `sass_gate.py`,
+`a0_sites.py`, `a0_win.py`, `sites2.py`), scripts `/tmp/mixedkv-wtS7-{s0,base,s1,s1b,s2,s3}.sh`
+with logs `/tmp/mixedkv-wtS7-{s0,base,s1,s1b,s1c,s2,s2b,s3}.log`, workspaces
+`/tmp/mixedkv-wtS7{,-c1..c5,-base,-base-li,-li}`, checkouts
+`/home/bigboi/dash-flashinfer-claude-wtS7{,-c1..c5,-base}`.  ws-1: `/tmp/mixedkv-wtS7{,-base}`,
+`/tmp/mixedkv-wtS7-{c,c2,c3,d}.log`, `/tmp/mixedkv-wtS7-b-{base,new}-q{1,4}-r{1,2,3}.json`.

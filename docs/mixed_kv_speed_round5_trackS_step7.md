@@ -791,3 +791,78 @@ iteration, one now) before the span's first store, as in [44].  Peak live set: `
 `LDS.128` / `LDS.64` of span s+1 precede the `STS.128` of span s (address immediates `+2048 (s+1)`
 vs `+2048 s`); counts per span unchanged (2 `LDS`, 4 `STS.128`); REG <= 128, STACK 0 — if not,
 `MIXED_EXPANSION_PIPELINED_SPANS 0`.
+
+
+## 9. As measured (2026-09-04, nkcut2 H200 + ws-1 RTX 5090; full tables in backends.md "Track S step 7")
+
+Final tree `d453cbcb` = [45c] + [45e] + [45f] + [45a] (static-module call vote); three
+design-prescribed fallbacks were taken in this order, each followed by the full re-gate (register
+gate, 72/72 matrix default + `XQA_NB_SUB_SEQ=2` on nkcut2, 72/72 on ws-1, sm90 q=1 objects
+byte-identical, all eight sm120 modules byte-identical, lineinfo == production):
+
+1. **[45b] -> `MIXED_EXPANSION_PIPELINED_SPANS 0`** (section 8.6 gate): in the fp4 fold body
+   ptxas placed span 2's `LDS.64 R36` on the registers of span 0's `STS.128 [R51], R36` seven
+   instructions earlier (`0xc090` -> `0xc100`).  The two fp8 "hits" of the linear scan were
+   cross-branch (tail of one body / entry of the other) and prologue, not collisions.  The
+   two-set code stays under the switch.
+2. **[45d] reverted (`0148a3bf`)**: the accept table's fp8 110-113.5 row.  Its A2 counter (`R2UR`
+   long-scoreboard at the page load 1.7 % -> 0) moved literally, but the same load's round trip
+   re-appeared on the BAD `SEL` of `getPageLaneUngated` (fp8 3.5 %, fp4 3.4 %, mixed 5.0 %) and the
+   copy's new `SHFL.IDX -> ISETP` page-valid chain took ~2.7 % short-scoreboard; the per-commit
+   bisect priced the commit at fp8 +3.4 us, fp4 +2.1 us (mixed -0.6).
+3. **[45a] dyn -> per-span vote (`MIXED_DYN_CALL_VOTE 0`)**, the section-4 fallback: the bisect
+   priced the dynamic module's call-level vote at mixed +2.8 us (its pre-vote pass runs all four
+   spans' `LDS.U16 -> F2FP` chains whatever their format; dyn `F2FP.E4M3` samples 1.1 -> 2.0 %),
+   while the static modules' call vote gained fp8 -2.7 / fp4 -2.5.
+
+Register gate: met at every commit (REG 122-128, STACK 0, LDL 0, STL 0; the static modules sit at
+the 128 cap from [45c] on, so the "-1" of section 4 was spent by ptxas, not saved).  Final REG 124
+/ 128 / 128 / 128 (dyn / a16 / fp8 / fp4).
+
+**A0 (section 2's discriminating run): intermediate.**  Produced-wait group at n = 5: 1,293
+samples = 13.0 % (905 on the `0x2e40` BRA, 265 on the NANOSLEEP); at n = 1: 765 = 7.9 % (687 on
+the BRA, 4 on the NANOSLEEP).  A 1.7x drop, not ~5x and not unchanged: the NANOSLEEP part is fill,
+~690 samples on the TRYWAIT branch survive at 16 tiles per CTA and are gemm1 waiting on gemm0 in
+steady state (part of it the 1-CTA/SM exposure of the 136-CTA run).  "0-2 % slack" in section 2
+is amended to "~5 % gemm1-on-gemm0 wait in steady state"; the accept table was not changed (the
+code is the same either way), and the measured cuts were compared against it as written.  `R2UR`
+at `getPage` 2.0 % -> 3.9 % at n = 1: per-load, as predicted.
+
+**A4 (medians of three locked rounds, base = pristine `659eacfa` interleaved in the same
+session; record base in parentheses):** transport_a16 **85.3** vs 86.7 (83.4) — keep row 84-87,
+faster than the interleaved base; fp8 **110.3** vs 116.5 (113.5) — row 110-113.5 by 0.3 us
+(spread 109.8-110.5), predicted 99-105 **missed**; fp4 **95.2** vs 103.7 (101.5) — row 90-96,
+predicted 88-93 missed; mixed **102.5** vs 110.3 (107.8) — row 101-105, predicted 92-97 missed,
+target <= 101 not met on the raw median (the same-session base runs 2.2-3.3 us above the record).
+Ratios vs the interleaved base 0.984x / 0.947x / 0.918x / 0.929x; q=1 controls equal; no reject
+row triggered.  Bisect (two rounds): [45c] fp8 -5.1 / fp4 -7.2 / mixed -7.1 / a16 -1.6; [45e]
+-0.5..-1.1; [45f] neutral; [45d] +3.4 / +2.1 / -0.6; [45a] -2.7 / -2.5 static, +2.8 dyn.
+
+**A2:** `smsp__inst_executed.sum` fp8 36.0 -> 32.5 M, fp4 36.5 -> 33.1 M, mixed 42.4 -> 39.6 M, a16
+29.9 -> 27.4 M (all beyond the predicted bands); warp-cycles per issued instruction fp8 8.13 ->
+8.36, fp4 7.31 -> 7.18, mixed 6.51 -> 6.43 (every <= target missed); short_scoreboard fp8 2.01 ->
+1.75, fp4 1.65 -> 1.32; long_scoreboard fp8 1.81 -> 2.48, mixed 1.38 -> 1.44 (rose); occupancy
+2 / 2, 115,456 B, `LDGSTS` counts unchanged.  PC sampling: (i) gemm0 tile-loop samples per
+warp-tile 0.423 -> 0.368 and gemm1 busy ~3,660 -> ~3,460 — both roles shrank; (ii) the produced
+wait stays ~980 samples absolute; (iii) `xBar.consumed` 0 % fp8 / fp4, 1.9 % mixed, **3.6 % a16**
+(gemm1 pacing part of the a16 module); (iv) flag `ISETP` -> 0, `PRMT <- SHFL` -> 0, `MATCH.ANY`
+-> 0 as predicted; `R2UR` at the page load -> 0.3 % **but the BAD `SEL` of `getPageUngated` takes
+4.7 % (fp8) / 4.1 % (fp4) / 5.6 % (a16)**, the dyn module's `getPage` `R2UR` stays 5.5 %;
+`F2FP.E4M3` + fold `BRA` 6.7 % -> 5.0 % (<= 2 % missed).
+
+**Corrections to this design, from the measurement.**  (1) Section 2 (a): the exposed round trip
+at the page-index load is not a uniform-register artefact — whatever instruction first consumes
+the loaded index (`R2UR` in [44], the BAD `SEL` in [45f] / [45d]) is scheduled directly behind the
+load, so the two-tile prefetch distance is unused; the lever is to defer the first consumer to the
+copy (raw loaded vector, select at the use), not to change the datapath.  Both [45d] and [45f] as
+written leave this bucket at 4-6 %.  (2) Section 3.1 for the dynamic module: the call-level vote
+costs more than the four serialised chains it removes (+2.8 us), because the pre-vote pass runs
+every span's chain regardless of format; the per-span vote is the right form there.  (3) Section
+3.2: the two-set body does not stop ptxas from reusing the just-stored `out` registers as the next
+`LDS` destination (one hit in four bodies); a guaranteed form would need the loads issued before
+the stores of the *previous* span's second block as well (+4 more live registers), which the
+128 cap does not allow.  (4) The realisation factors of section 3.7 were still too high: the
+instruction cut over-delivered (fp8 -9.6 % vs -6..-9 % implied) and the stall side under-delivered
+(warp-cycles per instruction rose); the wall moved -5.3 % (fp8) against the modelled -8..-11 %.
+Kept: [45c] (the whole tag pipeline was dead work in the static modules: -5..-7 us) and [45e];
+[45f] is neutral and kept for the shorter prologue chain; [45a] static kept (-2.5..-2.7).
