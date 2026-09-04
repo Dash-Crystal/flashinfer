@@ -1009,6 +1009,12 @@ constexpr float kMixedFoldBound = 255.5f * 0x1p120f;
 #ifndef MIXED_EXPANSION_PIPELINED_SPANS
 #define MIXED_EXPANSION_PIPELINED_SPANS 0
 #endif
+// [45a] in the dynamic module: 1 = one fold vote per call (pre-vote pass over the tag-selected
+// spans), 0 = the design's fallback (per-span vote, as [44]).  Static modules always vote once per
+// call.  0 at verification, see the dynamic branch of expandMixedPartialHeadsInPlaceBF16Placement.
+#ifndef MIXED_DYN_CALL_VOTE
+#define MIXED_DYN_CALL_VOTE 0
+#endif
 __device__ inline bool foldScalesFinite(bool finite, bool foldOk) {
   return __all_sync(0xFFFFFFFFu, foldOk && finite);
 }
@@ -1293,14 +1299,20 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     spans(MixedFoldTag<false>{});
   }
 #else
-  // ---- dynamic module: [45a] one vote per call over the tag-selected spans, rolled span loop ----
-  // Pre-vote pass (unrolled: nbSpans scale words, each span's (g 2^k, foldOk) SELECTED by its tag
-  // byte from the register word; A16 / BAD spans (tag 0) contribute "finite" by select - their
-  // scale rows are never written by the copy, so a stale word must not reach the compare).
+  // ---- dynamic module: rolled span loop; the fold vote is per span (MIXED_DYN_CALL_VOTE 0, the
+  // design's [45a] fallback "per-span vote in the dyn module only") or one per call ([45a] as
+  // written, MIXED_DYN_CALL_VOTE 1).  Set to 0 at verification: the per-commit bisect priced the
+  // call-level vote at mixed +2.8 us (its pre-vote pass runs the four spans' LDS.U16 -> F2FP chains
+  // whatever their format; F2FP.E4M3 samples in the dyn module rose 1.1 -> 2.0 %), while the
+  // static modules' call vote gained.  Both forms are bit-exact (same bodies, same per-span bound).
   float const gFold8 = fp8GlobalScale * 0x1p120f;
   float const gFold4 = fp4GlobalScale * 0x1p126f;
   bool const foldOk8 = fabsf(fp8GlobalScale) >= 0x1p-117f;
   bool const foldOk4 = fabsf(fp4GlobalScale) >= 0x1p-117f;
+#if MIXED_DYN_CALL_VOTE
+  // Pre-vote pass (unrolled: nbSpans scale words, each span's (g 2^k, foldOk) SELECTED by its tag
+  // byte from the register word; A16 / BAD spans (tag 0) contribute "finite" by select - their
+  // scale rows are never written by the copy, so a stale word must not reach the compare).
   bool finite = true;
   bool foldOk = true;
 #pragma unroll
@@ -1315,14 +1327,21 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     foldOk = foldOk && (isFP8 ? foldOk8 : (isFP4 ? foldOk4 : true));
   }
   bool const fold = foldScalesFinite(finite, foldOk);  // one VOTE.ALL per call, warp-uniform
-  // One span (page) of one format; fold is the call-level flag (uniform branch, no vote).  The
-  // scale word is read again here: the rolled loop cannot index a register array by span.
+#endif
+  // One span (page) of one format.  MIXED_DYN_CALL_VOTE 1: fold is the call-level flag (uniform
+  // branch, no vote); 0: the span's own chain and VOTE.ALL after its loads ([44] order).  The
+  // scale word is read here: the rolled loop cannot index a register array by span.
   auto const expandSpan = [&](uint32_t span, auto formatTag) {
+    constexpr bool spanIsFP8 = decltype(formatTag)::value == fp8Format;
     uint32_t const tileOff = span * spanTileBytes;
     uint32_t const s01 = ldsU16(scaleAddr + span * spanScaleBytes);
     LdGrain packed[2];
     loadBlock(formatTag, addr0 + tileOff, packed[0]);
     loadBlock(formatTag, addr2 + tileOff, packed[1]);
+#if !MIXED_DYN_CALL_VOTE
+    bool const fold = foldScalesFinite(spanFinite(s01, spanIsFP8 ? gFold8 : gFold4),
+                                       spanIsFP8 ? foldOk8 : foldOk4);
+#endif
     auto const body = [&](auto foldTag) {
       uint32_t sf2_0, sf2_1;
       scalePair(formatTag, foldTag, s01, sf2_0, sf2_1);
