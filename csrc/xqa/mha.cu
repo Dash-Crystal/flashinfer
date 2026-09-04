@@ -457,14 +457,16 @@ struct alignas(128) SharedMem {
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   // Row maxNbCopiedHeads of a warp's range is the dump row for its lanes past the tile's
   // heads (copyMixedPartialHeadsAsync scale copy).
-  uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1][mixedKScaleBytes];
+  // 4 B alignment is a contract: the copies stage each row's scale group with a 4 B cp.async
+  // and the [44] expansion reads scale pairs with LDS.U16 at row * 4 + 2h.
+  alignas(4) uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1][mixedKScaleBytes];
   // Group scope under grpLoadV: the warps of a group stage the scales of their own disjoint
   // token ranges of the shared V tile; each warp's slot is headsPerWarp rows + its dump row.
   static constexpr uint32_t vScaleRowsPerWarp =
       (grpLoadV ? exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp) : cacheVTileSeqLen) + 1;
-  uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
-                 [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
-                 [mixedVScaleBytes];
+  alignas(4) uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
+                            [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
+                            [mixedVScaleBytes];
 #if MIXED_KV_PROBE_C
   // Dead landing area for the probe's shadow copies (never read). 16 B per lane per gemm0 warp.
   alignas(16) uint8_t probeScratch[ctaShapeInWarps.x][warp_size * 16];

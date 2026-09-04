@@ -293,7 +293,7 @@ second helper with the new body is selected at the two call sites by a template 
   branch so `__all_sync` is convergent.  The lane's two scales `s_0, s_1` (E4M3 -> f16 exact ->
   fp32 exact: `cvt.rn.f16x2.e4m3x2` on the u16 + `HADD2.F32`, the same route as
   `e4m3x4ScalesToFloat`) give `f_i = s_i * gFold` with `gFold = g * 2^k` (k = 120 FP8, 126 FP4);
-  the vote is `__all_sync(~0, max(|f_0|, |f_1|) < 255.5 * 2^120) && foldOk` with **`foldOk = |g|
+  the vote is `__all_sync(~0, foldOk && max(|f_0|, |f_1|) < 255.5 * 2^120)` (foldOk inside the vote, as the code has it; it is warp-uniform so the two spellings are equivalent) with **`foldOk = |g|
   >= 2^-117`** (warp-uniform, from the global scale, as `mha_sm90.cu:492-493`, `:533-534`,
   `:2832-2836`).  Why the second term: the reference scale is `bf16_rn(fl32(s * g))`
   (`convertE4M3ScaleToA16Bits`, `mhaUtils.cuh:593-598`); `bf16_rn(fl32(s * g * 2^k)) =

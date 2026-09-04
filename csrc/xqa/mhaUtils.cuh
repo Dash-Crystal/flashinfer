@@ -1039,11 +1039,14 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset, float fp8GlobalScale,
     float fp4GlobalScale) {
   using Tile = Array2D<_LdGrain, dstNbHeads, dstNbGrains>;
-  static_assert(mha::is_same_v<InputElem, __nv_bfloat16>, "placement decode is bf16-only");
+  // Every static_assert below is dependent on a template parameter so that a mixed build that
+  // never instantiates this helper (fp16 input, other page sizes, sm120) compiles unchanged.
+  static_assert(sizeof(_LdGrain) == grainBytes && mha::is_same_v<InputElem, __nv_bfloat16>,
+                "placement decode is bf16-only");
   static_assert(sizeof(_LdGrain) == grainBytes && grainBytes == 16);
   static_assert(swizzle, "the cut assumes the 128 B-row swizzle c ^ (r % 8)");
   static_assert(Tile::rowBytes == 128 && dstNbGrains == 8, "128 B tile rows");
-  static_assert(warp_size == 32 && tokensPerPage == 16);
+  static_assert(dstNbGrains == 8 && warp_size == 32 && tokensPerPage == 16);
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   static_assert(partBytes == 128, "128 B parts: 4 blocks per row, 64 blocks per 16-token span");
   constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
@@ -1207,9 +1210,10 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
+  // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
   static_assert(sizeof(_LdGrain) == grainBytes && grainBytes == 16);
   static_assert(swizzle && Tile::rowBytes == 128 && Tile::cols == 8, "128 B swizzled tile rows");
-  static_assert(warp_size == 32 && tokensPerPage == 16);
+  static_assert(Tile::cols == 8 && warp_size == 32 && tokensPerPage == 16);
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   static_assert(partBytes == 128, "128 B parts");
   constexpr uint32_t blocksPerPart = exactDiv(exactDiv(partBytes, grainBytes), 2);
@@ -1222,7 +1226,8 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
   constexpr uint32_t iterationsPerSpan = exactDiv(blocksPerSpan, warp_size);  // 2
   constexpr uint32_t rowsPerIter = exactDiv(warp_size, blocksPerPart);         // 8
   static_assert(rowsPerIter == 8 && headsPerSpan % 8 == 0, "row % 8 is a lane constant");
-  static_assert(validElemsPerHead == exactDiv(sizeof(PaddedCacheHead), sizeof(CacheElem)),
+  static_assert(partBytes == 128 &&
+                    validElemsPerHead == exactDiv(sizeof(PaddedCacheHead), sizeof(CacheElem)),
                 "every 16-element block of the head is valid: no per-block elem check");
   static_assert(dstNbHeads >= maxNbCopiedHeads);
   static_assert(maxNbCopiedHeads % warp_size == 0, "scale loop: no dump row needed");
