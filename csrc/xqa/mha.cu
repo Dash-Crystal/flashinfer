@@ -153,8 +153,20 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 // layout bring SharedMem to ~87 KB (K 32 + V 32 + Q 4 + X 8 + scales/meta ~11) and
 // __launch_bounds__(256, 2) caps registers at 128, which the warpTile.y 16 mixed code
 // already meets on the q=1 modules (REG 128, STACK 8-24, spills outside the tile loop).
-constexpr uint32_t preferedKHeadPartBytes = 64;
+// Track S step 5 [43]: 128 B K parts again (2 copy/expand/MMA rounds per 64-token K tile
+// instead of 4; the round's fixed cost - wait_group, tag broadcast, page advance, flag
+// stores - was paid four times).  The 32 KB larger K ring fits two CTAs because the
+// per-warp V scale rows shrink to their 4 B stride (SharedMem::mixedVScaleBytes): K 64 KB +
+// V 32 KB + Q 4 KB + X 8 KB + scales/meta/barriers 3.4 KB = 115,456 B; 2 x (115,456 + 1,024)
+// = 232,960 <= 233,472 (228 KB).  64-row V tiles (V 64 KB) would not fit (147 KB).
+constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+// [43] also rolls the K-part loop of the gemm0 warps and the X-tile loop of the gemm1 warps
+// and drops the isFull copy variants (one copy body per format): the two co-resident CTAs
+// put four code regions on every SMSP and the step-4 build stalled on instruction fetch
+// (no_instruction 2.2-2.8 warps per issue cycle; hot loops 3,239 + 3,500 SASS in the dynamic
+// module).
+#define MIXED_COMPACT_TILE_LOOPS 1
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;
@@ -164,6 +176,12 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 #endif
 #endif
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
+#ifndef MIXED_COMPACT_TILE_LOOPS
+#define MIXED_COMPACT_TILE_LOOPS 0
+#endif
+// Rolled per-tile loops and a single (bounds-checked) copy body per format: code footprint
+// over unrolled scheduling freedom (Track S step 5 [43], sm90 SPEC_DEC mixed build only).
+constexpr bool kCompactTileLoops = MIXED_COMPACT_TILE_LOOPS != 0;
 // constexpr uint32_t cacheElemsPerKHeadPart = exactDiv(kHeadPartBytes, cacheElemSize);
 
 constexpr bool persistentQ = paddedInputHeadBytes * ctaTile.y <= (16u << 10);
@@ -400,8 +418,16 @@ struct alignas(128) SharedMem {
 #if ENABLE_MIXED_KV_CACHE
   static constexpr uint32_t mixedKScaleBytes =
       mha::max(4U, exactDiv(kHeadPartBytes, 2 * grainBytes));
-  static constexpr uint32_t mixedVScaleBytes =
-      mha::max(4U, exactDiv(sizeof(PaddedCacheHead), 2 * grainBytes));
+  // Row stride of the staged V scales.  The copy writes rows at its scaleLoadBytes
+  // (max(4, blocksPerPart)): 8 B for whole 256 B head rows under grpLoadV, 4 B for a warp's
+  // own 128 B half row otherwise - the second 4 B of every row were never written or read.
+  // The sm90 compact build ([43]) takes the 4 B stride (that 1,056 B is what lets the 128 B
+  // K ring fit two CTAs); the other builds keep the 8 B layout byte-for-byte (sm120 fp4 q=1
+  // measured +1.6 us with the shrunk layout, a smem-layout effect this step does not chase).
+  static constexpr uint32_t mixedVScaleBytes = mha::max(
+      4U, exactDiv(exactDiv(sizeof(PaddedCacheHead),
+                            (kCompactTileLoops && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
+                   2 * grainBytes));
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
   MixedPageFormats<nbPagesPerVTile>
       vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
@@ -2392,7 +2418,9 @@ CUBIN_EXPORT __global__
       //     }
       //     printf("}\n");
       // }
-      bool const isFullTile = (seqIter + 1 < nbSeqIters);
+      // [43] kCompactTileLoops: every tile takes the bounds-checked copy body (nbHeadsAvail
+      // is warpTile.x for full tiles); the isFull specialisation doubled the copy code.
+      bool const isFullTile = !kCompactTileLoops && (seqIter + 1 < nbSeqIters);
 #if ENABLE_MIXED_KV_CACHE
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // The mixed copy/expand helpers take no token offset: the warp tile's origin
@@ -2409,8 +2437,9 @@ CUBIN_EXPORT __global__
                               grainBytes, grainBytesGmemCache, qkSwizzle, true>(
             warp, dst, dstHeadOffset, src, idxPart);
       } else if (kA16CopyFastPath && !needsExpansion) {
+        uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
-            seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+            (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
                               grainBytes, grainBytesGmemCache, qkSwizzle, false>(
             warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
@@ -2425,7 +2454,9 @@ CUBIN_EXPORT __global__
 #endif
             );
       } else {
-        uint32_t const nbHeadsAvail = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+        uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+        uint32_t const nbHeadsAvail =
+            (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
@@ -2519,7 +2550,9 @@ CUBIN_EXPORT __global__
         constexpr uint32_t nbPartsPerKHead = exactDiv(headElems, elemsPerKHeadPart);
         // the accumulator
         WarpAcc acc{};
-        constexpr uint32_t nbUnroll = (cacheElemSize == 2 ? nbPartsPerKHead : 1);
+        // [43] kCompactTileLoops rolls the part loop: one copy/expand/MMA body per module.
+        constexpr uint32_t nbUnroll =
+            (cacheElemSize == 2 && !kCompactTileLoops ? nbPartsPerKHead : 1);
 #pragma unroll(nbUnroll)
         for (uint32_t p = 0; p < nbPartsPerKHead; p++) {
           constexpr bool syncKTileEarly =
@@ -2971,7 +3004,7 @@ CUBIN_EXPORT __global__
           (seqOffset < cacheSeqLen
                ? cacheSeqLen - seqOffset
                : 0U);  // may also be full but it can be handled correctly anyway
-      bool const isFullTile = (seqIter + 1 < nbSeqIters);
+      bool const isFullTile = !kCompactTileLoops && (seqIter + 1 < nbSeqIters);  // [43]
 #if ENABLE_MIXED_KV_CACHE
       if (kA16CopyFastPath && !needsExpansion && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
@@ -3083,7 +3116,15 @@ CUBIN_EXPORT __global__
     }
     bool xBarProducedParityNext = false;
     for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters) {
+#if MIXED_COMPACT_TILE_LOOPS
+      // [43] kCompactTileLoops rolls the X-tile loop: one V copy/expand/MMA body per module
+      // (the unrolled form carried nbXItersPerCtaTile = 4 of them in the hot loop).  Kept as
+      // a preprocessor branch so the other builds see the stock `#pragma unroll` (an
+      // `unroll(N)` spelling changes their SASS).
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
       for (uint32_t xIter = 0; xIter < nbXItersPerCtaTile; xIter++) {
         uint32_t const idxXTile = xIter * nbXTilesPerXIter + warpGrpIdx / nbCacheVTilesPerXTile;
         assert(idxXTile < ctaShapeInWarps.x);
