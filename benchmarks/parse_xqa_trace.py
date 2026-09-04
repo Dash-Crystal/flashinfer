@@ -82,8 +82,9 @@ def parse_cta_records(path, mode=None):
             if pending and (mode is None or group_mode == mode):
                 launches.append(pending)
             pending = []
-            if m_beg is not None:
-                cur_mode = m_beg.group(1)
+            # records between an END and the next MODE marker are the next
+            # mode's JIT warm-up launch: no mode until its marker arrives
+            cur_mode = m_beg.group(1) if m_beg is not None else None
             continue
         m = PAT_CTA.search(line)
         if m:
