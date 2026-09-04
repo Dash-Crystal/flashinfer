@@ -1611,6 +1611,11 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if SWAP_AB
 //@fixme: to reduce code size, we can disable unroll and use double-buffer for LDSM in
 // loadVTileTransposed.
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
+      // The rescale above wrote the accumulator registers with non-wgmma
+      // instructions: fence them once before this tile's first PV wgmma.
+      gmma::fence();
+#endif
 #pragma unroll
       for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++) {
 #if CACHE_ELEM_ENUM == 2
@@ -1683,12 +1688,20 @@ __launch_bounds__(128 * ctaWarpGroups)
               reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
 #endif
         }
+#if CACHE_ELEM_ENUM == 2
+        // Register-A fragments must stay live until the wgmma completes: commit
+        // and drain per k-step.
         gmma::commit_group();
-        //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until
-        // finish of
-        // gmma.
         gmma::wait_group<0>();
+#endif
       }
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
+      // All gemm1NbGmmaInstK x gemm1NbGmmaInstM PV wgmmas read shared memory
+      // only, so they stay in flight together: one commit and one drain per
+      // tile instead of one per k-step.
+      gmma::commit_group();
+      gmma::wait_group<0>();
+#endif
 #else
       auto const descVTBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VTBuffer::rowBytes * 8,
                                                 gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
