@@ -604,3 +604,16 @@ register for the expansion decision, `SHF.R + LOP3` per span for the format (uni
 if ptxas keeps the REDUX result in a UR), `LDS.U8 [UR]` of `kFormats` 0.  Registers: static -1
 (`pageTagLane`, `pageFormats`, the flag), dyn +1 (`Next/Curr` +2, `pageFormats` -1).  REG <= 128,
 STACK 0, LDL / STL 0.
+
+### 8.2 [45e] — `computeRowSum` quad broadcast with a constant mask (commit "[45e]")
+
+File: `csrc/xqa/mha.cu` `computeRowSum` (`:~805`), inside the `#pragma unroll` loop over
+`QuadRegRowMax::size` (4): `#if MIXED_COMPACT_TILE_LOOPS __shfl_sync(0xFFFFFFFFU, rowSum[i],
+laneId() & ~3U) #else <stock> #endif`.  `MIXED_COMPACT_TILE_LOOPS` is defined at `mha.cu:~186`,
+before the function.  Data flow: `rowSum[i]` (per lane) -> `SHFL.IDX` from lane `4 (lane / 4)`
+-> `rowSum[i]`; the stock form reads the same source lane (lane 0 of the 4-wide segment) under a
+4-lane mask.  Control flow: none added; the function runs once per tile in the converged gemm0
+warp (`mha.cu:2777`), so the full mask is the true active set.  Expected SASS: 4 `SHFL.IDX` (was
+4 `SHFL.IDX` + `WARPSYNC` / `MATCH.ANY` / `REDUX.OR` / `VOTEU.ANY` / `LOP3` / `BRA.DIV` per
+shuffle); `MATCH.ANY` 0 and `BRA.DIV` 0 in the gemm0 tile loop.  Registers: 0.  sm120 / M32:
+the `#else` text is byte-for-byte the stock line.

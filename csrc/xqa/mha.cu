@@ -810,7 +810,17 @@ __device__ inline QuadRegRowMax computeRowSum(Warp const& warp, GemmOutRegTile c
 // each quad to eliminate mismatch. This has no visible impact on final result and can be removed.
 #pragma unroll
   for (uint32_t i = 0; i < QuadRegRowMax::size; i++) {
+#if MIXED_COMPACT_TILE_LOOPS
+    // [45e] (Track S step 7): the same quad broadcast with a constant full mask and the quad-base
+    // source lane (lane & ~3).  The stock form's lane-dependent mask made ptxas wrap every shuffle
+    // in WARPSYNC / MATCH.ANY / REDUX / VOTEU / BRA.DIV convergence code (111 PC samples per fp8
+    // launch on gemm0's critical path); this is one SHFL.IDX.  Value-identical: both broadcast
+    // lane 0 of the quad, and computeRowSum runs in the converged gemm0 warp.  Preprocessor
+    // guard so the sm120 / M32 modules keep their SASS.
+    auto const lane0Val = __shfl_sync(0xFFFFFFFFU, rowSum[i], laneId() & ~3U);
+#else
     auto const lane0Val = __shfl_sync(0xFU << (laneId() / 4 * 4), rowSum[i], 0, 4);
+#endif
     // Disable the assert, sometimes it triggers because of different orders of accumulation.
     // assert(fabs(rowSum[i] - lane0Val) < 1E-4f);
     rowSum[i] = lane0Val;
