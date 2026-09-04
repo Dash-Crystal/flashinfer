@@ -595,18 +595,40 @@ struct SparseMixedCollectiveMainloop {
     op.staged.active = false;
   }
 
+#ifdef MIXED_FA3_TRACE
+  // Diagnosis-only sub-stamps of finish_pending_pair (thread 0, %globaltimer ns):
+  // t[0] after cp.async.wait_group, t[1] after barrier B, t[2] after expand K,
+  // t[3] after K fence+commit, t[4] after expand V, t[5] after V fence+commit.
+  // An inactive operand leaves its two stamps equal to the previous one.
+  struct FinTrace {
+    bool on;
+    uint64_t t[6];
+  };
+#endif
+
   // Caller guarantees the operand's copies landed and are visible (cp.async
   // wait + group barrier).
   template <typename STensor>
   CUTLASS_DEVICE void finish_pending(Params const& p, Operand& op, STensor& sX,
                                      uint8_t (*meta_formats)[PAGES_PER_TILE],
-                                     uint32_t* meta_valid, int thread_idx) const {
+                                     uint32_t* meta_valid, int thread_idx
+#ifdef MIXED_FA3_TRACE
+                                     ,
+                                     FinTrace& ft, int ft_base
+#endif
+                                     ) const {
     if (!op.pending.active) return;
     int const stage = op.pending.state.index();
     expand_token(p, meta_formats[op.pending.slot], meta_valid[op.pending.slot], sX, stage, op.isK,
                  op.scales[stage], thread_idx);
+#ifdef MIXED_FA3_TRACE
+    if (ft.on) ft.t[ft_base] = mixed_detail::globaltimer_ns();
+#endif
     cutlass::arch::fence_view_async_shared();  // D5
     op.pipeline->producer_commit(op.pending.state);
+#ifdef MIXED_FA3_TRACE
+    if (ft.on) ft.t[ft_base + 1] = mixed_detail::globaltimer_ns();
+#endif
     op.pending.active = false;
   }
 
@@ -662,6 +684,9 @@ struct SparseMixedCollectiveMainloop {
     PendingTile const none{false, PipelineState{}, 0};
     Operand K{&pipeline_k, &smem_pipe_write_k, shared_storage.mixed_scales_k, true, none, none};
     Operand V{&pipeline_v, &smem_pipe_write_v, shared_storage.mixed_scales_v, false, none, none};
+#ifdef MIXED_FA3_TRACE
+    FinTrace ft{false, {0, 0, 0, 0, 0, 0}};
+#endif
 
     // Wait for the previous pair's compressed copies (all groups but the newest),
     // make them visible to the group, expand and commit them.
@@ -672,11 +697,30 @@ struct SparseMixedCollectiveMainloop {
         } else {
           cutlass::arch::cp_async_wait<0>();
         }
+#ifdef MIXED_FA3_TRACE
+        if (ft.on) ft.t[0] = mixed_detail::globaltimer_ns();
+#endif
         group_barrier();  // barrier B: every thread's copies of the pending pair landed
+#ifdef MIXED_FA3_TRACE
+        if (ft.on) ft.t[1] = ft.t[2] = ft.t[3] = mixed_detail::globaltimer_ns();
+#endif
         // Explicit call sites: selecting an Operand by a runtime reference would
         // force both structs into local memory (C2).  The body is small now.
-        finish_pending(mainloop_params, K, sK, meta_formats, meta_valid, thread_idx);
-        finish_pending(mainloop_params, V, sV, meta_formats, meta_valid, thread_idx);
+        finish_pending(mainloop_params, K, sK, meta_formats, meta_valid, thread_idx
+#ifdef MIXED_FA3_TRACE
+                       ,
+                       ft, 2
+#endif
+        );
+#ifdef MIXED_FA3_TRACE
+        if (ft.on) ft.t[4] = ft.t[5] = ft.t[3];
+#endif
+        finish_pending(mainloop_params, V, sV, meta_formats, meta_valid, thread_idx
+#ifdef MIXED_FA3_TRACE
+                       ,
+                       ft, 4
+#endif
+        );
       }
     };
 
@@ -684,6 +728,11 @@ struct SparseMixedCollectiveMainloop {
     uint64_t const tr_enter = mixed_detail::globaltimer_ns();
     uint64_t tr_after_q = 0, tr_first_t0 = 0, tr_prev_end = 0;
     uint64_t tr_acq = 0, tr_bar = 0, tr_gat = 0, tr_iss = 0, tr_fin = 0, tr_gap = 0;
+    // acq split (K, V) and fin split (wait, barrier B, expand K, K fence+commit,
+    // expand V, V fence+commit, other = pending test + rotate + stamp overhead).
+    uint64_t tr_acqK = 0, tr_acqV = 0;
+    uint64_t tr_wait = 0, tr_barB = 0, tr_expK = 0, tr_fcK = 0, tr_expV = 0, tr_fcV = 0,
+             tr_oth = 0;
     int tr_n = 0;
 #endif
     // Metadata for the first two tiles processed (t and t-1), C1.
@@ -695,10 +744,14 @@ struct SparseMixedCollectiveMainloop {
     auto produce_pair = [&](int tK, int tV) {
 #ifdef MIXED_FA3_TRACE
       bool const trace = (blockIdx.x == 0) && (work_idx <= 1) && (thread_idx == 0);
-      uint64_t tr0 = 0, tr1 = 0, tr2 = 0, tr3 = 0, tr4 = 0, tr5 = 0;
+      uint64_t tr0 = 0, tr0b = 0, tr1 = 0, tr2 = 0, tr3 = 0, tr4 = 0, tr5 = 0;
+      ft.on = trace;
       if (trace) tr0 = mixed_detail::globaltimer_ns();
 #endif
       if (tK >= 0) pipeline_k.producer_acquire(smem_pipe_write_k);
+#ifdef MIXED_FA3_TRACE
+      if (trace) tr0b = mixed_detail::globaltimer_ns();
+#endif
       if (tV >= 0) pipeline_v.producer_acquire(smem_pipe_write_v);
 #ifdef MIXED_FA3_TRACE
       if (trace) tr1 = mixed_detail::globaltimer_ns();
@@ -722,7 +775,11 @@ struct SparseMixedCollectiveMainloop {
       }
       cutlass::arch::cp_async_fence();  // this pair's copies form one commit group
 #ifdef MIXED_FA3_TRACE
-      if (trace) tr4 = mixed_detail::globaltimer_ns();
+      if (trace) {
+        tr4 = mixed_detail::globaltimer_ns();
+        // No pending operand (A16 pair): every sub-stamp reads as tr4 -> fin = oth.
+        ft.t[0] = ft.t[1] = ft.t[2] = ft.t[3] = ft.t[4] = ft.t[5] = tr4;
+      }
 #endif
       // Previous pair's compressed tiles: their group is complete once at most
       // one group (this pair's) is outstanding.  Then this pair becomes pending.
@@ -735,6 +792,10 @@ struct SparseMixedCollectiveMainloop {
         if (tr_n == 0) tr_first_t0 = tr0; else tr_gap += tr0 - tr_prev_end;
         tr_acq += tr1 - tr0; tr_bar += tr2 - tr1; tr_gat += tr3 - tr2; tr_iss += tr4 - tr3;
         tr_fin += tr5 - tr4; tr_prev_end = tr5; ++tr_n;
+        tr_acqK += tr0b - tr0; tr_acqV += tr1 - tr0b;
+        tr_wait += ft.t[0] - tr4; tr_barB += ft.t[1] - ft.t[0]; tr_expK += ft.t[2] - ft.t[1];
+        tr_fcK += ft.t[3] - ft.t[2]; tr_expV += ft.t[4] - ft.t[3]; tr_fcV += ft.t[5] - ft.t[4];
+        tr_oth += tr5 - ft.t[5];
       }
 #endif
     };
@@ -782,14 +843,20 @@ struct SparseMixedCollectiveMainloop {
     if (blockIdx.x == 0 && thread_idx == 0 && work_idx <= 1) {
       uint64_t const tr_exit = mixed_detail::globaltimer_ns();
       printf("[w%d] item %6llu ns: enter->afterQ %6llu | afterQ->pair0 %6llu | pairs(%d) %6llu "
-             "= acq %5llu bar %4llu gat %5llu iss %6llu fin %6llu gap %6llu | lastpair->exit %5llu\n",
+             "= acq %5llu bar %4llu gat %5llu iss %6llu fin %6llu gap %6llu | lastpair->exit %5llu"
+             " | acq = K %5llu V %5llu | fin = wait %6llu barB %5llu expK %6llu fcK %5llu"
+             " expV %6llu fcV %5llu oth %5llu\n",
              work_idx, (unsigned long long)(tr_exit - tr_enter),
              (unsigned long long)(tr_after_q - tr_enter),
              (unsigned long long)(tr_first_t0 - tr_after_q), tr_n,
              (unsigned long long)(tr_prev_end - tr_first_t0), (unsigned long long)tr_acq,
              (unsigned long long)tr_bar, (unsigned long long)tr_gat, (unsigned long long)tr_iss,
              (unsigned long long)tr_fin, (unsigned long long)tr_gap,
-             (unsigned long long)(tr_exit - tr_prev_end));
+             (unsigned long long)(tr_exit - tr_prev_end), (unsigned long long)tr_acqK,
+             (unsigned long long)tr_acqV, (unsigned long long)tr_wait,
+             (unsigned long long)tr_barB, (unsigned long long)tr_expK,
+             (unsigned long long)tr_fcK, (unsigned long long)tr_expV,
+             (unsigned long long)tr_fcV, (unsigned long long)tr_oth);
     }
 #endif
     scheduler.broadcast_next_work(work_tile_info);
