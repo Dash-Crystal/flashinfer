@@ -17,9 +17,9 @@ mixed stream used by the benchmarks 1.66x (172 MB vs 285 MB).
 | host (B=17, S=4096, 8 KV heads, GQA 4, D=128) | A16 | FP8 target | FP4 target | mixed target | measured now |
 |---|---|---|---|---|---|
 | H200 sm90 XQA decode, q=1 | 83 us | <= 58 | <= 36 | <= 62 | FP8 91, FP4 96, mixed 114 |
-| H200 sm90 XQA, q=4 (SPEC_DEC) | 135 | <= 94 | <= 59 | <= 101 | FP8 229, FP4 275, mixed 935 |
-| RTX 5090 sm120 XQA decode, q=1 | 180 | <= 125 | <= 79 | <= 135 | FP8 139, FP4 84 (passes), mixed 146 |
-| RTX 5090 sm120 XQA, q=4 | 184 | <= 128 | <= 81 | <= 138 | FP8 155, FP4 101, mixed 157 |
+| H200 sm90 XQA, q=4 (SPEC_DEC, runs mha.cu) | 135 | <= 94 | <= 59 | <= 101 | FP8 231, FP4 277, mixed 437 (co-tenant-corrected; after [29]: 198/240/420) |
+| RTX 5090 sm120 XQA decode, q=1 | 180 (175 after [29]) | <= 125 | <= 79 | <= 135 | **after [29]: FP8 118.8, FP4 65.5, mixed 126.4 - all pass** (were 139/84/146) |
+| RTX 5090 sm120 XQA, q=4 | 184 (179) | <= 128 | <= 81 | <= 138 | **after [29]: FP8 125.0, FP4 81.9, mixed 132.3** (FP8/mixed pass, FP4 within 1%) |
 | H200 FA3 prefill, q>=64 | 300 | parity | parity | parity | A16 528, compressed ~1500-1800 |
 
 Byte rooflines, corrected by the P0.1 host probe (measured achievable streaming
