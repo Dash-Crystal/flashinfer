@@ -466,7 +466,11 @@ the transport control and stays byte-identical to `5cc416fd`).
   `2^120`, then `bf16(f32(s) g)` with `g` reloaded from the grid-constant
   parameters).  No host bound on the global scale (the [23] `.item()` check is
   gone).  E4M3 NaN payload codes decode to the finite `1.111 x 2^-112 x scale`
-  (the quantizer never emits them; tests exclude NaN).
+  (the quantizer never emits them; tests exclude NaN).  The scale products are
+  `mul.rn.f32` without `.ftz` (`mixed_detail::mul_rn_f32_denorm`): the module
+  is built with `-use_fast_math`, and `f32(s) g` below `2^-126` (e.g. `s =
+  2^-9`, `g = 1.1 x 2^-118`) must survive as an f32 / bf16 subnormal as it does
+  in the reference - found by the extremes matrix, 2026-09-04.
 - **New C10 (dynamic dispatch, [24c]).** The dynamic module's chunk-table row
   carries two 6-bit page masks (`tags[4]` = FP8 pages, `tags[5]` = FP4 pages;
   `tags[0..3]` unused) so that its last word `m8 | m4 << 8 | valid << 16 |

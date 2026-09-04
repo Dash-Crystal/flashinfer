@@ -105,6 +105,17 @@ inline constexpr bool mainloop_has_init_shared_v =
 
 namespace mixed_detail {
 
+// f32 product that keeps subnormal results (mul.rn.f32 without .ftz).  The
+// module is compiled with flush-to-zero f32 arithmetic, but the scale factor
+// bf16(f32(s) * g) must equal the reference's for |s g| < 2^-126 - a bf16
+// subnormal (C9; e.g. s = 2^-9 with g = 1.1 x 2^-118 on the exact path).  One
+// FMUL either way.
+CUTLASS_DEVICE float mul_rn_f32_denorm(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
 CUTLASS_DEVICE uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
   uint32_t d;
   asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
@@ -758,8 +769,8 @@ struct SparseMixedCollectiveMainloop {
     uint32_t a16_dst;         // smem address of (row u/16, chunk u%16), stage 0, tile page h
     uint32_t out0;            // smem address of chunk 2b + swap of row r, stage 0, page h (first output)
     uint32_t out1;            // chunk 2b + 1 - swap (second output)
-    uint32_t land8;           // FP8 landing: logical chunk 8+b of row r (D-block 1 line, see land_row_line)
-    uint32_t land4;           // FP4 landing: 8 B in chunk 8 + b/2 + 4*(r&1), half b&1
+    uint32_t land8;           // FP8 landing (cp.async dst, 16 B aligned): logical chunk 8+b of row r (D-block 1 line, see land_row_line)
+    uint32_t land4;           // FP4 landing (cp.async dst, 8 B aligned): 8 B in chunk 8 + b/2 + 4*(r&1), half b&1
     uint32_t sc_rd;           // smem address of this thread's 4 B scale word in the row's 8 B slot, page h, stage 0
     float gs8, gs4;           // global scales of this operand (FP8 bf16: x 2^120 or the +inf sentinel, C9)
   };
@@ -803,6 +814,9 @@ struct SparseMixedCollectiveMainloop {
       uint32_t const sc_base = cute::cast_smem_ptr_to_uint(&scales[0][0]);
       b.out0 = chunk_smem(sX, 0, int(r), 2 * k + swap) + page_off;
       b.out1 = chunk_smem(sX, 0, int(r), 2 * k + 1 - swap) + page_off;
+      // Aligned copy destinations; the expansion's half order (swap) is applied
+      // per pair in expand_bases, not folded here (the cp.async needs the aligned
+      // address, and an item-invariant swapped copy was what ptxas spilled).
       b.land8 = chunk_smem(sX, 0, int(r), CHUNKS_PER_BLOCK + k) + page_off;
       b.land4 = chunk_smem(sX, 0, int(r), CHUNKS_PER_BLOCK + k / 2 + 4 * (r & 1u)) + 8 * (k & 1u) +
                 page_off;
@@ -1045,11 +1059,24 @@ struct SparseMixedCollectiveMainloop {
   // Per FP4 block: LDS.64 + LDS.32 + scale 5 + 2 x 20 (LUT) + 8 HMUL2 + 2 STS.
 
   // E4M3 scale byte (byte sel of the word) -> the reference's float(scale).
+  // One PTX block with 32-bit operands only: e4m3 -> f16 (exact) -> f32 (exact),
+  // F2FP.F16.E4M3.UNPACK_B + HADD2.F32 in SASS.  A 16-bit C++ operand (`"h"`
+  // constraint / __half) here made ptxas materialise the half through the frame
+  // (STL + LDL.LU.S16 per block) in the register-tight dynamic module.
   CUTLASS_DEVICE static float scale_byte_f32(uint32_t scale_word, uint32_t sel) {
     uint32_t const byte = __byte_perm(scale_word, 0u, sel);
-    uint32_t h2;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<uint16_t>(byte)));
-    return __half2float(reinterpret_cast<__half const&>(h2));
+    float f;
+    asm("{\n"
+        " .reg .b16 b0, b1, h0, h1;\n"
+        " .reg .b32 h2;\n"
+        " mov.b32 {b0, b1}, %1;\n"
+        " cvt.rn.f16x2.e4m3x2 h2, b0;\n"
+        " mov.b32 {h0, h1}, h2;\n"
+        " cvt.f32.f16 %0, h0;\n"
+        "}"
+        : "=f"(f)
+        : "r"(byte));
+    return f;
   }
   // f32 -> A16 broadcast to both halves (one rounding: the reference's
   // static_cast<A16>(float(scale) * global)).
@@ -1084,12 +1111,19 @@ struct SparseMixedCollectiveMainloop {
     uint32_t l4a, l4b;    // FP4 landing halves (4 B each)
     uint32_t sc;          // scale word
   };
+  // Per pair: four IADD (stage offsets), two LOP3 (first halves: the swap term
+  // is OR-ed onto the stage-dependent address - land is 16 B / 8 B aligned and
+  // STAGE_BYTES a multiple of 16, so | equals +, but ptxas cannot reassociate an
+  // OR with the add and hoist `land + 8 swap` into an item-invariant register:
+  // that hoisting, four registers per operand, was what it spilled in the
+  // dynamic module) and two LOP3 (second halves, ^ 8 / ^ 4).
   CUTLASS_DEVICE static ExpandBases expand_bases(OperandBases const& b, uint32_t stage,
                                                  uint32_t t) {
+    static_assert(STAGE_BYTES % 16 == 0, "stage offsets keep the half bits");
     uint32_t const so = stage * STAGE_BYTES;
     uint32_t const swap = out_swap(own_u(t));
-    uint32_t const l8a = b.land8 + so + 8 * swap;
-    uint32_t const l4a = b.land4 + so + 4 * swap;
+    uint32_t const l8a = (b.land8 + so) | (8u * swap);
+    uint32_t const l4a = (b.land4 + so) | (4u * swap);
     return {b.out0 + so, b.out1 + so, l8a, l8a ^ 8u, l4a, l4a ^ 4u,
             b.sc_rd + stage * SCALE_STAGE_BYTES};
   }
@@ -1147,7 +1181,8 @@ struct SparseMixedCollectiveMainloop {
     mixed_detail::sts128(e.d1 + off, p.w);
     return;
 #endif
-    float const v = scale_byte_f32(sw, sc_sel(own_u(t))) * (FP8 ? b.gs8 : b.gs4);
+    float const v =
+        mixed_detail::mul_rn_f32_denorm(scale_byte_f32(sw, sc_sel(own_u(t))), FP8 ? b.gs8 : b.gs4);
     uint4 lo, hi;
     uint32_t sf2;
     if constexpr (FP8) {
@@ -1169,7 +1204,8 @@ struct SparseMixedCollectiveMainloop {
           hi.y = mixed_detail::mul_a16x2<DTypeKV>(hi.y, mixed_detail::kTwoPow120Bf16x2);
           hi.z = mixed_detail::mul_a16x2<DTypeKV>(hi.z, mixed_detail::kTwoPow120Bf16x2);
           hi.w = mixed_detail::mul_a16x2<DTypeKV>(hi.w, mixed_detail::kTwoPow120Bf16x2);
-          sf2 = a16x2_broadcast(scale_byte_f32(sw, sc_sel(own_u(t))) * fp8_global_plain(prm, isK));
+          sf2 = a16x2_broadcast(mixed_detail::mul_rn_f32_denorm(scale_byte_f32(sw, sc_sel(own_u(t))),
+                                                                 fp8_global_plain(prm, isK)));
         }
       } else {
         sf2 = a16x2_broadcast(v);

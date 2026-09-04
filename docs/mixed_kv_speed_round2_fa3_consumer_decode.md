@@ -786,6 +786,20 @@ bit-exact.
 **Deviation from revision 1.**  The E2M1 placement variant is not built (LUT
 kept); fp4 is unchanged by this commit.
 
+**Found in verification (2026-09-04) and fixed: flush-to-zero on the scale
+product.**  The JIT compiles with `-use_fast_math`, so the f32 product `f32(s)
+* g` is an `FMUL.FTZ`; with `g = 1.1 x 2^-118` and `s = 2^-9` the product `1.1
+x 2^-127` is an f32 subnormal and was flushed to 0, while the reference keeps
+it and rounds it to a bf16 subnormal (bf16 shares f32's exponent range).  The
+88-case matrix caught it only at `[extremes-fp8-64-g3.31e-36]` (V-side, 400 of
+131072 outputs off by one bf16 ulp; the q = 1 case passed by sampling luck:
+`only-0x01-scale` transports fail everywhere).  Fix: `mixed_detail::
+mul_rn_f32_denorm` (`mul.rn.f32` without `.ftz`, inline PTX) for the hot and
+the cold scale product - same instruction count, `FMUL` instead of
+`FMUL.FTZ`.  C9's exactness claim now holds down to bf16 subnormal scale
+factors; the isolation matrix (payload / scale classes, K or V fixed) is
+all-zero after the fix.
+
 ---
 
 ## As written: F24b (second producer warp group + C11 reductions)
@@ -919,6 +933,30 @@ built or run here.
   (`expand_block`), one body per format.  `__syncwarp` inside `expand_block`
   is reached converged (the loop trip counts are warp-uniform).
 - `pending_word` unchanged in form (`w7 << 32 | w6 | stage << 60`, `w6 = 0`).
+
+**Found in verification (2026-09-04) and fixed: the dynamic module's pair loop
+was not stack-free.**  The first build showed `STACK 40` and, per pair, four
+`LDL` before each operand's expansion plus an `STL; LDL.LU.S16` pair per block
+site.  Read from the SASS: (a) ptxas hoisted the four item-invariant landing
+half addresses per operand (`land8 + 8 swap`, its `^ 8`, and the FP4 pair)
+out of `expand_bases` and spilled them (the dynamic module holds all three
+formats' bases: ~17 more thread constants than the static fp8 module);
+(b) the 16-bit `"h"` asm operand / `__half` of `scale_byte_f32` was
+materialised through the frame.  Fixes: `expand_bases` forms the first half as
+`(land + so) | (8 swap)` - an OR the compiler cannot reassociate into an
+item-invariant sum (the copy destinations stay the aligned `land8 / land4`;
+an intermediate attempt that folded the swap into them mis-aligned the
+`cp.async` destinations and faulted) - at +1 LOP3 per format per operand per
+pair; `scale_byte_f32` is one PTX block with 32-bit operands only
+(`mov.b32 {b0,b1}`, `cvt.rn.f16x2.e4m3x2`, `cvt.f32.f16`; same F2FP + HADD2
+in SASS).  Result recorded in the results section below.
+
+**Verification note (build hygiene).**  `rsync -a` preserves the local edit
+mtimes, which can be older than a remote workspace's `.o` files; ninja then
+skips the rebuild and a "pass" measures stale objects (seen once here: the
+static fp8 / fp4 modules kept the pre-fix objects while the dynamic module was
+rebuilt).  Touch the edited headers after every rsync and check the `.o`
+mtimes against the run's start time.
 
 **Prediction status.**  Per 2E: none quoted.  Per-page issue-path count is
 about today's (FP8 copy ~12, A16 ~11 instructions); the lever is the removal of
