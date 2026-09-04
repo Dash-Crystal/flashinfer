@@ -105,7 +105,15 @@ def main() -> None:
     last_page_len = torch.full((args.batch_size,), page_size, dtype=torch.int32, device=device)
     workspace = torch.empty(256 << 20, dtype=torch.uint8, device=device)
     sm_scale = args.head_dim ** -0.5
-    jit_args = mixed_page_prefill_jit_args(dtype, dtype, dtype, args.head_dim)
+    # One mixed module per static format (transport_a16 -> 0, fp8 -> 1, fp4 -> 2,
+    # mixed -> dynamic); the URI names the format.
+    static_of = {"transport_a16": 0, "fp8": 1, "fp4": 2, "mixed": None}
+    jit_args_of = {
+        m: mixed_page_prefill_jit_args(dtype, dtype, dtype, args.head_dim, static_format=sf)
+        for m, sf in static_of.items() if m in args.modes
+    }
+    for m, ja in jit_args_of.items():
+        print(f"module {m}: {ja[0]} variant {ja[11]}", file=sys.stderr)
 
     results = []
     for q_len in args.q_lens:
@@ -120,17 +128,19 @@ def main() -> None:
 
         stock = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa3")
         plan(stock)
-        mixed = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa3",
-                                                    jit_args=jit_args)
-        plan(mixed)
+        mixed = {}
+        for m, ja in jit_args_of.items():
+            mixed[m] = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa3",
+                                                           jit_args=ja)
+            plan(mixed[m])
         for mode in args.modes:
             if mode == "stock_a16":
                 call = lambda: stock.run(q, (k_cache, v_cache))
             else:
                 t = transports["a16" if mode == "transport_a16" else mode]
-                static = {"transport_a16": 0, "fp8": 1, "fp4": 2}.get(mode)
-                run_args = mixed_page_prefill_run_args(t, sm_scale, static)
-                call = lambda: mixed.run(q, (k_cache, v_cache), *run_args)
+                run_args = mixed_page_prefill_run_args(t, sm_scale, static_of[mode])
+                w = mixed[mode]
+                call = lambda: w.run(q, (k_cache, v_cache), *run_args)
             timing = time_call(call, args.repeats, args.trials)
             results.append({"q_len": q_len, "mode": mode, **timing})
             print(f"q_len {q_len:4d} {mode:14s} median {timing['median_us']:9.2f} us",

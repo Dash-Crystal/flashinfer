@@ -76,27 +76,41 @@ MIXED_SCALAR_DTYPES = ["int64_t"] * len(MIXED_SCALAR_NAMES)
 MIXED_PAGE_SIZE = 16
 
 
+def _static_format_code(static_format: Optional[int]) -> int:
+    if static_format not in (None, 0, 1, 2):
+        raise ValueError("static_format must be None, 0, 1 or 2")
+    return -1 if static_format is None else int(static_format)
+
+
 def mixed_page_prefill_jit_args(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     head_dim: int,
     use_sliding_window: bool = False,
+    static_format: Optional[int] = None,
 ) -> Tuple:
     """``jit_args`` for ``BatchPrefillWithPagedKVCacheWrapper(backend="fa3", jit_args=...)``.
 
     The kernel selects the mixed-page producer because the generated
     ``AdditionalParams`` carries ``mixed_page_format`` (see
     ``has_mixed_page_format_v`` in ``hopper/sparse_mixed_mainloop.cuh``).
+
+    ``static_format`` (None / 0 / 1 / 2) is a compile-time constant of the module
+    (variant ``MixedPageAttention<N>``, URI suffix ``_static_format_N``): a module
+    built for one format compiles only that format's copy path and no tag loads;
+    ``None`` builds the dynamic module with the per-page format switch.  The
+    same value must be passed to :func:`mixed_page_prefill_run_args`.
     """
     if head_dim != 128:
         raise ValueError("mixed-page FA3 attention is implemented for head_dim == 128")
     if dtype_kv not in (torch.bfloat16, torch.float16):
         raise ValueError("mixed-page FA3 attention expands to a bf16/f16 KV cache dtype")
+    code = _static_format_code(static_format)
     uri = (
         f"batch_prefill_mixed_page_sm90_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"head_dim_{head_dim}_swa_{use_sliding_window}"
+        f"head_dim_{head_dim}_swa_{use_sliding_window}_static_format_{code}"
     )
     return (
         uri,
@@ -110,7 +124,7 @@ def mixed_page_prefill_jit_args(
         _FA3_BASE_TENSOR_DTYPES + MIXED_TENSOR_DTYPES,
         _FA3_BASE_SCALAR_NAMES + MIXED_SCALAR_NAMES,
         _FA3_BASE_SCALAR_DTYPES + MIXED_SCALAR_DTYPES,
-        "DefaultAttention<false>",
+        f"MixedPageAttention<{code}>",
         "#include<flashinfer/attention/hopper/variants.cuh>",
     )
 
@@ -139,11 +153,12 @@ def mixed_page_prefill_run_args(
 ) -> List:
     """Positional ``*args`` for ``wrapper.run(q, (k_cache, v_cache), *args)``.
 
-    ``static_format`` (0/1/2) promises every page visible to the call has that
-    format; the kernel then does not read ``page_format``.
+    ``static_format`` (None / 0 / 1 / 2) must equal the ``static_format`` the
+    wrapper's module was built with (:func:`mixed_page_prefill_jit_args`); the
+    kernel launcher rejects a mismatch.  A static module promises every page
+    visible to the call has that format and never reads ``page_format``.
     """
-    if static_format not in (None, 0, 1, 2):
-        raise ValueError("static_format must be None, 0, 1 or 2")
+    code = _static_format_code(static_format)
     if transport.page_format.dtype != torch.uint8 or transport.page_format.dim() != 1:
         raise ValueError("page_format must be one uint8 tag per physical page")
     fp8_p = _byte_strides(transport.fp8_k_payload, kv_layout)
@@ -184,6 +199,6 @@ def mixed_page_prefill_run_args(
         *fp8_s,
         *fp4_p,
         *fp4_s,
-        -1 if static_format is None else int(static_format),
+        code,
     ]
     return tensors + scalars

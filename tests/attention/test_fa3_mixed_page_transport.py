@@ -100,23 +100,33 @@ def test_fa3_mixed_page_transport_matches_a16_expansion(q_len, kv_layout, page_m
             fp4_v_scales=transport.fp4_v_scales.transpose(1, 2),
         )
 
-    jit_args = mixed_page_prefill_jit_args(dtype, dtype, dtype, head_dim)
+    # The static format is a module constant: one wrapper per format.  The
+    # reference runs the static-A16 module over the expanded cache; pure fp8/fp4
+    # streams run their static module, every other mix the dynamic module (the
+    # "a16" mode therefore checks the dynamic module against the static-A16 one).
+    static_format = {"fp8": 1, "fp4": 2}.get(page_mode)
     workspace = torch.empty(128 << 20, dtype=torch.uint8, device=device)
-    wrapper = BatchPrefillWithPagedKVCacheWrapper(
-        workspace, kv_layout, backend="fa3", jit_args=jit_args
+    reference_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout, backend="fa3",
+        jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, head_dim, static_format=0),
     )
-    _plan(wrapper, qo_indptr, kv_indptr, kv_indices, last_page_len, num_qo_heads, num_kv_heads,
-          head_dim, causal=q_len > 1)
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout, backend="fa3",
+        jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, head_dim,
+                                             static_format=static_format),
+    )
+    for w in (reference_wrapper, wrapper):
+        _plan(w, qo_indptr, kv_indptr, kv_indices, last_page_len, num_qo_heads, num_kv_heads,
+              head_dim, causal=q_len > 1)
 
     a16_reference = transport._replace(page_format=torch.zeros_like(transport.page_format))
-    expected = wrapper.run(
+    expected = reference_wrapper.run(
         q, (reference_k, reference_v),
         *mixed_page_prefill_run_args(a16_reference, sm_scale, 0, kv_layout),
     )
     actual = wrapper.run(
         q, (canonical_k, canonical_v),
-        *mixed_page_prefill_run_args(transport, sm_scale, {"fp8": 1, "fp4": 2}.get(page_mode),
-                                     kv_layout),
+        *mixed_page_prefill_run_args(transport, sm_scale, static_format, kv_layout),
     )
     assert not torch.isnan(expected).any()
     assert not torch.isnan(actual).any()
