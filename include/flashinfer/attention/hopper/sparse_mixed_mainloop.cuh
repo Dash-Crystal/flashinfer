@@ -894,16 +894,31 @@ struct SparseMixedCollectiveMainloop {
   // span pointer + head * hs + row * ts + blk_off (bytes), computed once per work
   // item in make_bases (F24 recomputed it per tile: the IADD3.X / VIADD chains
   // that topped the producer's stall samples).
+  // Both products as PTX mad.wide.u32 (32-bit strides, KVPageByteStrides): the
+  // C++ 64-bit products compiled to mul.lo.s64 whose high word ptxas formed with a
+  // separate VIADD, leaving the base's two halves in non-adjacent registers; the
+  // per-page mad.wide.u32 (page_src) then could not take the base as its 64-bit
+  // accumulator and split into IMAD.WIDE.U32 + IADD3 + IMAD.X per copy ([25e]
+  // SASS reading).  A base formed by mad.wide.u32 is one 64-bit value.
   template <typename Ptr>
   CUTLASS_DEVICE static uint64_t compressed_base(Ptr ptr, KVPageByteStrides const& st,
                                                  int kv_head_idx, uint32_t row, uint32_t blk_off) {
-    return reinterpret_cast<uint64_t>(ptr) + uint64_t(kv_head_idx) * uint64_t(st.head) +
-           uint64_t(row) * uint64_t(st.token) + uint64_t(blk_off);
+    uint64_t r = reinterpret_cast<uint64_t>(ptr) + uint64_t(blk_off);
+    asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(uint32_t(kv_head_idx)), "r"(st.head), "l"(r));
+    asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(row), "r"(st.token), "l"(r));
+    return r;
   }
   // Page `page` of a per-item base: one IMAD.WIDE.U32 (the host bounds the page
-  // stride to 32 bits of bytes).
+  // stride to 32 bits of bytes).  Written as PTX mad.wide.u32: the C++ form
+  // `base + uint64_t(page) * uint64_t(stride)` compiled to mul.lo.s64 + add.s64,
+  // which ptxas lowered to IMAD.WIDE.U32 plus a high-word add of a materialised
+  // zero (UMOV URk, URZ; VIADD Rhi, Rhi, URk), a per-copy LDC of the stride and
+  // two MOVs of the base - ~7 instructions per copy instead of one ([25e] SASS
+  // reading of the static modules; the dynamic module happened to fold it).
   CUTLASS_DEVICE static void const* page_src(uint64_t base, uint32_t page, uint32_t page_stride) {
-    return reinterpret_cast<void const*>(base + uint64_t(page) * uint64_t(page_stride));
+    uint64_t r;
+    asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(page), "r"(page_stride), "l"(base));
+    return reinterpret_cast<void const*>(r);
   }
 
   // Page placement of one copy / expansion: the byte offset of the page's region
@@ -1329,7 +1344,9 @@ struct SparseMixedCollectiveMainloop {
       if constexpr (FOLDS && VOTE) {
         bool ok = fold_ok(v[0]);
 #pragma unroll
-        for (uint32_t j = 1; j < N; ++j) ok = ok && fold_ok(v[j]);
+        // Bitwise: `&&` short-circuits and ptxas emitted BSSY / @P BRA / BSYNC
+        // around the remaining FSETPs ([25e]); `&` keeps the chain as PLOP3s.
+        for (uint32_t j = 1; j < N; ++j) ok = ok & fold_ok(v[j]);
         if (__all_sync(0xFFFFFFFFu, ok)) {
           expand_static_arm<FP8, false>(prm, isK, e, b, pk, sw, v, t);
         } else {
@@ -1366,8 +1383,10 @@ struct SparseMixedCollectiveMainloop {
           float const f = scale_byte_f32(sw[j], sc_sel(t));
           bool const in8 = ((m8 >> j) & 1u) != 0u;
           bool const in4 = ((m4 >> j) & 1u) != 0u;
-          ok8 = ok8 && (!in8 || fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs8)));
-          ok4 = ok4 && (!in4 || fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs4)));
+          // Bitwise (no short-circuit branches, [25e]): both products and both
+          // tests are evaluated for every page; the mask bit gates the result.
+          ok8 = ok8 & (!in8 | fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs8)));
+          ok4 = ok4 & (!in4 | fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs4)));
         }
         bool const hot8 = __all_sync(0xFFFFFFFFu, ok8);
         bool const hot4 = __all_sync(0xFFFFFFFFu, ok4);
