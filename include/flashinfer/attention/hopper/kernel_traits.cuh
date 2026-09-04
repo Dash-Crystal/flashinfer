@@ -49,11 +49,15 @@ struct SharedStorageQKVO {
 // trip per 16 tiles instead of one per pair), and a pair reads its two tiles'
 // rows with four LDS.128.  One row is 32 B: 6 page indices, 6 tags, the valid
 // count and a flags byte (bit 0: any compressed page; bit 1: row filled).
+// [24c] The dynamic module stores two 6-bit page masks in tags[4], tags[5]
+// (bit i: page i is E4M3 / E2M1; tags[0..3] unused) so that the last word of
+// the row - masks | valid << 16 | flags << 24 - is all a pair needs, and reads
+// page indices by LDS.32 from the row.  Static modules keep the tag bytes.
 template <typename IdType, int CTA_KV>
 struct alignas(16) MixedTileMeta {
   static constexpr int kPages = CTA_KV / 16;
   IdType pages[kPages];
-  uint8_t tags[kPages];
+  uint8_t tags[kPages];  // dynamic module: [4] = FP8 page mask, [5] = FP4 page mask
   uint8_t valid;
   uint8_t flags;
 };
@@ -74,10 +78,14 @@ struct SharedStorageQKVOMixed {
     typename MainloopPipeline::SharedStorage pipeline_k;
     typename MainloopPipeline::SharedStorage pipeline_v;
   };
-  // [23] block scales: per stage, per page, one 4 B word per producer thread (the
-  // word holding the thread's block; the four owners of a word each copy it to
-  // their own slot, so a warp's copy and read are 128 contiguous bytes: one
-  // wavefront, no same-address LDGSTS replays, and D3 holds for the scales).
+  // Block scales: per stage, per page, a 512 B slot.  [24b] uses its first 128 B
+  // as one 8 B word pair per token row (the row's eight E4M3 block scales,
+  // copied by the row's lane 0 with one cp.async and read by the row's eight
+  // lanes after that lane's cp.async.wait_group and one __syncwarp per pair - D3
+  // as amended by A8); [23] used one 4 B word per producer thread (7.95
+  // wavefronts per warp copy instruction, A7).  The slot size is kept at [23]'s
+  // so that every module's shared-storage layout - and the a16 module's SASS,
+  // the transport control - is unchanged; 384 B per page slot are unused.
   static constexpr uint32_t kMixedScaleStageBytes = (CTA_KV / 16) * 128 * 4;
   alignas(16) uint8_t mixed_scales_k[NUM_STAGES][kMixedScaleStageBytes];
   alignas(16) uint8_t mixed_scales_v[NUM_STAGES][kMixedScaleStageBytes];
@@ -182,8 +190,27 @@ struct AttentionKernelTraits {
                                           SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
 };
 
-// Same traits with the mixed-page shared storage.  The producer drives its own
-// per-page TMA, so USE_TMA_LOAD_KV is false (PipelineAsync, 128 producer threads).
+// The module's compile-time page format carried by the attention variant
+// (variants.cuh MixedPageAttention<N>): -1 dynamic, 0 A16, 1 E4M3, 2 E2M1.
+template <typename Variant, typename = void>
+struct mixed_variant_static_format : std::integral_constant<int, -1> {};
+template <typename Variant>
+struct mixed_variant_static_format<Variant, std::void_t<decltype(Variant::kMixedStaticFormat)>>
+    : std::integral_constant<int, Variant::kMixedStaticFormat> {};
+
+// Same traits with the mixed-page shared storage.  The producer issues cp.async
+// copies itself, so USE_TMA_LOAD_KV is false (PipelineAsync).
+//
+// [24b] Producer warp groups.  The compressed (E4M3, E2M1) and dynamic modules
+// run TWO producer warp groups (16 warps, 512 threads): thread t = 128 h + u
+// applies the [23] ownership formulas to u on the tile pages i = h + 2 j.  The
+// static-A16 module has no expansion and keeps ONE producer warp group (12
+// warps): its SASS is the transport control and stays byte-identical.
+// Register pool (C3): __launch_bounds__(NUM_THREADS, 1) gives 65536 / 512 = 128
+// registers per thread at launch; setmaxnreg then moves them so that
+// NUM_PRODUCER_THREADS x PRODUCER_REGS + NUM_MMA_THREADS x CONSUMER_REGS <= 65536:
+// 256 x 72 + 256 x 184 = 65536 exactly (12 warps: 128 x 72 + 256 x 216 = 64512).
+// The consumer's fit at 184 is proven by ptxas -v (no C7507, STACK 0), not here.
 template <int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
           typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
@@ -194,6 +221,18 @@ struct MixedAttentionKernelTraits
   using BaseTraits =
       AttentionKernelTraits<false, HEAD_DIM_QK_, HEAD_DIM_VO_, CTA_Q_, CTA_KV_, NUM_STAGES_,
                             DTypeQ_, DTypeKV_, DTypeO_, IdType_, AttentionVariant_>;
+  static constexpr int kMixedStaticFormat = mixed_variant_static_format<AttentionVariant_>::value;
+  static constexpr int NUM_PRODUCER_WGS = kMixedStaticFormat == 0 ? 1 : 2;
+  static constexpr int NUM_WARPS = ((CTA_Q_ / 64) + NUM_PRODUCER_WGS) * 4;
+  static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
+  static constexpr int NUM_PRODUCER_THREADS = NUM_PRODUCER_WGS * cutlass::NumThreadsPerWarpGroup;
+  static constexpr int PRODUCER_REGS = 72;
+  static constexpr int CONSUMER_REGS = NUM_PRODUCER_WGS == 2 ? 184 : 216;
+  static_assert(NUM_PRODUCER_WGS == 1 || NUM_PRODUCER_WGS == 2, "one or two producer warp groups");
+  static_assert(PRODUCER_REGS % 8 == 0 && CONSUMER_REGS % 8 == 0, "setmaxnreg takes multiples of 8");
+  static_assert(NUM_PRODUCER_THREADS * PRODUCER_REGS + BaseTraits::NUM_MMA_THREADS * CONSUMER_REGS <=
+                    65536,
+                "register pool: producer + consumer allocations must fit the SM (C3)");
   using SharedStorage =
       SharedStorageQKVOMixed<typename BaseTraits::MainloopPipeline, DTypeQ_, DTypeKV_, DTypeO_,
                              IdType_, CTA_KV_, NUM_STAGES_, typename BaseTraits::SmemLayoutQ,

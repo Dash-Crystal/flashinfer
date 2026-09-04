@@ -60,7 +60,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using AttentionVariant = typename Ktraits::AttentionVariant;
 
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
-  static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
+  // Producer warp groups: 1 (stock, mixed a16 module) or 2 ([24b] mixed
+  // compressed / dynamic modules).  Role test, PipelineAsync producer arrival
+  // count, consumer thread index and the register split all derive from it.
+  static constexpr int NUM_PRODUCER_WGS = producer_warp_groups_v<Ktraits>;
+  static constexpr int NUM_COPY_THREADS = NUM_PRODUCER_WGS * cutlass::NumThreadsPerWarpGroup;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
@@ -87,8 +91,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   PipelineParams pipeline_params;
   int warp_group_idx = cutlass::canonical_warp_group_idx();
-  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
-                                             : MainloopPipeline::ThreadCategory::Consumer;
+  // (the `== 0` form is kept textually for one producer warp group)
+  bool const is_producer_wg = NUM_PRODUCER_WGS == 1 ? warp_group_idx == 0
+                                                    : warp_group_idx < NUM_PRODUCER_WGS;
+  pipeline_params.role = is_producer_wg ? MainloopPipeline::ThreadCategory::Producer
+                                        : MainloopPipeline::ThreadCategory::Consumer;
   if constexpr (use_tma_load_kv) {
     pipeline_params.is_leader = warp_group_thread_idx == 0;
     pipeline_params.num_consumers = NUM_MMA_THREADS;
@@ -151,10 +158,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }
 
   // The mixed-page producer (sparse_mixed_mainloop.cuh) uses the stock 72/216
-  // register split of the gather producer (P0.7: the producer fits 72 with STACK 0).
-  if (warp_group_idx == 0) {  // Producer
+  // register split of the gather producer (P0.7: the producer fits 72 with STACK 0)
+  // in its 12-warp module, and the traits' 72/184 split in the 16-warp modules
+  // ([24b]: 256 x 72 + 256 x 184 = 65536; kernel_traits.cuh checks the pool).
+  if (is_producer_wg) {  // Producer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
+    } else if constexpr (Ktraits::kMixedTraits) {
+      cutlass::arch::warpgroup_reg_dealloc<Ktraits::PRODUCER_REGS>();
     } else {
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
@@ -212,6 +223,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   } else {  // Consumer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
+    } else if constexpr (Ktraits::kMixedTraits) {
+      cutlass::arch::warpgroup_reg_alloc<Ktraits::CONSUMER_REGS>();
     } else {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
     }

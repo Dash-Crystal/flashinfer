@@ -405,3 +405,85 @@ group barrier.  Where this section conflicts with D2/D3/A2/C3 above, it wins.
   Track W's [29], where the compute warps expand).  The dynamic (mixed) module
   is additionally bound by its copy-issue phase (2.0-2.2 us per pair of per-page
   format branches and three formats' address setup), a [21]/[22]-side cost.
+
+### A8. [24] Two producer warp groups, page-parity ownership, fold exactness, dynamic dispatch (amends D3, A7/D6, C3, C4, C5, C6; adds C9, C10, C11)
+
+Written with lever [24] (docs/mixed_kv_speed_round2_fa3_consumer_decode.md:
+F24a decode floor, F24b second producer warp group, F24c dynamic module page
+masks).  Where this section conflicts with A7 above, it wins.  The static-A16
+module keeps ONE producer warp group and A7's formulas verbatim (its SASS is
+the transport control and stays byte-identical to `5cc416fd`).
+
+- **D6 / D3 (ownership, compressed and dynamic modules).** Producer thread
+  `t` of 256 (`u = t & 127`, `h = t >> 7`) owns block `u % 8` of row `u / 8`
+  of the tile pages `i = h + 2 j`, `j < 3`; A16 pages: chunk `u % 16` of rows
+  `u / 16`, `u / 16 + 8` of those pages.  The row's eight lanes are one warp.
+  D3's "reads only what its own `cp.async` wrote" is amended for the scale
+  word: **the row's 8 B scale slot is copied by the row's lane 0 (`b == 0`) and
+  read by all eight lanes after every lane's own `cp.async.wait_group` and one
+  `__syncwarp()` per pair** (the landing-chunk rule of A7 applied to a copy).
+  Output chunk order per thread: first store to chunk `2b + swap`, `swap =
+  ((b >> 2) ^ r) & 1`, second to `2b + 1 - swap`; the landing is read as two
+  half loads in the same order (the data order is untouched).  Rationale: a
+  row's first `STS.128` then hits eight distinct bank groups across its two
+  D-block lines - 4 wavefronts per instruction instead of A7's 2-way 8.
+- **Scale slot (deviation from the design's 8 B-per-row shrink).** The slot
+  stays `6 x 512` B per stage per operand (`kMixedScaleStageBytes`); each page
+  slot uses its first 128 B as 16 rows x 8 B.  Shrinking it would move
+  `mixed_meta` in the shared storage and change the a16 module's chunk-table
+  immediates, which must stay byte-identical; smem is unchanged (~199.7 KB).
+- **C3 (budgets).** `setmaxnreg` 72 / 184 at `__launch_bounds__(512, 1)`
+  (pool 256 x 72 + 256 x 184 = 65536, `static_assert` in
+  `MixedAttentionKernelTraits`); a16 module 72 / 216 at 384 threads.  Build
+  check per A4: no C7507, exactly two `USETMAXREG` (`DEALLOC 0x48`, `TRY_ALLOC
+  0xB8`), STACK 0 in both regions, for every module.
+- **C4 (barrier accounting).** `PipelineAsync` producer arrival count 256
+  (consumer 256 unchanged); `kQueryEmpty` 512; `kProducerWG` 256; the Q TMA is
+  issued by warp 0 of the CTA only; the chunk-table gather by threads `< 128`
+  (the group barrier is met by all 256); ping-pong barrier ids 2, 3 indexed by
+  `wg - kFirstConsumerWG` (`named_barrier.cuh`).
+- **C5 (consumer unchanged) - second exception.** `mainloop_mma.cuh` and
+  `variants.cuh` are untouched.  `named_barrier.cuh` gains
+  `producer_warp_groups_v<Ktraits>` (1 unless the traits define
+  `NUM_PRODUCER_WGS`) and the first-consumer-WG offset; `prefill_sm90.cuh` and
+  `epilogue.cuh` derive `NUM_COPY_THREADS` from it (hence the producer arrival
+  count, the consumer thread index, `NUM_MMA_THREADS` = 256 for `kValueEmpty` /
+  the epilogue barrier / the O store partition) and the register split from
+  the traits; `sparse_mainloop.cuh`'s `NUM_PRODUCER_THREADS == NUM_COPY_THREADS`
+  assert admits the mixed traits.  Stock traits keep every constant textually
+  (acceptance: the stock paged kernel's SASS byte-identical).
+- **C6 (issue budget).** Restated per producer warp: <= ~500
+  warp-instructions per pair for fp8 at the decode floor, <= ~540 fp4.
+- **C7.** Unchanged; every producer thread of both warp groups waits
+  `barrier_O`.
+- **New C9 (fold exactness).** bf16 FP8 decode by bit placement
+  (`prmt`, `shl 4`, `and 0x87F087F0`: the E4M3 byte read as bf16 is the value
+  x 2^-120, subnormals included) folds `2^120` into the block scale.  The fold
+  is exact iff `2^-126 <= |s g| < 255.5`; the kernel tests the upper bound per
+  block (`|f32(s) gfold| < 255.5 x 2^120`, `VOTE.ALL` over the warp = one
+  page, four rows) and the lower bound per operand (`gfold = +inf` when `|g| <
+  2^-117`), and otherwise takes the exact two-multiply form (eight `HMUL2` by
+  `2^120`, then `bf16(f32(s) g)` with `g` reloaded from the grid-constant
+  parameters).  No host bound on the global scale (the [23] `.item()` check is
+  gone).  E4M3 NaN payload codes decode to the finite `1.111 x 2^-112 x scale`
+  (the quantizer never emits them; tests exclude NaN).  The scale products are
+  `mul.rn.f32` without `.ftz` (`mixed_detail::mul_rn_f32_denorm`): the module
+  is built with `-use_fast_math`, and `f32(s) g` below `2^-126` (e.g. `s =
+  2^-9`, `g = 1.1 x 2^-118`) must survive as an f32 / bf16 subnormal as it does
+  in the reference - found by the extremes matrix, 2026-09-04.
+- **New C10 (dynamic dispatch, [24c]).** The dynamic module's chunk-table row
+  carries two 6-bit page masks (`tags[4]` = FP8 pages, `tags[5]` = FP4 pages;
+  `tags[0..3]` unused) so that its last word `m8 | m4 << 8 | valid << 16 |
+  flags << 24` is all a pair needs; the pending word is `w7 << 32 | stage <<
+  60` with `w6 = 0`.  Copy and expansion loops are format-outer over the
+  parity-restricted masks (`0x15 << h`) with one body per format; page indices
+  come from the chunk-table row by `LDS.32` - the parity's three indices read
+  into scalars before the copy loops and selected by a constant compare/select
+  chain, the expansion loop prefetching the next set bit's page - never from a
+  runtime-indexed register array (C2).
+- **New C11 (shared-memory LSU pipe budget).** Per producer pair per SM the
+  wavefront-cycles of wgmma operand reads + producer `STS` + `LDS` + `LDGSTS`
+  stay <= ~85 % of the target cadence in cycles (<= ~2000 at 2370 cycles);
+  every layout change states its per-class wavefront count from A7's measured
+  rules before it is written, and the ncu confirmation reports the four
+  classes per pair (`l1tex__data_pipe_lsu_wavefronts_mem_shared` by op).
