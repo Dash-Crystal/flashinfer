@@ -2026,3 +2026,156 @@ us): stock_a16 299.1 / 308.5, transport_a16 282.2 / 287.4, fp8 460.1 / 474.5,
 fp4 494.3 / 509.0, mixed 719.1 / 726.9 — equal to the wt/F24 record.  Target
 <= 330 open on all compressed modes; next design F25 (12-warp layout, producer
 136 registers, per-operand vote, one IMAD.WIDE per copy) in wt/F25.
+### Round 3, lever "fill / prologue cut" (R1-R6): confirmation and attribution (2026-09-04, nkcut2 H200, worktree wt/r3fill @ 6dbc6ae3)
+
+Design: `docs/mixed_kv_speed_round3_fill.md` (sections 6-8; verdict in
+section 10).  Change: fast-path tile records 0-1 from the scan warp (R1),
+loader's chunk-0 fill moved to loop iteration `g == nbFast` (R1), converters
+without `consumed` waits for t < 3 (C8'), tile-ordered start burst (R3),
+constants after the first issue (R2), static modules skip `page_format` (R4),
+gemm0 Q parity wait with `qBar.produced` count 32 (R5), u32 partition
+arithmetic (R6).  Build gates (ptxas / SASS, production modules) all pass:
+no C7507, 0 stack / spill, `USETMAXREG` 2, `LDL` = `STL` = 0.  Conformance
+66 / 66.
+
+**Locked bench** (5 x 5 medians, us): a16 78.8 -> **77.7** (-1.1, pass), fp8
+67.8 -> **67.3** (accept <= 65.0: reject), fp4 60.5 -> **60.4** (<= 58.0:
+reject), mixed 64.4 -> **66.7** (**+2.3**, reject > 63.0).
+
+**Trace runs.**  `MIXED_KV_TRACE 1` copy of the checkout
+(`/home/bigboi/dash-flashinfer-claude-r3fill-trace`, workspace
+`/tmp/mixedkv-r3fill-trace`), `xqa_mixed_trace_once.py --q-len 1`, locked.
+Two facts about the trace build itself, both needed to read the numbers:
+
+1. **The trace build hangs intermittently.**  5 of ~14 traced compressed-mode
+   launches never completed (fp8: launch 1 of run 2, CTA 187 missing; fp4:
+   run 1 launch 0 with 14 CTAs missing (39, 43, 71, 129, 130, 134, 136, 158,
+   163, 165, 166, 175, 186, 192), run 3 launch 1 (43, 45, 48), run 4 (101,
+   231), a duplicate job's fp4 launch 0 (1 CTA)); the host spins in
+   `cudaDeviceSynchronize` until the timeout.  Hung CTAs are in both dispatch
+   sets.  0 hangs in 8 a16 / mixed launches (incl. warm-ups); the [8]
+   baseline trace build (`trace5`, 12 launches) and every earlier trace run
+   never hung; the production build's 66-case matrix + 5 x 5 bench (> 300
+   launches) did not hang.  The only new blocking construct in the trace
+   build is the stamp-42/44 `test_wait` poll (converter warp 0 lane 0, tile
+   0), which is not a deadlock by inspection (the polled phase needs only
+   arrivals already issued).  **Unattributed; blocks any merge of R1-R6**
+   (a protocol change whose timing-shifted build deadlocks is not "sound by
+   C8'" until the hang is explained).  Launches below are the complete ones:
+   fp8 4, fp4 2, a16 2, mixed 2 (`/tmp/r3fill/merged.log`, complete launches
+   of `/tmp/r3fill_trace*.log`).
+2. **The trace build spills.**  fp8 trace module `STACK:320`, `LDL` 34, `STL`
+   103 (production `STACK:0`, 0 / 0; [8]'s trace build: 256 B stack, 4 B
+   spill).  By SASS position 99 of them are printf frames (around the 5
+   `CALL.ABS` vprintf sites), ~32 sit in cold end-of-kernel blocks and 6 in
+   the converter region.  The trace body grew fp8 58.9 -> 66.5, fp4 55.2 ->
+   61.7, a16 67.5 -> 69.8, mixed 60.7 -> 71.2 us while the production wall
+   moved -0.5 / -0.1 / -1.1 / +2.3 — so **body and steady-state period
+   changes of this trace build are not evidence about production**; the
+   section-7 rows "steady-state periods +-3 %" and "body +-3 %" are
+   *undecidable from this run* (trace: fp8 gemm0 cadence 1.53 vs 1.34,
+   K-conv expand 1.08 vs 0.42 us; fp4 unchanged 1.31 / 0.47; mixed gemm0
+   1.86 vs 1.57).  Fill-chain *ordering* facts below are not affected (they
+   are gates, not throughput).
+
+**Section-7 accept table, filled** (us from CTA start; per-launch medians
+over 256 CTAs, median over launches; "today" = trace5):
+
+| quantity | today | accept / reject | fp8 | fp4 | a16 | mixed | verdict |
+|---|---:|---|---:|---:|---:|---:|---|
+| first K copy committed (14) | 5.31 / 4.74 / — / 5.47 | <= 3.2 / > 3.8 | **3.07** | **2.99** | 2.73 (empty) | 3.34 | pass: the fast path is on the chain as designed |
+| scan -> fast pages (40 - 4) | — | <= 0.9 / > 1.2 | 0.67 | 0.67 | 0.65 | 0.64 | pass |
+| sync -> conv at issue(0) (41 - 37) | — | <= 0.6 / > 0.9 | 0.29 | 0.30 | 0.29 | 0.31 | pass |
+| RT4 (15 - 14) | 1.54 / 1.70 / — / 2.82 | <= 1.30 / >= 1.45 | **2.25** | **1.98** | (0.46) | 1.40 | **reject** fp8 / fp4: the tile-0-only burst lands *later* than the 3-tile burst (all 264 CTAs now commit within 0.1 us at 3.0-3.1 and the Q / page loads share the window); mixed improves (TMA tiles 0-1 no longer queued behind tile 2) |
+| tile 1 committed - K0 landed (43 - 15) | — | <= 0.30 / > 0.5 | -0.13 | -0.16 | -0.27 | -0.13 | pass (R2 constants not on the tile-1 path) |
+| tile 1 landed (45) vs firstk + 0.6 | — | later: F3c / revert R3 | **9.97** (firstk 7.31) | **9.66** (6.42) | 8.97 (6.82, empty) | **11.49** (8.11) | **reject** — but not a DRAM effect: stamp 45 sits in loop iteration 1, after `issue(2)` in iteration 0, which waits `kMetaReady[0]` (see stamp 13) |
+| true gap: produced(0) complete -> gemm0 passes (20 - 42) | (0.96 as "gap") | report | 0.01 | -0.20 | 0.10 | 0.10 | finding 4 resolved: the 0.96 us was the release-arrive *performing*, gemm0 wakes within 0.1 us |
+| arrive issued -> phase complete (42 - 16) | — | report; > 0.5 -> steady-state item | 0.74 | 0.58 | 3.12 (TMA landing) | 2.26 | > 0.5: the arrive completes behind the converters' own STS drain; a steady-state item |
+| firstk (fill) | 8.99 / 8.21 / 9.71 / 10.05 | fp8 <= 6.0 (> 6.8 stop), fp4 <= 5.7 (> 6.5), mixed <= 7.0 (> 7.8) | **7.31** | **6.42** | 6.82 | **8.11** | fp8 **reject (stop, re-attribute)**; fp4 between; mixed reject; a16 -2.9 |
+| loader chunk 0 done (13) vs converters' issue(2) | 4.83 / 4.19 / 3.84 / 4.77 | `kc_ready(2)` within +10 % of steady; later -> fallback (c) | **9.42** | **9.09** | 8.64 | **10.90** | **reject**: chunk-0 entered (46) at 7.50 / 7.15 / 4.64 / 8.35 — 5.0-5.9 us after the sync for two "empty" loader iterations (today 0.7); the fill itself 1.97 / 1.98 / 3.90 / 2.54 |
+| `kc_ready(1) - kc_ready(0)` (CTA 0; the tile whose expansion `issue(2)` delays) | 0.9-1.7 / 1.5-2.4 / 0.3 / 2.3-2.6 | steady +-10 % | **3.4-4.7** | **3.6-3.8** | 5.1-5.3 (empty conv; TMA) | **6.7-6.9** | **reject** (section 8 item 11 trigger) |
+| `kc_ready(2) - kc_ready(1)` | 1.5-2.1 / 0.8-1.5 / 6.0-6.6 / 0.65-0.72 | mixed <= steady + 0.5 | 1.1-1.8 | 0.9-1.2 | 0.56 | 1.5 | pass (the exposed tile is 1, not 2) |
+| `g0_kwait(1) - g0_xarr(0)` (tile-1 stall on gemm0) | 0.12-0.19 / 0.13-0.22 / 0.11-0.13 / 0.65-0.97 | <= steady + 0.6 | **1.9-3.9** (med 2.8) | **2.7-2.9** | 1.5-1.8 | **3.1-4.1** | **reject**: the stall is larger than the fill cut in every compressed mode |
+| a16 `kl_iss(2)` (tile-2 TMA issue) | ~4.0 | <= 4.6 / > 5.0 | — | — | **~8.9** (kMetaReady 8.64 + 0.3) | — | **reject**: the TMA-branch walk + two iterations took 3.9 + 2.4 us behind the burst |
+| a16 first TMA issue (`kl_start(0)`, anchored on stamp 46 - CTA 0 offsets) | ~3.9 | <= 2.8 / > 3.4 | — | — | **~3.8-4.2** | — | **reject**: not earlier — sync 2.27 -> first issue is 1.5 us of setmaxnreg / cursor init / LDS behind the burst |
+| gemm0 Q wait (kwait0 -> firstk) | 0.19 | R5 ~0.05 | 0.13 | **0.54** | 0.13 | 0.13 | fp4: Q warp publishes at 6.27 (today 2.94), after gemm0's K wait (5.78): **Q is on fp4's path now** (Q load / STS behind the LDGSTS burst: cursor 3.5, consumed 5.06, store 1.07 us) |
+| item boundary `g0_kwait -> g0_qwait` tile 31 | 1113-1351 cyc | <= 600 | not traced (window tiles 0-7) | | | | R5 unverified; steady `qwait - kwait` 0.137 vs 0.204 us (fp8) |
+| steady-state role periods (tiles 3-7) | fp8 1.21-1.32, fp4 1.20-1.31 | +-3 % | trace 1.53 / 1.63 | 1.31 / 1.23 | 2.75 / 1.97 | 1.86 / 1.96 | undecidable (trace-build spills, fact 2) |
+| per-CTA histogram fill median (trace) | 9.0 / 8.2 / 9.7 / 10.0 | <= 5.5 / 5.0 / 5.5 | **7.3** | **6.4** | 6.9 | 8.1 | fail; cut -1.7 / -1.8 / -2.8 / -1.9 |
+| fill median slow set / fast set | 9.1 / 8.7, 8.1 / 7.9, 9.6 / 10.1, 9.9 / 9.9 | | 7.3 / 7.3 | 6.4 / 6.4 | 6.5 / 8.9 | 8.1 / 8.1 | the cut lands on both sets equally (compressed); a16's fill now follows the dispatch slot |
+| body, tail | | +-3 % | 66.5 (58.9), 2.0 | 61.7 (55.2), 2.3 | 69.8 (67.5), 2.3 | 71.2 (60.7), 2.4 | body undecidable (fact 2); tail unchanged |
+
+**Attribution of the mixed +2.3 us.**  Not a steady-state period (undecidable
+in the trace, and the wall change is fully accounted for below).  The
+converters' `issue(2)` gate on `kMetaReady[0]`: the loader's two TMA
+iterations for the fast tiles plus its preamble take 5.9 us after the sync
+(sync 2.45 -> `fillChunk0` entered 8.35; today the fill started right after
+the sync), the fill itself takes 2.54 us (walk 1.9 + RT2 0.16 + RT3 0.34 +
+gather), so `kMetaReady[0]` arrives at **10.90** (today 4.77).  The
+converters block at `issue(2)` in loop iteration 0 until then, so tile 1's
+expansion (already landed at ~5.5) starts only at ~11 (`kc_ready(1) -
+kc_ready(0)` 6.7-6.9 vs 2.3-2.6 today) and gemm0 stalls **3.1-4.1 us on tile
+1** (today 0.65-0.97) plus 0.8-1.2 on tile 2 (today 0.3-0.7; the tile-2 TMA
+boxes go out at ~11.2, `kl_iss(2)`), against a firstk gain of 1.9 us (10.05
+-> 8.11): net +1.5 to +2.5 us on the wall, the bench's +2.3.  Section 8 items
+5 (periods) cannot be judged; item 11 (chunk-0 protocol vs position) is
+triggered: the position `g == nbFast` puts the fill behind the burst in
+*both* branches.
+
+**Attribution of the missing fp8 / fp4 gain.**  Stamp 14 moved exactly as
+designed (5.31 -> 3.07, 4.74 -> 2.99; design 2.6-3.2) and firstk moved
+8.99 -> 7.31 / 8.21 -> 6.42 (design 5.4 / 5.1): the shortfall of ~1.9 / 1.3
+us is RT4 (2.25 / 1.98 against the designed 1.15 / 1.0 — the tile-0-only
+burst did not land faster than today's three-tile burst) plus the arrive-
+perform latency 0.74 / 0.58 (which the design carried as the 0.96 "gap" and
+which did not shrink with the smaller burst) plus, on fp4, the Q warp (0.54).
+The cut *is* on the slow member's path: fill medians are 7.3 / 7.3 (slow /
+fast) against 9.1 / 8.7 today, i.e. -1.8 on the slow set.  It is cancelled by
+the same mechanism as mixed: the loader reaches `fillChunk0` only at 7.50 /
+7.15 (two iterations of one `arrive_and_wait` each took 2.5 + 1.7 us — the
+loader's MIO-pipe instructions and the Q warp's loads / STS queue behind the
+converters' tile-0 and tile-1 LDGSTS of both operands, which R1 moved ahead
+of the fill; `kl_start(2) - kl_start(0)` 4.2 vs 0.7 us), `kMetaReady[0]`
+arrives at 9.42 / 9.09, the converters' `issue(2)` waits for it, tile 1's
+expansion starts ~4 us late (`kc_ready(1) - kc_ready(0)` 3.4-4.7 / 3.6-3.8
+vs 0.9-1.7 / 1.5-2.4), and gemm0 stalls 1.9-3.9 (median 2.8) / 2.7-2.9 us on
+tile 1 against 0.15-0.3 today.  -1.7 fill + ~2.6 tile-1 stall - R5 / true-gap
+savings = the bench's -0.5 / -0.1.  Section 8 item 6 (firstk > 6.8 fp8) and
+item 7 (tile-1 stall > 0.6) are both triggered; the cause is not R3 (tile 1
+landed by ~5.4) but the in-loop `kMetaReady` gate, so "revert R3" is not the
+fix.
+
+**a16 (-1.1 us, pass) — what actually produced it.**  Not an earlier first
+TMA issue (`kl_start(0)` ~3.8-4.2 vs ~3.9 today; the loader's preamble after
+the sync is 1.5 us behind the burst) but the *order*: tiles 0 and 1 are
+issued before the walk and tile 2 after it (`kl_iss(2)` ~8.9), so tile 0 no
+longer shares the DRAM queues with tile 2 of all 264 CTAs — firstk 9.71 ->
+6.82 (K-side "landing" 3.12 us) — while gemm0 then waits 1.4-1.7 us for tile
+2/3 (`g0_kwait(3) - g0_xarr(2)` 1.35-1.70 vs 1.0-2.7 today, DRAM-bound
+either way).  The a16 fill is now dispatch-slot dependent (slow set 6.5, fast
+8.9).  The gain needs neither the fast records nor C8' (a16's converters are
+idle): "issue two TMA tiles, then walk" is a loader-only ordering.
+
+**Round decision: keep nothing from R1-R6 now.**  (i) The trace build hangs
+(fact 1) and the hang is not attributed — nothing that changes the
+consumed / kMetaReady / qBar protocols merges before that, a16 included
+(the a16 module carries the same protocol code).  (ii) fp8 / fp4 / mixed fail
+their gates by a mechanism the design did not model: moving the loader off
+the tile-0..2 chain put the chunk-0 fill *behind* the converters' start
+burst in the SM's MIO pipe, and the converters' in-loop `issue(nbFast)` gate
+turns that into a tile-1 expansion stall on gemm0's chain that exceeds the
+fill cut.  (iii) Section-6 fallback (c) (fill + arrive at iteration 0 with
+the loader pre-arrive protocol) is necessary but, by these numbers, not
+sufficient: the fill would still run concurrently with the burst (the same
+segments ran 2-3x slower here) and lands at ~5-6.5 against `issue(2)`'s want
+at ~6.0 — marginal, and it gives back a16's ordering gain in the TMA branch.
+The variant to design (not build) is: (c) **plus a third fast record
+(`nbFast = 3`, scan-warp register budget first)** so that no `kMetaReady`
+gate exists before tile 3 and the chunk-0 fill has a full ring of slack in
+the compressed modules; and for the a16 / mixed TMA branch the loader-only
+ordering "TMA tiles 0-1, walk, tile 2" (no C8', no fast records needed for
+a16; mixed needs the compressed-side fix as well).  Separate items recorded:
+the Q warp must not sit behind the LDGSTS burst (fp4: Q on the path); RT4 did
+not shrink with a smaller burst (start-burst model wrong: ordering, not
+bytes); the arrive-perform latency 0.6-0.7 us is a steady-state item; R4 / R6
+are pure and can be carried by any later change.
