@@ -291,11 +291,20 @@ struct alignas(128) SharedMem {
   ShmQWiseVec xRowSum[nbXBuf];
 #endif
 
-  ShmQWiseVec gemm0CurrentSeqMax;
+  ShmQWiseVec gemm0CurrentSeqMax;  // !SWAP_AB running row max (SWAP_AB keeps it in registers)
   // col sum and max for the current gemm1 acc. Use shared memory to save some registers. register
   // storage will be 8x duplicate for swapAB and 4x duplicate for non-swapAB.
   ShmQWiseVec gemm1AccColMax;
   ShmQWiseVec gemm1AccColSum;
+#if SWAP_AB
+  // gemm0 colMax exchange: each warp publishes its tile-local column max into
+  // its own slot of the tile's parity; after one bar.sync every warp reads the
+  // four slots and folds them into a register-resident running max.  Slot
+  // parity p is rewritten at tile t+2, after the sync of tile t+1 that every
+  // warp passes only once it has read slot p at tile t: no WAR hazard, so no
+  // second sync and no shared-memory atomics.
+  ShmQWiseVec gemm0WarpColMax[2][gemm0NbWarps];
+#endif
 
   static constexpr uint32_t nbPagesPerTile =
       gemm0CtaTileNbTokens >= tokensPerPage ? exactDiv(gemm0CtaTileNbTokens, tokensPerPage) : 1;
@@ -609,7 +618,10 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
 
 #if SWAP_AB
-__device__ RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMax, Gemm0Acc const& src);
+__device__ RegColWiseVec computeWarpGrpColMax_sync(uint32_t warpRank,
+                                                   ShmQWiseVec (&warpColMaxSlots)[gemm0NbWarps],
+                                                   RegColWiseVec& runningColMax,
+                                                   Gemm0Acc const& src);
 __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t validRowBeg,
                                  uint32_t validRowEnd);
 __device__ void warpGrpOnlineSoftmax(Gemm0Acc& acc, RegColWiseVec const& colMax);
@@ -1305,11 +1317,17 @@ __launch_bounds__(128 * ctaWarpGroups)
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     uint32_t const warpRank = warpIdx.x;
 
+#if SWAP_AB
+    // Running column max across the tiles of this CTA; every warp holds an
+    // identical copy (all fold the same four per-warp slots in the same order).
+    auto runningColMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
+#else
     // init once per sequence. It also works as global colMax across iterations.
     if (threadIdx.x < ctaNbQHeads) {
       smem.gemm0CurrentSeqMax[threadIdx.x] = safeInitRowMax;
     }
     smem.gemm0WarpGrpBar.arrive_and_wait();
+#endif
 
     smem.qBar.produced.arrive_and_wait();
 #if DBG_PRINT
@@ -1424,7 +1442,8 @@ __launch_bounds__(128 * ctaWarpGroups)
 #endif
       // update colMax in shared mem and get a register copy
 #if SWAP_AB
-      RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0CurrentSeqMax, acc);
+      RegColWiseVec const colMax = computeWarpGrpColMax_sync(
+          warpRank, smem.gemm0WarpColMax[idxIter % 2], runningColMax, acc);
       warpGrpOnlineSoftmax(acc, colMax);
       TRACE_STAMP(2, idxIter, warpRank == 0);
 #else
@@ -3006,9 +3025,13 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 }
 #endif  // SPEC_DEC
 
-// smemColMax is persistent across multiple iterations
-__device__ inline RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMax,
-                                                          Gemm0Acc const& src) {
+// Tile-local column max reduced across the warp group and folded into the
+// register-resident running max (see SharedMem::gemm0WarpColMax).  Returns the
+// running max including this tile; bit-identical to the former shared-memory
+// atomicMax chain (fmax over the same set of values in any order).
+__device__ inline RegColWiseVec computeWarpGrpColMax_sync(
+    uint32_t warpRank, ShmQWiseVec (&warpColMaxSlots)[gemm0NbWarps],
+    RegColWiseVec& runningColMax, Gemm0Acc const& src) {
   auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
   for (uint32_t n = 0; n < src.cols; n++) {
@@ -3041,7 +3064,7 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMa
     for (uint32_t n = 0; n < src.cols; n++) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; j++) {
-        atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+        warpColMaxSlots[warpRank][8 * n + 2 * lane + j] = colMax[n][j];
       }
     }
   }
@@ -3052,12 +3075,16 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(ShmQWiseVec& smemColMa
   for (uint32_t n = 0; n < src.cols; n++) {
 #pragma unroll
     for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++) {
-      assert(colMax[n][j] <= smemColMax[8 * n + 2 * idxInQuad + j]);
-      colMax[n][j] = smemColMax[8 * n + 2 * idxInQuad + j];
+      float m = runningColMax[n][j];
+#pragma unroll
+      for (uint32_t w = 0; w < gemm0NbWarps; w++) {
+        m = fmax(m, warpColMaxSlots[w][8 * n + 2 * idxInQuad + j]);
+      }
+      assert(colMax[n][j] <= m);
+      runningColMax[n][j] = m;
     }
   }
-  gemm0WarpGrpSync();
-  return colMax;
+  return runningColMax;
 }
 
 __device__ inline RegColWiseVec loadShmColWiseVecWithDup(ShmQWiseVec const& smemVec) {
