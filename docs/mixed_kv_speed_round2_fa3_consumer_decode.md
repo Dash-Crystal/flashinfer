@@ -861,3 +861,65 @@ one `WARPSYNC`/`BAR.WARP.SYNC` more per call than [23]; a16 module byte-identica
 to `5cc416fd`; stock paged kernel byte-identical.  ncu: `STS.128` 4.0
 wavefronts, scale `LDGSTS` <= 4, `op_st` <= ~450, total <= ~2050 per call.
 Bench fp8 290-345, fp4 295-350 (section 3); trace `acq` >= 0.25 us.
+
+---
+
+## As written: F24c (dynamic module: page masks, format-outer page-rolled loops)
+
+Files: `include/flashinfer/attention/hopper/kernel_traits.cuh` (comment only:
+`MixedTileMeta` layout unchanged, `tags[4]`, `tags[5]` carry the masks in the
+dynamic module), `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh`.
+Static modules (a16, fp8, fp4) compile the same bodies as after F24b: their
+copy / expansion paths are the `if constexpr (!DYNAMIC)` arms, with `PagePos`
+carrying the same immediates (`j * PAGE_STEP_BYTES`, `j *
+SCALE_PAGE_STEP_BYTES`, `page_tok0(h, j)`) the F24b code computed inline.  Not
+built or run here.
+
+**Data flow (dynamic module).**
+- `chunk_store`: `m8 = reduce_or(octet, tag == FP8 ? 1 << slot : 0) & 0x3F`,
+  `m4` likewise (two `REDUX`), lane 0 writes the row's last word `m8 | m4 << 8 |
+  valid << 16 | flags << 24` with one `STS.32` (`flags` has `kFlagCompressed`
+  iff `m8 | m4`).  Static modules keep the [23] byte stores (a16 module
+  textually unchanged).
+- `read_meta` (dynamic): `TileRegs{pages = 0, w6 = 0, w7 = LDS.32(row + 28),
+  row_addr}` — one `LDS.32` per tile instead of two `LDS.128`; `page_at(i)` =
+  `LDS.32(row_addr + 4 i)`; `mask8()`, `mask4()`; `pending_mask8/4(tv)` read the
+  masks back from the pending word (bits 32..37, 40..45); `parity_mask(h) =
+  0x15 << h` (0x3F for one warp group).
+- `make_bases`: no parity offset in the dynamic module (`page_off = 0`,
+  `sc_page_off = 0`): pages are addressed by their tile index.
+- `PagePos { off, sc_off, tok0 }`: `static_page(h, j)` (immediates) /
+  `dynamic_page(i)` (`i * PAGE_REGION_BYTES`, `i * SCALE_PAGE_BYTES`, `16 i`:
+  one IMAD each); `copy_a16_page`, `copy_compressed_page`, `load_packed`,
+  `expand_block` take the offset instead of a slot index.
+
+**Control flow (dynamic module).**
+- `issue_tile_copies`: `m8 = mask8 & par`, `m4 = mask4 & par`, `ma = par & ~(m8
+  | m4)` (tail slots past `valid` are tagged A16 by `chunk_load` and land in
+  `ma`, zero-filled by the `FULL = false` arm as before).  Three `#pragma unroll
+  1` loops `for (mm = m; mm; mm &= mm - 1) { i = ffs(mm) - 1; ... }` — FP8, FP4
+  (each with its `compressed_src` set-up inside `if (m)`), A16 — one copy body
+  each; no per-page format branch.  All operands are warp-uniform smem data.
+- `expand_operand`: first pages of both formats loaded up front (`c8, sw8`,
+  `c4, sw4`), then `expand_format_pages<true>(m8, ...)` and
+  `expand_format_pages<false>(m4, ...)`: a rolled loop that issues the next
+  page's packed halves + scale word before the current page's stores
+  (`expand_block`), one body per format.  `__syncwarp` inside `expand_block`
+  is reached converged (the loop trip counts are warp-uniform).
+- `pending_word` unchanged in form (`w7 << 32 | w6 | stage << 60`, `w6 = 0`).
+
+**Prediction status.**  Per 2E: none quoted.  Per-page issue-path count is
+about today's (FP8 copy ~12, A16 ~11 instructions); the lever is the removal of
+data-dependent branches and unrolled 3-format bodies.  The gate is the ncu
+pc-sampling run on the F24b build (mixed module, producer region:
+`no_instructions`, `branch_resolving`, `mio_throttle`, `lg_throttle`,
+`imc_miss`) and the same on this build; if the F24b build shows < 10 % in the
+first two, this commit is dropped from the merge.
+
+**Expected artifacts.**  Dynamic module producer region: one `REDUX`-pair site
+per chunk store, `LDS.32` page-index reads inside the rolled loops (`FLO`/`POPC`
+for `ffs`), one copy body per format and one expansion body per format,
+`LDL/STL` 0 in the pair loop, `STACK` <= [23]'s 16 B (prologue only); SASS
+well below the pre-[22] 5263.  Static modules: SASS identical to the F24b
+build (the `PagePos` refactor is a pure re-spelling of the same immediates —
+verify by `cuobjdump -sass` diff, expected empty for all three).

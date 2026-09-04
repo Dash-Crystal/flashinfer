@@ -49,11 +49,15 @@ struct SharedStorageQKVO {
 // trip per 16 tiles instead of one per pair), and a pair reads its two tiles'
 // rows with four LDS.128.  One row is 32 B: 6 page indices, 6 tags, the valid
 // count and a flags byte (bit 0: any compressed page; bit 1: row filled).
+// [24c] The dynamic module stores two 6-bit page masks in tags[4], tags[5]
+// (bit i: page i is E4M3 / E2M1; tags[0..3] unused) so that the last word of
+// the row - masks | valid << 16 | flags << 24 - is all a pair needs, and reads
+// page indices by LDS.32 from the row.  Static modules keep the tag bytes.
 template <typename IdType, int CTA_KV>
 struct alignas(16) MixedTileMeta {
   static constexpr int kPages = CTA_KV / 16;
   IdType pages[kPages];
-  uint8_t tags[kPages];
+  uint8_t tags[kPages];  // dynamic module: [4] = FP8 page mask, [5] = FP4 page mask
   uint8_t valid;
   uint8_t flags;
 };
