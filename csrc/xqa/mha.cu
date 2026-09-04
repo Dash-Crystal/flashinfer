@@ -144,6 +144,17 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 16;
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #endif
+#elif __CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM == 5 && SPEC_DEC && M_TILESIZE == 16
+// Track S step 4 [41]: the sm90 SPEC_DEC mixed-page build runs 1 CTA/SM twice over - by
+// registers (255 cap) and by shared memory (163.6 KB of 228 KB with the 128 B / 64-row K/V
+// rings holding A16 tiles).  The kernel is latency-bound (0.4 issued instructions per
+// scheduler cycle, DRAM 7-14 %), so the lever is a second resident CTA: with M_TILESIZE 16
+// (q x GQA <= 16 rows, no padded MMA rows) the 64 B K parts / 32-row V tiles of the sm120
+// layout bring SharedMem to ~87 KB (K 32 + V 32 + Q 4 + X 8 + scales/meta ~11) and
+// __launch_bounds__(256, 2) caps registers at 128, which the warpTile.y 16 mixed code
+// already meets on the q=1 modules (REG 128, STACK 8-24, spills outside the tile loop).
+constexpr uint32_t preferedKHeadPartBytes = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;
@@ -3563,7 +3574,9 @@ CUBIN_EXPORT __global__
 
 #if SPEC_DEC
 #if __CUDA_ARCH__ == 900 && M_TILESIZE == 16
-constexpr uint32_t nbCtaPerSM = 2;
+// Two CTAs per SM only when two SharedMem instances (plus the 1 KB driver reservation each)
+// fit the 228 KB of an sm90 SM; otherwise the 128-register cap would buy nothing.
+constexpr uint32_t nbCtaPerSM = (2 * (smemSize + 1024u) <= (228u << 10)) ? 2 : 1;
 #else
 constexpr uint32_t nbCtaPerSM = 1;
 #endif
@@ -3794,6 +3807,51 @@ static uint32_t configureKernel() {
 
 static uint32_t const hostSmemSize = configureKernel();
 
+// Track S step 4 [42]: default number of sub-sequences per sequence (multi-block mode).
+// Cost model, calibrated on the XQA_NB_SUB_SEQ sweeps (nkcut2 H200, 136 sequences x 16 tiles,
+// at 132 slots (1 CTA/SM) and 264 slots (2 CTAs/SM); ws-1 RTX 5090, 170 slots, P0.8): the
+// CTAs of a wave run in lockstep, so the kernel takes waves x (fixed + tilesPerCta x tTile)
+// with waves = ceil(nbSeq x n / slots), slots = SMs x resident CTAs per SM, and tilesPerCta
+// the mean nbTiles / n (the sub-sequences take the tiles round-robin, so a 3.2-tile mean
+// mixes 4- and 3-tile CTAs that backfill each other).  The per-CTA fixed cost (Q load,
+// pipeline ramp, multi-block store/merge) measured 5.5-7 us against 4-11 us per 256-token
+// tile on both hosts, i.e. about one tile: kFixedCostInTiles = 1.  Because the scratch
+// round trip of the merge is not in the model, n > 1 is taken only for a modelled gain above
+// 5 %: at 264 slots that picks n = 5 (measured best: 680 CTAs, 2.58 waves), at 132 slots
+// n = 4 (measured 0.85x), at 170 slots it keeps n = 1 (P0.8: every n > 1 was slower there).
+static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSeq,
+                                     uint32_t maxSeqLen) {
+  uint32_t const nbTiles = std::max<uint32_t>(1U, divUp(maxSeqLen, ctaTile.x));
+  static uint32_t const ctasPerSm = []() -> uint32_t {
+    int n = 0;
+    cudaError_t const err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &n, kernel_mha, static_cast<int>(ctaSize), hostSmemSize);
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      return 1U;
+    }
+    return static_cast<uint32_t>(std::max(n, 1));
+  }();
+  constexpr uint64_t kMilli = 1000;
+  constexpr uint64_t kFixedCostInTiles = 1;
+  constexpr uint64_t kMinGainPercent = 5;
+  uint64_t const slots = std::max<uint32_t>(1U, multiProcessorCount * ctasPerSm);
+  auto const cost = [&](uint32_t n) -> uint64_t {
+    uint64_t const waves = divUp<uint64_t>(uint64_t{nbSeq} * n, slots);
+    return waves * (kFixedCostInTiles * kMilli + kMilli * nbTiles / n);
+  };
+  uint32_t best = 1;
+  uint64_t bestCost = cost(1);
+  for (uint32_t n = 2; n <= nbTiles; n++) {
+    uint64_t const c = cost(n);
+    if (c < bestCost) {
+      bestCost = c;
+      best = n;
+    }
+  }
+  return (best > 1 && bestCost * 100 < cost(1) * (100 - kMinGainPercent)) ? best : 1;
+}
+
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
@@ -3830,8 +3888,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
         return std::min<uint32_t>(val, divUp(maxSeqLen, ctaTile.x));
       }
     }
-    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads)),
-                              divUp(maxSeqLen, ctaTile.x));
+#if SPEC_DEC
+    uint32_t const nbSeq = batchSize * nbKHeads * divUp(qSeqLen * headGrpSize, rowsPerBlock);
+#else
+    uint32_t const nbSeq = batchSize * nbKHeads;
+#endif
+    return chooseNbSubSeqPerSeq(multiProcessorCount, nbSeq, maxSeqLen);
   }();
 #if SPEC_DEC
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);

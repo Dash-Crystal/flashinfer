@@ -829,3 +829,178 @@ mixed dispatch: `XQA_NB_SUB_SEQ=4` (0.85x on every mode, needs the host
 `nbSubSeqPerSeq` default from the per-CTA fixed-cost model), and a 2-CTA/SM
 SPEC_DEC build (register budget 128 with the C2-free code, or the `mha_sm90.cu`
 SPEC_DEC mixed path whose smem arithmetic is above).
+
+### Track S step 4 — [41] 2-CTA/SM SPEC_DEC build and [42] host `nbSubSeqPerSeq` default (2026-09-03, nkcut2 H200 + ws-1 RTX 5090, worktree E)
+
+**Occupancy arithmetic (before any build).**  The sm90 q=4 modules after [40]
+ran 1 CTA/SM for two independent reasons, both read from the step-3 ncu launch
+statistics: `Block Limit Registers 1` (REG 236-249 under the 255-register
+`__launch_bounds__(256, 1)` of the SPEC_DEC build, `mha.cu` `nbCtaPerSM`) and
+`Block Limit Shared Mem 1` (`Dynamic Shared Memory Per Block 163.58 KB` =
+167,504 B against 228 KB per SM).  Neither limit alone would have been enough
+to lift:
+
+| SharedMem member (sm90, enum 5, SPEC_DEC) | M_TILESIZE 32, K 128 B / V 64 rows (shipping) | M_TILESIZE 16, K 64 B / V 32 rows ([41]) |
+|---|---|---|
+| `k[4 warps][2 bufs]` = 4 x 2 x 64 tokens x part bytes | 65,536 | 32,768 |
+| `v[2 grps][1][2 bufs]` = 2 x 2 x rows x 256 B | 65,536 | 32,768 |
+| `q` = warpTile.y x 256 B | 8,192 | 4,096 |
+| `x[4]` = 4 x warpTile.y x 128 B | 16,384 | 8,192 |
+| scales, formats, row max/sum, barriers, padding | ~11,856 | ~5,888 |
+| **sizeof(SharedMem)** (ncu `launch__shared_mem_per_block_dynamic`) | **167,504 B (163.6 KB)** | **83,712 B (81.8 KB)** |
+| 2 x (size + 1 KB driver) vs 228 KB | 329 KB: no | 165.5 KB: **yes** (3 CTAs: 248 KB, no) |
+
+The two intermediate layouts do not fit two CTAs either: K 128 B / V 32 rows at
+M 16 is 116,480 B (2 x 117.5 KB = 235 KB > 228 KB, over by 1.5 KB), K 64 B /
+V 64 rows at M 16 is the same size.  So the smem lever is the sm120 K/V ring
+shape (64 B K parts, 32-row V tiles; `mha.cu` `preferedKHeadPartBytes` /
+`cacheVTileSeqLen`) *and* the 16-row M tile.
+
+Registers: `__launch_bounds__(256, 2)` means <= 128 registers per thread
+(65,536 / 512).  What drives the 239-249 of the shipping build is the M-tile:
+at `M_TILESIZE` 32 a gemm0 warp holds a 32 x 64 fp32 accumulator (64 registers)
+and a gemm1 warp a 32 x 64 fp32 output accumulator (64), plus the copy/expand
+address state of a 128 B part (16 grains per lane per part); the compiler then
+spends the rest of the 255 budget on scheduling freedom (STACK 0 both before and
+after [29], so none of it was demand).  With q x GQA = 16 rows the 32-row tile
+is half padding (`nbValidRows = rowsPerBlock = M_TILESIZE` in SPEC_DEC): the
+MMA and softmax rows 16-31 are computed and discarded.  `M_TILESIZE 16` halves
+both accumulators (32 + 32) and the 64 B parts halve the per-part copy state.
+The register test already existed in the cache: the q=1 non-SPEC_DEC enum-5
+sm90 modules are built at `__launch_bounds__(256, 2)` with the same
+warpTile.y 16 mixed copy/expand code (128 B parts) and compile to **REG 128,
+STACK 8-24, 2-5 LDL/STL pairs all outside the tile loop** (store at the
+prologue, `LDL.LU` at the epilogue); SPEC_DEC adds the mask words, the 64 B
+parts remove half the address state.  Prediction: REG 128, STACK 0-32, no LDL
+inside the tile loop; the per-tile instruction count drops (half the MMA and
+softmax rows) while the K pipeline runs 4 parts per tile instead of 2.
+
+Effect model: the kernel is latency-bound (step 3: 0.4 issued instructions per
+scheduler-cycle, DRAM 7-14 %, warp latency 4.5-5.1 cycles per issued
+instruction at 8 warps/SM), so a second resident CTA hides the K/V landing and
+barrier round trips of the other; and the sub-sequence sweep on the 1-CTA/SM
+build (n=4: 0.85x on every mode; 136 CTAs on 132 SMs is 1.03 waves, the 4-CTA
+tail wave costs almost a whole CTA time) says the wave geometry is worth
+another ~15 %.  Modelled: fp4 236 -> 130-150, fp8 199 -> 115-135, mixed 216 ->
+125-155, a16 136 -> 95-105 (a16 sits near the 67.5 us byte floor plus the
+per-CTA fixed cost); the q=4 targets (94 / 59 / 101) were not predicted to be
+met by occupancy alone.
+
+**Levers.**
+- **[41]** `csrc/xqa/mha.cu`: `#elif __CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM == 5 && SPEC_DEC && M_TILESIZE == 16` selects `preferedKHeadPartBytes = 64`, `cacheVTileSeqLen = 32`; `nbCtaPerSM` for the sm90 SPEC_DEC `M_TILESIZE == 16` case is `2 * (smemSize + 1024) <= 228 KB ? 2 : 1` (the smem arithmetic decides, not the flag).  `flashinfer/jit/xqa.py`: `-DM_TILESIZE=16` for the mixed-page SPEC_DEC modules when `q_seq_len x head_group_ratio <= 16` (one 16-row token block; the module URI already encodes both, so no name change).  The sm120 SPEC_DEC modules take the M tile too (their K/V ring is unchanged; their 99 KB cap still gives 1 CTA/SM).
+- **[42]** `csrc/xqa/mha.cu launchMHAFlashInfer`: `chooseNbSubSeqPerSeq` replaces `max(1, SMs / (B x H))` (which is 1 for every B x H >= SMs).  slots = SMs x `cudaOccupancyMaxActiveBlocksPerMultiprocessor(kernel_mha, 256, smemSize)`; cost(n) = ceil(nbSeq x n / slots) x (1 + nbTiles / n) in tile units (per-CTA fixed cost ~ one tile: 5.5-7 us measured on both hosts against 4-11 us per tile); n > 1 only for a modelled gain > 5 % (merge scratch traffic is not in the model).  Picks n = 5 at 264 slots, n = 4 at 132 slots (the measured optimum of the 1-CTA/SM build), n = 1 at 170 slots (ws-1; P0.8 measured every n > 1 slower there).  `XQA_NB_SUB_SEQ` still overrides.
+
+**Artifact (sm90, `cuobjdump -res-usage` / `-sass` of `xqa_mha.cuda.o`, q=4 modules, workspace `/tmp/mixedkv-wtE-s4-v1`; `build.ninja` carries `-DM_TILESIZE=16`).**
+
+| module (sm90 q=4) | REG before -> after | STACK / LDL / STL | SASS instr before -> after | LDGSTS static | BRA |
+|---|---|---|---|---|---|
+| a16 (0) | 236 -> **128** | 0 / 0 / 0 | 8,552 -> 7,008 | 221 -> 177 | 98 -> 125 |
+| fp8 (1) | 238 -> **128** | 0 / 0 / 0 | 8,912 -> 8,160 | 191 -> 102 | 140 -> 174 |
+| fp4 (2) | 240 -> **128** | 0 / 0 / 0 | 9,792 -> 9,104 | 119 -> 102 | 132 -> 174 |
+| mixed dyn (-1) | 249 -> **128** | 0 / 0 / 0 | 8,824 -> 9,288 | 137 -> 122 | 206 -> 289 |
+
+sm120 q=4 (ws-1, triton `cuobjdump`, same flags): a16 213 -> 200, fp8 235 -> 196,
+fp4 214 -> 178, mixed 240 -> 202 registers, STACK/LDL/STL 0 everywhere, SASS
+7,160 -> 5,968 / 7,240 -> 6,000 / 7,392 -> 6,184 / 9,256 -> 8,056.
+
+**ncu (sm90 q=4, one launch, `--launch-skip 1 --launch-count 1`, co-tenant
+present so durations are serialized; "before" = the step-3 record of the same
+metrics on the [40] tree).**
+
+| metric | mixed before | mixed after | fp4 before | fp4 after | fp8 after | a16 after |
+|---|---|---|---|---|---|---|
+| launch__grid_size | 136 | 408 (v1, n=3) | 136 | 408 | 408 | 408 |
+| launch__registers_per_thread | 249 | **128** | 240 | **128** | 128 | 128 |
+| launch__shared_mem_per_block_dynamic | 167,504 B | **83,712 B** | 167,504 | 83,712 | 83,712 | 83,712 |
+| launch__occupancy_limit_registers / _shared_mem (blocks) | 1 / 1 | **2 / 2** | 1 / 1 | 2 / 2 | 2 / 2 | 2 / 2 |
+| launch__waves_per_multiprocessor | 1.03 | 1.55 | 1.03 | 1.55 | 1.55 | 1.55 |
+| sm__warps_active (% of peak, active cycles); theoretical | 12.2 %; 12.5 | **21.1 %; 25** | 12.3 % | 21.5 % | 21.7 % | 22.1 % |
+| smsp__issue_active (% of active cycles) | 44 (0.44 issued/scheduler-cycle) | 43.9 | 39 | 43.7 | 41.5 | 33.9 |
+| smsp__inst_executed.sum | 46.36 M | 50.21 M | 48.31 M | 48.79 M | 40.50 M | 24.54 M |
+| warp-cycles per issued instruction | 4.52 | 7.61 | 5.06 | 7.87 | 8.25 | 10.31 |
+| .. of which no_instruction (warps per issue-active cycle) | 0.52 | 2.16 | 0.77 | 2.42 | 1.64 | 1.86 |
+| .. long_scoreboard | - | 1.19 | - | 1.35 | 1.63 | - |
+| dram__throughput (% of peak, elapsed) | - | 21.1 | - | 11.9 | 21.7 | - |
+| gpu__time_duration (serialized) | 283.6 us | **198.3** | 311.0 | **189.2** | 173.2 | 123.0 |
+
+The register and smem limits are both 2 blocks and the achieved warps per SM
+went 7.8 -> 13.5-14.1 of 16 (the 1.55-wave tail keeps it under the theoretical
+25 %).  Issue utilisation per active cycle did not double: the second CTA
+raises the warp latency per issued instruction from 4.5-5.1 to 7.6-8.3 cycles,
+and the largest single component is now instruction fetch (`no_instruction`
+2.2-2.4 warps per issue cycle, up from 0.5-0.8): the four warps per SMSP (a
+gemm0 and a gemm1 warp of each CTA) sit in four code regions instead of two.
+The gain is in wall time, not in SM issue rate: instructions per kernel are
+within 5 % (the 64 B parts add copy/expand iterations, the 16-row tile removes
+MMA/softmax rows, and 3x more CTAs pay the prologue) while the serialized
+kernel time fell 30-39 %.
+
+**XQA_NB_SUB_SEQ sweep on the 2-CTA/SM build (nkcut2, flock'd, `--repeats 2
+--trials 5`, medians; grid = 136 x n CTAs on 264 slots).**
+
+| n (waves) | transport_a16 | fp8 | fp4 | mixed |
+|---|---|---|---|---|
+| 1 (0.52; 1 CTA/SM in practice) | 105.3 | 165.4 | 194.3 | 201.1 |
+| 2 (1.03) | 116.2 | 166.7 | 183.2 | 181.8 |
+| 3 (1.55) | 100.5 | 128.4 | 148.1 | 151.8 |
+| 4 (2.06) | 101.3 | 136.7 | 154.2 | 153.9 |
+| **5 (2.58)** | **98.6** | **123.7** | **144.3** | **138.3** |
+| 6 (3.09) | 99.1 | 131.1 | 153.5 | 154.5 |
+| 8 (4.12) | 98.7 | 127.5 | 144.4 | 159.7 |
+
+Every "just over an integer wave" count (2, 4, 6) pays a nearly full CTA time
+for its tail, exactly the discrete-wave reading of the 1-CTA/SM sweep (n=1 =
+1.03 waves there); the n=1 row isolates [41] at 1 CTA/SM: fp4 237 -> 194
+(0.82x), fp8 199 -> 165, a16 136 -> 105, mixed 216 -> 201 (the M-tile work
+halving minus the doubled K round trips).  The host model's first version
+(ceil tiles per CTA, no hysteresis) chose n=3; the sweep calibrated it to the
+mean tiles per CTA (16/5 = 3.2: 4- and 3-tile CTAs backfill each other) with
+the 5 % hysteresis that keeps ws-1 at n=1 - both hosts' sweeps are reproduced
+by the same constants.
+
+**Timing (flock'd, `--repeats 2 --trials 5`, three rounds of the shipped
+default; the `kernel_family` line reports `mha.cu spec_dec=True` and the
+`..._spec_q_seq_len_4` URIs for every q=4 mode; ncu `launch__grid_size` 680 =
+136 x 5, `launch__waves_per_multiprocessor` 2.58, `launch__occupancy_limit_registers`
+2, `launch__occupancy_limit_shared_mem` 2 on the shipped build).  q=1 is the
+untouched `mha_sm90.cu` control (session offset +1-3 % against the step-3
+record: 83.0 / 91.2 / 96.0 / 115.6).**
+
+| mode | q=4 step-3 record ([40]) | q=4 [41]+[42] r1 / r2 / r3 | ratio | q=4 target | q=1 control |
+|---|---|---|---|---|---|
+| transport_a16 | 136.4 | 100.0 / 99.7 / 99.6 | **0.73x** | 135 (pass) | 85.6 |
+| fp8 | 198.7 | 124.2 / 124.3 / 124.8 | **0.63x** | <= 94 (open, 1.32x) | 92.2 |
+| fp4 | 236.1 | 144.1 / 144.3 / 145.7 | **0.61x** | <= 59 (open, 2.45x) | 97.2 |
+| mixed | 216.4 | 137.8 / 137.8 / 136.0 | **0.64x** | <= 101 (open, 1.36x) | 117.0 |
+
+Against the prediction (fp4 130-150, fp8 115-135, mixed 125-155, a16 95-105):
+every mode landed inside its band.  mixed stays below fp4 (0.95x) and the
+Track S acceptance (mixed <= 1.5x fp4) holds.  Correctness: 34/34 bit-exact on
+nkcut2 and ws-1 with the shipped default and again with `XQA_NB_SUB_SEQ=2`
+(the multi-block merge path of the 2-CTA/SM SPEC_DEC build; the test shape's
+2 tiles never trigger it from the model).
+
+**sm120 regression table (ws-1 RTX 5090, flock'd, `--repeats 5 --trials 5`,
+three rounds; q=1 modules are unchanged by [41] and the host rule keeps n = 1
+there - torch.profiler grid `[1, 8, 17]` at q=1 and q=4; q=4 modules take the
+16-row M tile).**
+
+| mode | q=1 record | q=1 after (r1 / r2 / r3) | q=4 record ([29]) | q=4 after (r1 / r2 / r3) | q=4 target |
+|---|---|---|---|---|---|
+| transport_a16 | 174.7 | 172.8 / 173.4 / 173.2 | 179-184 | 176.2 / 176.0 / 176.1 | - |
+| fp8 | 100.5 | 100.6 / 100.7 / 100.3 | 125.0 | **115.1 / 115.1 / 115.4** | <= 128 (pass) |
+| fp4 | 59.5 | 59.6 / 59.8 / 59.8 | 81.9 | **65.8 / 65.5 / 65.7** | <= 81 (pass, was within 1 %) |
+| mixed | 113.5 | 113.5 / 113.6 / 113.5 | 132.3 | **119.0 / 118.7 / 119.6** | <= 138 (pass) |
+
+**What is left for the sm90 q=4 targets (94 / 59 / 101).**  The kernel now
+runs 13.5-14 warps per SM at 42-44 % issue-active with 7.6-8.5 warp-cycles per
+issued instruction, 2.2-2.8 of them instruction-fetch (`no_instruction`) and
+1.2-1.6 long-scoreboard; DRAM is at 12-22 % of peak.  Occupancy is exhausted
+(3 CTAs/SM would need <= 85 registers and 3 x 82 KB of smem), so the remaining
+levers are per-tile issue count and code footprint: the dynamic instruction
+count per warp-tile (2,900 for mixed, 2,800 fp4, 2,300 fp8 at 8 warps) and the
+four-region i-fetch pattern of two co-resident CTAs, i.e. a smaller, less
+unrolled per-tile body (the 64 B parts run 4 copy/expand/MMA rounds per tile)
+or the `mha_sm90.cu` SPEC_DEC route whose smem arithmetic is in the step-3
+section (K3/V2 fits 2 CTAs/SM at 99 KB).  The a16 mode is 1.48x its 67.5 us
+byte floor with 680 CTAs x ~6 us of fixed cost = 15 us of the gap.
