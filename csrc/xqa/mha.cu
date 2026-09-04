@@ -220,6 +220,10 @@ static_assert(!kMixedBF16PlacementExpansion ||
                   (kCompactTileLoops && mha::is_same_v<InputElem, __nv_bfloat16> && !grpLoadV &&
                    !compactMixedPages),
               "[44] placement expansion: sm90 SPEC_DEC compact bf16 build with per-warp V tiles");
+// [44] item 3 (gated on artifact A0): the mixed copy with hoisted per-lane / per-page address
+// constants (copyMixedPartialHeadsAsyncHoisted).  Same build as the placement expansion; the
+// MIXED_KV_PROBE_C measurement build keeps the stock copy (the probe lives there).
+#define MIXED_HOISTED_COPY (MIXED_BF16_PLACEMENT_EXPANSION && !MIXED_KV_PROBE_C)
 
 // number of shared memory buffers for latency hiding
 constexpr uint32_t nbQBuffers = mha::min(nbPartsPerInputQHead, 2u);  // for latency hiding
@@ -2461,6 +2465,18 @@ CUBIN_EXPORT __global__
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
                               grainBytes, grainBytesGmemCache, qkSwizzle, false>(
             warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
+#if MIXED_HOISTED_COPY
+      } else {
+        // [44] item 3: isFullTile is constant false under kCompactTileLoops (one bounds-checked
+        // copy body); dstHeadOffset is 0 and the tile origin is page-aligned (asserted above).
+        static_assert(kCompactTileLoops, "MIXED_HOISTED_COPY implies the compact tile loops");
+        uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+        uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
+        copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
+            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
+            pageFormats, idxHeadGrp, idxPart, nbHeadsAvail);
+      }
+#else
       } else if (isFullTile) {
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
@@ -2485,6 +2501,7 @@ CUBIN_EXPORT __global__
 #endif
             );
       }
+#endif
 #else
       if (isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
@@ -3046,12 +3063,19 @@ CUBIN_EXPORT __global__
             warp, dst, dstHeadOffset, src, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       } else {
+#if MIXED_HOISTED_COPY
+        // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
+        copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
+            dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, pageFormats,
+            idxHeadGrp, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#else
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
                                    vSwizzle, false, compactMixedPages>(
             dst, getSmemVScales(idxNextSMemVBuf),
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#endif
       }
 #else
       if (isFullTile) {

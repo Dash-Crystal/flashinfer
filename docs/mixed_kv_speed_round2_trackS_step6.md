@@ -359,7 +359,10 @@ second helper with the new body is selected at the two call sites by a template 
 
 `copyMixedPartialHeadsAsync` (`mhaUtils.cuh:286-499`) keeps its ownership (lane = block `l % 4`
 of rows `l / 4 + 8i`: coalesced 16 B / 8 B lanes per token row, the A2/D6 finding) and its
-page-outer dispatch; the change is which quantities are computed where:
+page-outer dispatch; the change is which quantities are computed where.  As written (section
+8.3, rev 2) it is a second helper `copyMixedPartialHeadsAsyncHoisted<..., bool isK>` selected
+under `#if MIXED_HOISTED_COPY` (= `MIXED_BF16_PLACEMENT_EXPANSION && !MIXED_KV_PROBE_C`), the
+stock helper untouched:
 
 - Per lane, once per kernel (registers): `blockInPart = l % 4`, `headInSpan0 = l / 4`,
   `swz = (2 * blockInPart) ^ (headInSpan0 % 8)` (the destination grain, lane-constant by the same
@@ -710,3 +713,61 @@ HMUL2 + 2 STS.128) = 68, ~4 address / loop = **~85** (today 2 x 53 = 106); FP4 �
 section-4 budget's 46.  F2FP per FP8 lane-call 18 -> 3, HADD2.F32 16 -> 2, HMUL2 16 (32 in the
 fallback body), STS.128 4, LDS.128 2 / LDS.64 2, LDS.U16 1, one `WARPSYNC` between the `DEPBAR`
 and the first LDS, no LDL / STL, REG <= 128.
+
+### 8.3 Item 3 — hoisted copy constants (`copyMixedPartialHeadsAsyncHoisted`; gated on artifact A0, separate commit so Verify can drop it)
+
+Files: `csrc/xqa/mhaUtils.cuh` (`cpAsyncCaShared<size>`, `cpAsyncCgShared16` — u32 shared-window
+`cp.async` with the stock cache policies — and `copyMixedPartialHeadsAsyncHoisted`),
+`csrc/xqa/mha.cu` (`MIXED_HOISTED_COPY = MIXED_BF16_PLACEMENT_EXPANSION && !MIXED_KV_PROBE_C`; K
+site: the `isFullTile` / bounds-checked pair of mixed copy calls becomes one hoisted call —
+`isFullTile` is constant false under `kCompactTileLoops`; V site: the non-`grpLoadV` mixed copy).
+The stock `copyMixedPartialHeadsAsync` is untouched and stays the body of every other build.
+
+Data flow, one call (K: one 128 B part of 64 rows = 4 spans; V: one 32-row half-tile, `idxPart =
+warpIdxInGrp`):
+
+```
+lane l: b = l % 4, x = l / 4 (= row % 8 for every copied row: rows advance by 8 per iteration, 16 per
+        span, origin row 0), elem = (idxPart * 4 + b) * 16
+        dstFirst = tileBase + byteOffset<swz>(x, 2b), dstSecond = ... (x, 2b + 1)        (u32, per call)
+per span (page = pages[span]; nbSpans <= nbPages, page-aligned origin):
+        laneOff  = pageValid ? page * stride.page + headIdx * stride.head + x * stride.token : 0  (u64)
+        laneSrc  = payload + laneOff + elemOff(format)         (A16 2 elem, FP8 elem, FP4 elem / 2)
+        iterStride = 8 * stride.token                          (u64, per format)
+per iteration i in {0, 1}:
+        src = laneSrc + i * iterStride                         (one 64-bit add)
+        valid = pageValid && 16 span + x + 8 i < nbAvailHeads  (ISETP + PLOP3)
+        LDGSTS [dstFirst + 2048 span + 1024 i], src, valid ? n : 0        (immediate destination)
+          A16: two cg 16 B (second grain from src + 16); FP8: one ca 16 B (MIXED_FP8_COPY 1; the 0 / 2
+          variants as in the stock helper); FP4: one ca 8 B
+scale loop (rows l + 32 i; page l / 16 + 2 i, token l % 16; K 2 iterations, V 1):
+        compressed page: one ca 4 B LDGSTS [scaleBase + 4 l + 128 i] from
+          scales + page/token/head strides + 4 idxPart, src-size 4 if the row is valid else 0
+          (a zero scale word keeps the expansion's vote neutral and 0 x zero payload = 0)
+        A16 / bad page: nothing issued (deliberate change from the stock helper, which issued a
+          0-size copy from a substitute pointer: the A16 row's scale word is never read because the
+          expansion skips A16 spans; this removes the stock body's runtime pointer select)
+```
+
+Control flow: page loop (`#pragma unroll(pageLoopUnroll)`) -> warp-uniform format branch (dynamic
+module; static modules fold the tag) -> `iteration(0)`, `iteration(1)` (explicit calls, no loop)
+-> scale loop (1-2 unrolled iterations, `@P LDGSTS` for compressed rows).  No `__syncwarp` here:
+completion is the caller's `wait_group` plus the expansion helper's entry barrier.  `isK` is a
+template parameter (the stock helper's runtime `isK ? k_payload : v_payload` pointer select is
+gone); no runtime-indexed register arrays; the only 64-bit multiplies are the three `IMAD.WIDE`
+of `laneOff` per span and the `iterStride` shift.
+
+Static guarantees: 16 B grains, `swizzle`, 128 B rows with 8 grains, `partBytes 128` /
+`blocksPerPart 4`, `headsPerSpan 16`, `nbSpans <= nbPages`, two iterations per span with 8 rows
+each, `validElemsPerHead == sizeof(PaddedCacheHead) / sizeof(CacheElem)` (every block valid: no
+per-block element check), `dstNbHeads >= maxNbCopiedHeads`, `maxNbCopiedHeads % 32 == 0` (no dump
+row in the scale loop), `scaleLoadBytes 4`, `headIterations * 2 <= nbPages`; the K site
+`static_assert`s `kCompactTileLoops`.
+
+Expected SASS per copy iteration: IADD3 + IADD3.X (64-bit src add), ISETP, PLOP3, SEL, LDGSTS,
+3 `@!PT LDS` placeholders = **~9-10** (today 25 K / ~28 V), per span + 3 IMAD.WIDE + 2 SEL + the
+format branch (dynamic) — A1: `IMAD.WIDE` <= 3 per span and 0 per iteration, LDGSTS count
+unchanged (K 2 A16 / 1 FP8 / 1 FP4 + 1 scale per span-iteration shape), `LDGSTS` destinations
+`[R + imm]`.  Section 4's -590 U (dynamic) / -450..-600 U (static) is this item's budget; if A0
+puts copy + scales below 12 % of `inst_executed`, drop this commit (section 7 item 2).
+
