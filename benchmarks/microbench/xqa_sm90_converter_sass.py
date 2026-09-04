@@ -118,6 +118,10 @@ def main():
     ap.add_argument("nvdis")
     ap.add_argument("source", help="csrc/xqa/mha_sm90.cu matching the build")
     ap.add_argument("--dump", help="write the attributed SASS of this region (e.g. K-expand) to stdout")
+    ap.add_argument("--paths", action="store_true",
+                    help="split the K-expand region at its branches into the executed paths of a "
+                         "static fp8/fp4 build (bad-page test, fold vote, fold loop, two-multiply loop, "
+                         "zero fill) and print per-path class counts; the fold path is the steady state")
     args = ap.parse_args()
     ins = parse_nvdis(args.nvdis)
     reg = source_regions(args.source)
@@ -149,6 +153,26 @@ def main():
         addrs = [i["addr"] for i in sel]
         print(f"-- {name}: {len(sel)} SASS, PC 0x{min(addrs):05x}-0x{max(addrs):05x}")
         print("   " + fmt_hist(hist(sel)))
+    if args.paths:
+        exp = [i for i in ins if in_range(i, "roleK") and has_frame(i, "expand")]
+        bras = [i["addr"] for i in exp if i["op"].startswith("BRA")]
+        if len(bras) < 4:
+            raise SystemExit(f"expected >= 4 branches in K-expand (static fp8/fp4 build), found {len(bras)}")
+        b0, b1, b2, b3 = bras[:4]
+        seg = {"prologue (to the bad-page branch)": [i for i in exp if i["addr"] <= b0],
+               "scale prep + fold vote": [i for i in exp if b0 < i["addr"] <= b1],
+               "loop A": [i for i in exp if b1 < i["addr"] <= b2],
+               "loop B": [i for i in exp if b2 < i["addr"] <= b3],
+               "zero fill (past the sequence end)": [i for i in exp if i["addr"] > b3]}
+        n_hmul = lambda sel: sum(1 for i in sel if i["op"].startswith("HMUL2"))
+        fold, two = (seg["loop A"], seg["loop B"]) if n_hmul(seg["loop A"]) == 32 else (seg["loop B"], seg["loop A"])
+        for name, sel in seg.items():
+            print(f"-- {name}: {len(sel)}  {fmt_hist(hist(sel))}")
+        steady = seg["prologue (to the bad-page branch)"] + seg["scale prep + fold vote"] + fold
+        print(f"== executed per lane per tile, folded scale (steady state): {len(steady)}")
+        print("   " + fmt_hist(hist(steady)))
+        print(f"== executed per lane per tile, two-multiply fallback: "
+              f"{len(steady) - len(fold) + len(two)}")
     if args.dump:
         role, part = args.dump.split("-")
         rn = "role" + role

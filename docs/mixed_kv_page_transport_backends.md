@@ -289,6 +289,105 @@ fence + arrive share, 7-9.5 % of converter time (0.2-0.3 us/tile) — J1's -0.1.
 -0.45.  Code-size cuts: not selected.  Spin/arbitration reduction (P0.5, [5]) is the remaining lever
 for the 20-27 % not_selected.
 
+### Phase 2 [16] + converter SASS audit — bit-placement decode, source-ordered conflict-free layout, hoisted lane constants (nkcut2 H200, 2026-09-04, wt/B)
+
+Baseline = post-[13] tree (`f4369f61`) rebuilt in its own checkout and workspace; every number below
+is an interleaved A/B (base, new, base, new, ...) under the GPU lock with the VLLM co-tenant present.
+Tool: `benchmarks/microbench/xqa_sm90_converter_sass.py --paths` (executed path of the steady state
+= prologue + scale prep/vote + the folded-scale loop), lineinfo build byte-identical to production.
+
+**What changed (sm90, BF16 math; sm120 keeps its native cvt path, `__CUDA_ARCH__ < 1000` guard).**
+1. E4M3 -> BF16 by bit placement: `PRMT` (byte spread + sign replicate) + `SHF` + `LOP3` per two
+   values gives bf16(x) * 2^-120 exactly (subnormals included; `mul.rn.bf16x2` handles subnormal
+   inputs); the 2^120 is folded into the per-block scale when every scale of the warp's tile stays
+   finite after the fold (one `__all_sync` vote per tile on fp32 `|s * global * 2^120| < 255.5 * 2^120`),
+   else one extra packed multiply per pair.  4 SASS per pair (3 + HMUL2) instead of 5
+   (F2FP.E4M3 -> 2 HADD2.F32 -> F2FP.BF16 -> HMUL2).  E2M1 likewise (placement = mag * 2^-126, fold
+   iff |s * global| < 4): 5 per pair with the fallback multiply, 4 folded, instead of the cutlass
+   LUT's 32 SASS per 8 values (= 8 per pair) + HMUL2.  Exactness argument: both operands keep their
+   mantissas, only exponents shift, so the product rounds identically as long as `scale * global` is
+   fp32-normal; `|global| >= 2^-117` is checked once per warp (below it: two-multiply form).
+2. Lane cut: lanes 0-15 = one page's 16 tokens at head part 0, 16-31 at part 1, so every 8-lane
+   LDS.128/STS.128 phase is 8 consecutive tokens of one part.  Stores are source-ordered (block b,
+   half g at chunk `(2b+g) ^ (token % 8)` = one lane base XOR an immediate, 7 LOP3 per tile) and
+   conflict-free; the previous (token = tid/2, p = tid%2) cut made every STS.128 2-way conflicted
+   (parts 0 and 1 of a token share bank groups) and the destination-ordered variant tried first
+   would have been 4-way.  E4M3 packed rows keep the 128 B swizzle (reads = lane base XOR b*16,
+   conflict-free); E2M1 packed rows now use an 80 B stride (5 chunks; bank group `5*token + c`
+   walks all 8 groups over 8 tokens), so the lane's 4 blocks are 32 contiguous bytes at immediate
+   offsets (2 LDS.128 [R+UR+imm]).  Compressed pages are cp.async-copied by the converters, so the
+   layout is free (no TMA box uses it).
+3. All lane constants (A16 row base, packed row bases, scale offset) are computed once per warp
+   (`ExpandLane`) and kept in registers; per tile the address work is one `IADD3/VIADD` of the stage
+   base per stream (the compiler emits `[R+UR+imm]` for the rest).  The old body recomputed ~45
+   address instructions per tile.  The zero-initialised `LdGrain first{}/second{}` (14 CS2R) and
+   the BSSY/BSYNC pairs are gone.
+
+**SASS, `xqa_mha_sm90.cuda.o` (K converter; V identical +-1).**
+
+| build | total SASS | REG / STACK | expandPackedStage static | executed per lane per tile (steady state) |
+|---|---|---|---|---|
+| fp4 post-[13] | 3360 | 45 / 0 | 394: PRMT 96, LOP3 78, SHF 27, IMAD 98, HMUL2 32, HADD2 4, F2FP 6, FMUL 4, LDS 3, STS 8, CS2R 14, UMOV 8, BRA 5 | ~385 |
+| fp4 [16] | 3344 | 48 / 0 | 399 (fold loop + two-multiply loop + zero fill) | **188**: PRMT 36, LOP3 39, SHF/IMAD.SHL 42, HMUL2 32, STS 8, LDS 3, F2FP 4, HADD2 4, FMUL 4, FMNMX 3, VOTE 1, FSETP 1, ISETP 1, IADD3/VIADD/U* 5, BRA 3, NOP 2 (fallback path 223) |
+| fp8 post-[13] | 3200 | 48 / 0 | 272: F2FP 70, HADD2 68, HMUL2 32, LOP3 15, IMAD 28, LEA 6, LDS 5, STS 8, CS2R 14, BRA 6 | ~262 |
+| fp8 [16] | 3472 | 48 / 0 | 390 | **187**: PRMT 36, LOP3 42, SHF/IMAD.SHL 34, HMUL2 32, STS 8, LDS 5, F2FP 4, HADD2 4, FMUL 4, FMNMX 3, VOTE 1, misc 14 (fallback 222) |
+| mixed post-[13] | 4096 | 48 / 16 | 600 | - |
+| mixed [16] | 4096 | 48 / 0 | 768 (both formats x fold/fallback) | - |
+| a16 | 2504 -> 2488 | 40 / 0 | - | - |
+
+Plan [16] verification items: HADD2.F32 in the converter body 68 -> 4 (the four block-scale
+conversions); F2FP 70 -> 4 (+2 static in the fallback); LOP3 for stores 16 -> 7; STACK 0 in every
+build (the mixed build's STACK 16 is gone; an intermediate version of this change with two more
+hoisted registers spilled 8 B there, fixed by recomputing the fold multiplier per tile in the mixed
+build only); 52/52 bit-exact on H200 (34-case matrix + tails + E4M3-subnormal + max-scale regimes;
+the max-scale regime drives the two-multiply fallback) and 52/52 on the RTX 5090 (sm120 path).
+
+**Audit of the remaining fp4 lane-tile (188).**  Essential 139: 32 PRMT + 32 SHF + 32 LOP3
+(placement) + 8 SHF (`w << 4`, one per packed word so both nibbles of a byte take the same shift)
++ 32 HMUL2 + 8 STS.128 + 2 LDS.128 + 1 LDS scale word.  Non-essential 49: scale conversion 13
+(SHF, 2 F2FP.E4M3, 4 HADD2.F32, 4 FMUL, 2 F2FP.BF16 pack — fp32 route required for bit-exactness
+with an arbitrary fp32 global scale), fold vote 6 (3 FMNMX, FSETP, VOTE, NOP), store XOR 7 (the
+TMA swizzle vs source order; unavoidable without SEL-based register permutation), addressing 6
+(ULEA/USHF/ULOP3/IMAD.U32/IADD3/VIADD: stage base and `scales[t % 4]`), 4 PRMT scale broadcasts
+(ptxas fused them into HMUL2 `.H0_H0/.H1_H1` in an earlier variant but not here), format test +
+branches 4, `__syncwarp` NOP 1.  The plan's <= 180 target assumed a 6-SASS LUT (48 PRMT essential);
+with the placement decode the floor is 139 + the 13 scale + 6 vote = 158 and the residual 30 is
+addressing/branch glue worth <= 0.15 us at 10.8 cyc/instr.  A further -32 (fold 2^126 into the E2M1
+scale) is already taken when the fold applies (|s * global| < 4, true for the bench's unit scales);
+the fallback costs +32 HMUL2 only for tiles with large block scales.
+
+**Trace (MIXED_KV_TRACE=3, CTA 0, tiles 2-7, 15 launches each, cycles at 1.98 GHz).**
+
+| segment | fp4 base -> new | fp8 base -> new | mixed base -> new |
+|---|---|---|---|
+| K expansion (s13-s12) | 1440 -> 750 | 1490 -> 816 | 2202 -> 1545 |
+| V expansion (s15-s14) | 1662 -> 1068 | 2118 -> 966 | 3736 -> 2465 |
+| K converter period | 2512 -> 2228 | 3160 -> 2432 | 4066 -> 2584 |
+| copy issue (s9-s8, includes the wait for the stage release) | 700 -> 1242 | 1088 -> 1100 | 1078 -> 1013 |
+| gemm0 cadence (s0(t)-s0(t-1)) | 2620 -> 2544 | 3268 -> 2702 | 3881 -> 3254 |
+| gemm0 K-wait (s0(t)-s3(t-1)) | 262 -> 312 | 870 -> 311 | 1012 -> 431 |
+
+The fp4 converter now waits for gemm0's stage release (copy-issue segment 700 -> 1242 while its own
+work shrank), i.e. the converter no longer paces fp4; fp8 and mixed lose 0.3-0.4 us of gemm0 cadence
+because the K-wait (converter late) collapses to the fp4 level.
+
+**Production bench (q=1, B=17, S=4096, 8 KV heads, GQA 4, D=128, bf16; `--repeats 5 --trials 5`,
+two interleaved rounds, medians in us; all four modes dispatch to `mha_sm90.cu`).**
+
+| mode | post-[13] base (r1/r2) | [16] (r1/r2) | delta |
+|---|---|---|---|
+| transport_a16 | 82.18 / 81.95 | 81.79 / 81.84 | -0.3 (noise) |
+| fp8 | 86.20 / 86.84 | 77.17 / 77.25 | **-9.3 us (-10.8 %)** |
+| fp4 | 90.78 / 91.01 | 73.12 / 73.34 | **-17.7 us (-19.4 %)** |
+| mixed | 106.91 / 108.17 | 83.38 / 83.53 | **-24.1 us (-22.4 %)** |
+
+Plan [16] predicted fp8 "245 -> ~213 SASS, -5 us or more"; measured 262 -> 187 executed and -9.3 us
+(accept).  The plan's fp4 gain from hoisting alone was -16 SASS / -0.09 us; the placement decode
+plus the layout/hoisting cut gives -197 SASS and -17.7 us.  The expansion segment scaled with the
+count (1440 -> 750 cyc for 385 -> 188 SASS), so the converter is count-bound here, not
+MIO-rate-bound; fp4 is now paced by gemm0 (consumer floor), so the next fp4 lever is on the consumer
+side ([4]/[7]/[8]) or in the copy-issue chain ([14]/[19]), not in the decode.
+
 ### P0.5 [34] — fair-share vs latency-bound discriminator (nkcut2 H200, fp4 build, converters skipped)
 
 Build: `-DMIXED_KV_EXPERIMENT=1 -DMIXED_KV_TRACE=1` (expansion skipped, copies still issued and

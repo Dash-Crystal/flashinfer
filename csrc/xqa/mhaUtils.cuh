@@ -411,12 +411,12 @@ __device__ inline uint32_t convertE4M3x2ToA16(uint16_t fp8x2) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   if constexpr (mha::is_same_v<A16, __nv_bfloat16>) {
     uint32_t bf16x2;
-    asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(bf16x2) : "h"(fp8x2));
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(bf16x2) : "h"(fp8x2));
     return bf16x2;
   }
 #endif
   uint32_t fp16x2;
-  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(fp16x2) : "h"(fp8x2));
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(fp16x2) : "h"(fp8x2));
   if constexpr (mha::is_same_v<A16, half>) {
     return fp16x2;
   } else {
@@ -432,7 +432,7 @@ __device__ inline uint32_t convertE2M1x2ToA16(uint8_t fp4x2) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   if constexpr (mha::is_same_v<A16, __nv_bfloat16>) {
     uint32_t bf16x2;
-    asm volatile(
+    asm(
         "{\n"
         ".reg .b8 fp4_byte;\n"
         "mov.b32 {fp4_byte, _, _, _}, %1;\n"
@@ -444,7 +444,7 @@ __device__ inline uint32_t convertE2M1x2ToA16(uint8_t fp4x2) {
   }
 #endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  asm volatile(
+  asm(
       "{\n"
       ".reg .b8 fp4_byte;\n"
       "mov.b32 {fp4_byte, _, _, _}, %1;\n"
@@ -537,6 +537,68 @@ __device__ inline uint32_t scaleA16x2Pair(uint32_t a16x2Bits, uint8_t scaleBits0
 template <flashinfer::KVPageFormat format, typename A16>
 __device__ inline void expandCompressedBlock16WithScale(uint32_t sf2, LdGrain& first,
                                                         LdGrain& second);
+
+// ---- sm90 BF16 decode by bit placement (no e4m3x2/e2m1x2 -> bf16x2 cvt before sm100) ----
+//
+// An E4M3 byte s eeee mmm placed into a BF16 lane as s at bit 15, eeee at bits [10:7] and
+// mmm at bits [6:4] is exactly x * 2^-120 for every finite code (the BF16 exponent field
+// holds the 4-bit exponent unbiased; E4M3 subnormals m * 2^-9 land as the BF16 subnormals
+// m * 2^-129, and mul.rn.bf16x2 handles subnormal inputs exactly - verified exhaustively
+// on H200).  Likewise an E2M1 nibble s ee m placed as s at bit 15, ee at bits [8:7] and m
+// at bit 6 is mag(n) * 2^-126.  The power of two is folded into the block scale (E4M3) or
+// undone by one extra packed multiply (E2M1, whose block scales reach 448 and would not fit
+// a 2^126 fold).  Per four values: two PRMT (byte spread + sign replicate), two shifts, two
+// masks - four SASS per pair with the multiply instead of the five of the f16 detour.
+__device__ inline uint32_t prmtSelfB32(uint32_t w, uint32_t selector) {
+  uint32_t d;
+  asm("prmt.b32 %0, %1, %1, %2;" : "=r"(d) : "r"(w), "r"(selector));
+  return d;
+}
+__device__ inline uint32_t prmtB32(uint32_t a, uint32_t b, uint32_t selector) {
+  uint32_t d;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(selector));
+  return d;
+}
+// Four E4M3 bytes (values 0..3 of a 16 B block word) -> BF16x2 pairs {v1:v0}, {v3:v2}, each
+// value scaled by 2^-120.
+__device__ inline void e4m3x4ToBF16x2Pow2m120(uint32_t w, uint32_t& lo, uint32_t& hi) {
+  // [rep(sign b1), b1, rep(sign b0), b0] and [rep(sign b3), b3, rep(sign b2), b2].
+  uint32_t const a = prmtSelfB32(w, 0x9180u);
+  uint32_t const b = prmtSelfB32(w, 0xB3A2u);
+  // << 4: byte -> bits [11:4] (sign copy at 11 cleared by the mask), replicated sign -> 15.
+  lo = (a << 4) & 0x87F087F0u;
+  hi = (b << 4) & 0x87F087F0u;
+}
+// Eight E2M1 nibbles (one packed word, value i = nibble i) -> four BF16x2 pairs, each value
+// scaled by 2^-126.  out[k] = {v(2k+1) : v(2k)} from byte k: the even nibble's sign is moved
+// to the byte's bit 7 by w << 4, the odd nibble's is there already.
+__device__ inline void e2m1x8ToBF16x2Pow2m126(uint32_t w, uint32_t (&out)[4]) {
+  uint32_t const w4 = w << 4;
+#pragma unroll
+  for (uint32_t k = 0; k < 4; k++) {
+    // [rep(sign w byte k), w byte k, rep(sign w4 byte k), w4 byte k]
+    uint32_t const sel = ((0xCu + k) << 12) | ((4u + k) << 8) | ((8u + k) << 4) | k;
+    uint32_t const a = prmtB32(w4, w, sel);
+    // << 2: s ee m of each nibble -> bits [9:6]; keep the replicated sign at 15 and ee m.
+    out[k] = (a << 2) & 0x81C081C0u;
+  }
+}
+// Four E4M3 block scales -> float, times `mul`.
+__device__ inline void e4m3x4ScalesToFloat(uint32_t scaleWord, float mul, float (&out)[4]) {
+  uint32_t lo16x2, hi16x2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo16x2) : "h"(static_cast<uint16_t>(scaleWord)));
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi16x2) : "h"(static_cast<uint16_t>(scaleWord >> 16)));
+  float2 const lo = __half22float2(reinterpret_cast<__half2 const&>(lo16x2));
+  float2 const hi = __half22float2(reinterpret_cast<__half2 const&>(hi16x2));
+  out[0] = lo.x * mul;
+  out[1] = lo.y * mul;
+  out[2] = hi.x * mul;
+  out[3] = hi.y * mul;
+}
+__device__ inline uint32_t bf16x2BitsFromFloats(float a, float b) {
+  __nv_bfloat162 const v = __float22bfloat162_rn(float2{a, b});
+  return reinterpret_cast<uint32_t const&>(v);
+}
 
 // Broadcast an A16 scale to both halves once per block; the per-pair multiply
 // is then a single mul.rn.{bf16,f16}x2.
