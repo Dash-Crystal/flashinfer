@@ -1191,3 +1191,67 @@ NaN) in the A16 reference rows; fp8 / fp4 / mixed x q 1, 64 = 6 cases.  Matrix:
 one `FENCE.VIEW.ASYNC.S`, two `SYNCS.ARRIVE`; K(last) site and drain site:
 `DEPBAR.LE SB0, 0x0`, one operand's exact body (6 x 51), one `SYNCS.ARRIVE`;
 `VOTE.ALL` 2 in the region; `IADD3.X` / `VIADD` <= 4 in the loop.
+
+### As written: F25d (dynamic module: predicated per-format copies, format-outer decode with hoisted votes)
+
+Files: `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh`,
+`tests/attention/run_fa3_mixed_page_transport.py`.  Not built or run here.
+
+**Chunk table.**  `chunk_store`'s dynamic arm is F24c's (masks in `tags[4],
+tags[5]`, `w7 = m8 | m4 << 8 | valid << 16 | flags << 24`).  `read_meta` is one
+arm for every module (two `LDS.128`: `pages[6], w6, w7`); `TileRegs::row_addr`
+/ `page_at` are gone.  The pending word is F25c's `(w7 & 0x03FFFFFF) | stage
+<< 30` - masks at bits 0-5 / 8-13.
+
+**Copies (C17).**  `copy_dynamic_page<FULL>(b, page, j, p8, p4, stage, valid,
+t)` per unrolled page `j` (`p8 = (m8 >> j) & 1`, `p4 = (m4 >> j) & 1`, `pa =
+!(p8 || p4)`, `leader = blk % 8 == 0`): six sources (`a16_src0/1 + page *
+a16_ps`, `page_src(p8 / s8 / p4 / s4, page, stride)`: six `IMAD.WIDE.U32`), four
+destinations (`a16_dst`, `land8`, `land4`, `sc_rd` + `stage * bytes` + `j *
+PAGE_REGION_BYTES` / `j * SCALE_PAGE_BYTES`), six predicated copies through the
+new `mixed_detail::cp16_pred / cp8_pred(smem, gmem, pred, src_size)` (PTX
+`setp.ne` + `@p cp.async ... cp-size, src-size`: a predicated-off lane issues
+nothing): `@pa` two 16 B A16 rows, `@p8` 16 B block, `@(p8 && leader)` 8 B
+scale row, `@p4` 8 B block, `@(p4 && leader)` 8 B scale row.  FULL: src-sizes
+are the immediates 16 / 8; partial (the two per-item calls): `n = v ? size : 0`
+per copied row (`tok0 + a_r`, `tok0 + a_r + 8`, `tok0 + r` against `valid`),
+sources unmodified.  `issue_tile_copies`'s dynamic arm is `for j in 0..5:
+copy_dynamic_page<FULL>(b, m.page(j), j, ...)` - no loop over set bits, no
+`__ffs`, no select on an address.
+
+**Decode.**  `expand_operand<VOTE>`'s dynamic arm: `__syncwarp()` first (every
+lane past its wait: the six scale slots are readable), `sw[j]` for the six
+pages at immediate offsets, per page `f = scale_byte_f32(sw[j])`, `ok8 &&=
+!in8 || fold_ok(f * gs8)`, `ok4 &&= !in4 || fold_ok(f * gs4)`, `hot8 =
+__all_sync(ok8)`, `hot4 = __all_sync(ok4)`, then `expand_format_pages<true,
+!hot8>(m8)` and `expand_format_pages<false, !hot4>(m4)` (each a uniform branch
+between two instantiations outside the loop; f16: the hot instantiations, no
+vote).  `expand_format_pages<FP8, EXACT>(prm, isK, e, b, m, t)`: `if (m == 0)
+return`; `i0, i1` = the first two set bits (`i1 = i0` if only one), `c0, c1` =
+their landings; loop: `n0, n1` = the next two set bits (`n0 = i0` if none, `n1
+= n0` if one), `sw0, sw1` (`LDS.32` at `i * 512`), `x0, x1` = the next pages'
+landings (issued before this step's stores), `sf0, sf1` (hot: `a16x2(f32(s) *
+gs)`; exact: `a16x2(f32(s) * g)` with `g` loaded once before the loop),
+`__syncwarp()`, `expand_block<FP8, EXACT>` for `i0` and for `i1`, `if (!more)
+break`, rotate.  An odd page count decodes its last page twice (idempotent: same
+values to the same chunks) instead of branching; when no page follows, the
+next-step loads re-read the current pages (before their stores).  The interim
+`expand_block_voted` of F25b is gone; `VOTE` is ignored by the dynamic arm (the
+votes are per format per operand at every site).
+
+**Tests.**  `_run_dynamic_uniform(mode, q_len)`: a pure fp8 / fp4 transport run
+through the dynamic module (`static_format = None`): 6 pages of one format per
+tile, the other mask 0, kv_len 285 (partial last page); 4 cases.  Matrix: 100 +
+4 = 104.  `a16_fp8_runs` (all-A16 tiles next to all-FP8 ones) and `a16_fp4`
+(0 FP8 pages with FP4 present) were already in the 64-case matrix.
+
+**Expected artifacts (6.1 dyn row).**  Per copy site 36 `LDGSTS` (six per
+page: 3 x `.128`, 3 x `.64`) each under a predicate, 36 `IMAD.WIDE.U32`, no
+`FLO` / `POPC` / `BRX` in the copy path, no `SEL` on an address register,
+`LDL / STL` 0 in the pair loop (the F24 32 B frame came from the rolled copy
+loops' hoisted bases; the unrolled body has none); per finish site 4
+`VOTE.ALL` (two formats x two operands) in the loop site, 2 in each
+single-operand site (the exact-only `VOTE = false` static path does not apply
+to the dynamic module: its votes stay), the format loops with one back-edge
+`BRA` each and their `WARPSYNC` (if emitted) before the two `STS.128` pairs.
+Count per pair per warp (bench mix): ~790 (3.5).

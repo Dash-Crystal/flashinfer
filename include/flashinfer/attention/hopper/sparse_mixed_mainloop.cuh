@@ -53,10 +53,12 @@
  * kMixedStaticFormat (MixedPageAttention<N>, module URI ..._static_format_N),
  * every page has that format at compile time: the a16 module compiles no tag
  * loads, no format branches and no expansion; the fp8/fp4 modules compile one
- * copy arm.  N = -1 is the dynamic module ([24c], C10): the chunk-table row
- * carries two 6-bit page masks (E4M3, E2M1) and the copy and expansion loops
- * are format-outer and page-rolled over the masks - one body per format, the
- * page index read from the table by LDS.32, no per-page format branch.
+ * copy arm.  N = -1 is the dynamic module ([24c] / [25d], C10 / C17): the
+ * chunk-table row carries two 6-bit page masks (E4M3, E2M1); the copies are six
+ * unrolled pages with predicated per-format cp.async (the mask bits are the
+ * predicates: no loop, no per-page branch, no select on an address) and the
+ * expansion loops are format-outer over the masks, two pages per step, the fold
+ * vote once per format per operand.
  *
  * K(t-1) and V(t) are issued as a pair ([25], C13 / C14): K(last) alone first
  * (finished before barrier_O, C7), then the peeled first pair (K(last-1),
@@ -282,6 +284,24 @@ CUTLASS_DEVICE void cp8_zfill(uint32_t smem, void const* gmem, bool pred) {
   int const n = pred ? 8 : 0;
   asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 8, %2;\n" ::"r"(smem), "l"(gmem),
                "r"(n));
+}
+// [25d] Predicated forms for the dynamic module's per-format copies (C17): the
+// PTX predicate keeps the copy one branch-free `@P LDGSTS` (a predicated-off
+// lane issues nothing - no zero-fill of a destination another lane fills), and
+// the src-size operand carries the D4 zero-fill of the partial arm.
+CUTLASS_DEVICE void cp16_pred(uint32_t smem, void const* gmem, bool pred, int src_size) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "setp.ne.b32 p, %2, 0;\n\t"
+      "@p cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %3;\n\t}" ::"r"(smem),
+      "l"(gmem), "r"(int(pred)), "r"(src_size));
+}
+CUTLASS_DEVICE void cp8_pred(uint32_t smem, void const* gmem, bool pred, int src_size) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "setp.ne.b32 p, %2, 0;\n\t"
+      "@p cp.async.ca.shared.global.L2::128B [%0], [%1], 8, %3;\n\t}" ::"r"(smem),
+      "l"(gmem), "r"(int(pred)), "r"(src_size));
 }
 CUTLASS_DEVICE void cp4(uint32_t smem, void const* gmem) {
   asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n" ::"r"(smem), "l"(gmem));
@@ -666,26 +686,16 @@ struct SparseMixedCollectiveMainloop {
     }
   }
 
-  // One tile's row of the chunk table in registers.  One struct, two shapes
-  // (the unused fields of either module are constant zero and dead after DCE):
-  //  * static modules: two LDS.128 fill `pages` (6 indices), `w6` (tags 0..3)
-  //    and `w7` (tags 4, 5 | valid << 16 | flags << 24); `row_addr` is unused;
-  //  * dynamic module ([24c], C10): one LDS.32 fills `w7` = m8 | m4 << 8 |
-  //    valid << 16 | flags << 24 and `row_addr` is the row's smem address;
-  //    `pages` and `w6` are 0 (the pending word is then w7 << 32 | stage << 60);
-  //    page indices are read from the row by LDS.32 (page_at), never from a
-  //    runtime-indexed register array (C2).
+  // One tile's row of the chunk table in registers (two LDS.128, every module):
+  // `pages` (6 indices), `w6` (static: tags 0..3; dynamic: unused) and `w7`
+  // (static: tags 4, 5 | valid << 16 | flags << 24; dynamic ([24c], C10): m8 |
+  // m4 << 8 | valid << 16 | flags << 24).
   struct TileRegs {
-    uint32_t pages[PAGES_PER_TILE];  // static modules only
-    uint32_t w6, w7;                 // w6: static modules only
-    uint32_t row_addr;               // dynamic module only
-    // Page index of tile page j (static modules); `j` is a constant after
-    // unrolling - never a runtime index into pages[] (C2: local memory).
+    uint32_t pages[PAGES_PER_TILE];
+    uint32_t w6, w7;
+    // Page index of tile page j; `j` is a constant after unrolling - never a
+    // runtime index into pages[] (C2: local memory).
     CUTLASS_DEVICE uint32_t page(uint32_t j) const { return pages[j]; }
-    // Dynamic module: page index of tile page i (runtime) from the table.
-    CUTLASS_DEVICE uint32_t page_at(uint32_t i) const {
-      return mixed_detail::lds32(row_addr + 4 * i);
-    }
     CUTLASS_DEVICE uint32_t mask8() const { return w7 & 0x3Fu; }
     CUTLASS_DEVICE uint32_t mask4() const { return (w7 >> 8) & 0x3Fu; }
     CUTLASS_DEVICE uint32_t valid() const { return (w7 >> 16) & 0xFFu; }
@@ -705,14 +715,9 @@ struct SparseMixedCollectiveMainloop {
 
   CUTLASS_DEVICE static TileRegs read_meta(TileMeta const (*meta)[CHUNK_TILES], int entry) {
     TileMeta const& e = meta[(entry / CHUNK_TILES) & 1][entry % CHUNK_TILES];
-    if constexpr (DYNAMIC) {
-      uint32_t const row_addr = cute::cast_smem_ptr_to_uint(&e);
-      return TileRegs{{0u, 0u, 0u, 0u, 0u, 0u}, 0u, mixed_detail::lds32(row_addr + 28u), row_addr};
-    } else {
-      uint4 const a = *reinterpret_cast<uint4 const*>(&e);
-      uint4 const b = *(reinterpret_cast<uint4 const*>(&e) + 1);
-      return TileRegs{{a.x, a.y, a.z, a.w, b.x, b.y}, b.z, b.w, 0u};
-    }
+    uint4 const a = *reinterpret_cast<uint4 const*>(&e);
+    uint4 const b = *(reinterpret_cast<uint4 const*>(&e) + 1);
+    return TileRegs{{a.x, a.y, a.z, a.w, b.x, b.y}, b.z, b.w};
   }
 
   // ------------------------------------------------------------------------
@@ -894,9 +899,9 @@ struct SparseMixedCollectiveMainloop {
   }
 
   // Page placement of one copy / expansion: the byte offset of the page's region
-  // from the operand base (static modules: j * PAGE_REGION_BYTES, an immediate;
-  // dynamic module: i * PAGE_REGION_BYTES, one IMAD), the same for the scale
-  // slot, and the page's first token for the D4 predicate.
+  // from the operand base (copies and static expansion: j * PAGE_REGION_BYTES, an
+  // immediate; dynamic expansion loops: i * PAGE_REGION_BYTES, one IMAD), the
+  // same for the scale slot, and the page's first token for the D4 predicate.
   struct PagePos {
     uint32_t off;     // + PAGE_REGION_BYTES multiple
     uint32_t sc_off;  // + SCALE_PAGE_BYTES multiple
@@ -973,17 +978,70 @@ struct SparseMixedCollectiveMainloop {
     }
   }
 
+  // [25d] One page of the dynamic module (C17).  Data flow: the page's format is
+  // two mask bits (p8, p4; A16 = neither), warp-uniform data from the chunk
+  // table.  Six source addresses by IMAD.WIDE.U32 from the six per-item bases
+  // (A16 rows u/16 and u/16 + 8, FP8 block, FP8 scale row, FP4 block, FP4 scale
+  // row) and six predicated cp.async of which exactly two execute:
+  //   @pa  16 B  row u/16       -> a16_dst          @pa  16 B  row u/16 + 8 -> a16_dst + ATOM
+  //   @p8  16 B  FP8 block      -> land8            @(p8 & leader)  8 B  FP8 scales -> sc_rd
+  //   @p4   8 B  FP4 block      -> land4            @(p4 & leader)  8 B  FP4 scales -> sc_rd
+  // A predicated-off copy issues nothing (no wavefront, no zero-fill), so the
+  // seven non-leader lanes never touch the row's scale slot.  Destinations are
+  // thread constants + stage * bytes + j * PAGE_REGION_BYTES (immediates).
+  // Control flow: none (no loop, no per-page branch, no select on an address).
+  // Partial arm (!FULL, the two per-item calls): the D4 predicate per copied row
+  // (A16 rows a_r, a_r + 8; compressed row r) becomes the src-size operand
+  // (16 / 8 or 0); the source is passed unmodified (in bounds; src-size 0 reads
+  // nothing).
+  template <bool FULL>
+  CUTLASS_DEVICE void copy_dynamic_page(OperandBases const& b, uint32_t page, uint32_t j, bool p8,
+                                        bool p4, uint32_t stage, uint32_t valid,
+                                        int thread_idx) const {
+    uint32_t const u = static_cast<uint32_t>(thread_idx);
+    bool const pa = !(p8 || p4);
+    bool const leader = blk_blk(u) == 0;
+    PagePos const pp = static_page(j);
+    void const* a0 = b.a16_src0 + uint64_t(page) * uint64_t(b.a16_ps);
+    void const* a1 = b.a16_src1 + uint64_t(page) * uint64_t(b.a16_ps);
+    void const* c8 = page_src(b.p8, page, b.p8_ps);
+    void const* s8 = page_src(b.s8, page, b.s8_ps);
+    void const* c4 = page_src(b.p4, page, b.p4_ps);
+    void const* s4 = page_src(b.s4, page, b.s4_ps);
+    uint32_t const dA = b.a16_dst + stage * STAGE_BYTES + pp.off;
+    uint32_t const d8 = b.land8 + stage * STAGE_BYTES + pp.off;
+    uint32_t const d4 = b.land4 + stage * STAGE_BYTES + pp.off;
+    uint32_t const ds = b.sc_rd + stage * SCALE_STAGE_BYTES + pp.sc_off;
+    int n0 = 16, n1 = 16, nc16 = 16, nc8 = 8;
+    if constexpr (!FULL) {
+      uint32_t const a_r = u / CHUNKS_PER_ROW;
+      n0 = pp.tok0 + a_r < valid ? 16 : 0;
+      n1 = pp.tok0 + a_r + 8 < valid ? 16 : 0;
+      bool const vc = pp.tok0 + blk_row(u) < valid;
+      nc16 = vc ? 16 : 0;
+      nc8 = vc ? 8 : 0;
+    } else {
+      (void)valid;
+    }
+    mixed_detail::cp16_pred(dA, a0, pa, n0);
+    mixed_detail::cp16_pred(dA + ATOM_BYTES, a1, pa, n1);
+    mixed_detail::cp16_pred(d8, c8, p8, nc16);
+    mixed_detail::cp8_pred(ds, s8, p8 && leader, nc8);
+    mixed_detail::cp8_pred(d4, c4, p4, nc8);
+    mixed_detail::cp8_pred(ds, s4, p4 && leader, nc8);
+  }
+
   template <bool FULL>
   CUTLASS_DEVICE void issue_tile_copies(Params const& p, OperandBases const& b, TileRegs const& m,
                                         uint32_t stage, bool isK, int kv_head_idx,
                                         int thread_idx) const {
+    (void)p; (void)isK; (void)kv_head_idx;
     uint32_t const valid = m.valid();
-    uint32_t const a16_dst_stage = b.a16_dst + stage * STAGE_BYTES;
     if constexpr (!DYNAMIC) {
       // Static modules: unrolled over the six tile pages - the body is a handful
       // of instructions per page with immediate destinations; rolled loop
       // control cost as much as the copies.
-      (void)p; (void)isK; (void)kv_head_idx;
+      uint32_t const a16_dst_stage = b.a16_dst + stage * STAGE_BYTES;
 #pragma unroll
       for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) {
         uint32_t const page = m.page(j);
@@ -997,52 +1055,13 @@ struct SparseMixedCollectiveMainloop {
         }
       }
     } else {
-      // [24c] Dynamic module, [40]'s pattern (C10): format-outer, page-rolled.
-      // Data flow: the tile's two 6-bit masks (chunk table, w7); the six page
-      // indices are read from the table row up front with independent LDS.32
-      // into scalars - one smem latency per tile, off the copy issue path - and
-      // selected per page by a constant-unrolled compare/select chain on i (C2:
-      // no runtime index into a register array, no LDS on the LDGSTS address
-      // chain); destinations base + i * PAGE_REGION_BYTES (one IMAD).  Control
-      // flow: per format one rolled loop over the set bits, three warp-uniform
-      // loops (FP8, FP4, A16) with one copy body each and no per-page format
-      // branch.  Every quantity here is warp-uniform data from smem, so the
-      // loops never diverge.  ([25d] replaces this arm.)
+      // [25d] Dynamic module (C17): six unrolled pages, format by predication.
       uint32_t const m8 = m.mask8();
       uint32_t const m4 = m.mask4();
-      uint32_t const ma = 0x3Fu & ~(m8 | m4);
-      uint32_t pg[PAGES_PER_THREAD];
 #pragma unroll
-      for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) {
-        pg[j] = m.page_at(j);
-      }
-      auto const page_of = [&pg](uint32_t i) {
-        uint32_t r = pg[0];
-#pragma unroll
-        for (uint32_t k = 1; k < PAGES_PER_THREAD; ++k) r = (i == k) ? pg[k] : r;
-        return r;
-      };
-      (void)p; (void)isK; (void)kv_head_idx;
-      if (m8) {
-#pragma unroll 1
-        for (uint32_t mm = m8; mm; mm &= mm - 1) {
-          uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP8, FULL>(b, page_of(i), dynamic_page(i), stage, valid,
-                                              thread_idx);
-        }
-      }
-      if (m4) {
-#pragma unroll 1
-        for (uint32_t mm = m4; mm; mm &= mm - 1) {
-          uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP4, FULL>(b, page_of(i), dynamic_page(i), stage, valid,
-                                              thread_idx);
-        }
-      }
-#pragma unroll 1
-      for (uint32_t mm = ma; mm; mm &= mm - 1) {
-        uint32_t const i = __ffs(mm) - 1;
-        copy_a16_page<FULL>(b, page_of(i), dynamic_page(i), a16_dst_stage, valid, thread_idx);
+      for (uint32_t j = 0; j < PAGES_PER_TILE; ++j) {
+        copy_dynamic_page<FULL>(b, m.page(j), j, ((m8 >> j) & 1u) != 0u, ((m4 >> j) & 1u) != 0u,
+                                stage, valid, thread_idx);
       }
     }
   }
@@ -1280,14 +1299,13 @@ struct SparseMixedCollectiveMainloop {
   // cold arm alone: reference-exact for every finite input, no vote.
   // f16 modules: no fold, the hot arm with the plain scale, no vote.
   //
-  // Dynamic module: F24c's format-outer loops with F25b's block shape; the
-  // operand's __syncwarp is met first (scale slots of every page), each step's
-  // __syncwarp before its stores.  Replaced by F25d.
+  // Dynamic module ([25d]): see the arm below.
   template <bool VOTE>
   CUTLASS_DEVICE void expand_operand(Params const& prm, bool isK, OperandBases const& b,
                                      uint32_t tv, int stage, uint32_t t) const {
     ExpandBases const e = expand_bases(b, uint32_t(stage), t);
     if constexpr (!DYNAMIC) {
+      (void)tv;  // the static modules' pending word carries only the stage
       constexpr bool FP8 = STATIC_FP8;
       constexpr uint32_t N = PAGES_PER_THREAD;
       Packed pk[N];
@@ -1315,81 +1333,110 @@ struct SparseMixedCollectiveMainloop {
         expand_static_arm<FP8, false>(prm, isK, e, b, pk, sw, v, t);
       }
     } else {
-      // [24c] Dynamic module (C10): format-outer, page-rolled over the pending
-      // word's masks.  The FP8 loop's first page and the FP4 loop's first page
-      // are loaded up front (packed halves + scale word), so the FP4 loop's
-      // first load latency hides under the FP8 expansion; inside a loop the
-      // next page's loads are issued before this page's stores.  Two
-      // warp-uniform rolled loops with one expansion body each; page offsets
-      // by IMAD; no per-page format branch, no runtime-indexed register array.
-      __syncwarp();  // every lane past its wait: lane 0's scale slots are readable
-      uint32_t m8 = pending_mask8(tv);
-      uint32_t m4 = pending_mask4(tv);
-      uint32_t i8 = 0, i4 = 0;
-      Packed c8{}, c4{};
-      uint32_t sw8 = 0, sw4 = 0;
-      if (m8) {
-        i8 = __ffs(m8) - 1;
-        c8 = load_packed<true>(e, dynamic_page(i8).off);
-        sw8 = mixed_detail::lds32(e.sc + dynamic_page(i8).sc_off);
-      }
-      if (m4) {
-        i4 = __ffs(m4) - 1;
-        c4 = load_packed<false>(e, dynamic_page(i4).off);
-        sw4 = mixed_detail::lds32(e.sc + dynamic_page(i4).sc_off);
-      }
-      expand_format_pages<true>(prm, isK, e, b, m8, i8, c8, sw8, t);
-      expand_format_pages<false>(prm, isK, e, b, m4, i4, c4, sw4, t);
-    }
-  }
-
-  // One block of the dynamic module with a per-block vote (F24a's form; interim
-  // until F25d hoists the vote per format per operand).  The __syncwarp orders
-  // every lane's loads of the page before any lane's stores of it (A7).
-  template <bool FP8>
-  CUTLASS_DEVICE void expand_block_voted(Params const& prm, bool isK, ExpandBases const& e,
-                                         OperandBases const& b, Packed const& p, uint32_t sw,
-                                         uint32_t off, uint32_t t) const {
-    float const v = scale_product<FP8>(b, sw, t);
-    if constexpr (FOLDS) {
-      if (__all_sync(0xFFFFFFFFu, fold_ok(v))) {
-        __syncwarp();
-        expand_block<FP8, false>(e, p, a16x2_broadcast(v), off);
-      } else {
-        uint32_t const sf2 = a16x2_broadcast(mixed_detail::mul_rn_f32_denorm(
-            scale_byte_f32(sw, sc_sel(t)), global_plain<FP8>(prm, isK)));
-        __syncwarp();
-        expand_block<FP8, true>(e, p, sf2, off);
-      }
-    } else {
+      // [25d] Dynamic module (C10 / C17).  Data flow: (1) __syncwarp - every
+      // lane is past its cp.async.wait_group, so lane 0's landed scale slots of
+      // all six pages are readable by the row's lanes from here on (A9); (2) the
+      // six scale words at immediate offsets and, per page, f32(s_j) once, its
+      // two products with gs8 / gs4 and the two fold tests, each masked by the
+      // page's format bit (A16 pages and the other format's pages do not vote;
+      // their slots hold stale bytes, which is harmless); (3) one VOTE.ALL per
+      // format and one uniform branch per format choosing the hot or the exact
+      // loop body; (4) the format loops (expand_format_pages), two pages per
+      // step.  Control flow: two uniform branches outside the loops; the loop
+      // bodies carry only their back-edge.  f16 (no fold): the hot bodies.
       __syncwarp();
-      expand_block<FP8, false>(e, p, a16x2_broadcast(v), off);
+      uint32_t const m8 = pending_mask8(tv);
+      uint32_t const m4 = pending_mask4(tv);
+      if constexpr (FOLDS) {
+        constexpr uint32_t N = PAGES_PER_TILE;
+        uint32_t sw[N];
+#pragma unroll
+        for (uint32_t j = 0; j < N; ++j) sw[j] = mixed_detail::lds32(e.sc + static_page(j).sc_off);
+        bool ok8 = true, ok4 = true;
+#pragma unroll
+        for (uint32_t j = 0; j < N; ++j) {
+          float const f = scale_byte_f32(sw[j], sc_sel(t));
+          bool const in8 = ((m8 >> j) & 1u) != 0u;
+          bool const in4 = ((m4 >> j) & 1u) != 0u;
+          ok8 = ok8 && (!in8 || fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs8)));
+          ok4 = ok4 && (!in4 || fold_ok(mixed_detail::mul_rn_f32_denorm(f, b.gs4)));
+        }
+        bool const hot8 = __all_sync(0xFFFFFFFFu, ok8);
+        bool const hot4 = __all_sync(0xFFFFFFFFu, ok4);
+        if (hot8) {
+          expand_format_pages<true, false>(prm, isK, e, b, m8, t);
+        } else {
+          expand_format_pages<true, true>(prm, isK, e, b, m8, t);
+        }
+        if (hot4) {
+          expand_format_pages<false, false>(prm, isK, e, b, m4, t);
+        } else {
+          expand_format_pages<false, true>(prm, isK, e, b, m4, t);
+        }
+      } else {
+        expand_format_pages<true, false>(prm, isK, e, b, m8, t);
+        expand_format_pages<false, false>(prm, isK, e, b, m4, t);
+      }
     }
   }
 
-  // [24c] One format's pages of a pending tile (dynamic module).  `m` is the
-  // page mask; page `i` (its lowest set bit) is already loaded into `cur`, `sw`.
-  // Each step issues the next page's loads, expands the current page, advances.
-  template <bool FP8>
+  // [25d] One format's pages of a pending tile (dynamic module), one arm (EXACT
+  // = the cold two-multiply form).  `m` is the page mask (warp-uniform).  Data
+  // flow per step: the two current pages' scale words (LDS.32 at i * 512; the
+  // slots are readable: the operand's __syncwarp precedes this loop) and scale
+  // factors, the next step's landing loads (this thread's own copies; issued
+  // before this step's stores so their latency hides under the decode), then
+  // __syncwarp, then the two block bodies.  Hazards: the landing chunk a lane
+  // reads is another lane's output chunk of the same page; every lane's loads
+  // of a page are issued at or before the step preceding its stores and the
+  // step's __syncwarp orders them before any lane's stores (A7).  Different
+  // pages are disjoint.  An odd page count makes the last step's second page
+  // equal its first: the duplicate decode stores the same values to the same
+  // chunks (idempotent) - no branch on the page count; when no page follows,
+  // the "next" loads re-read the current pages (harmless: before their stores).
+  // Control flow: one rolled loop, back-edge only; the FP8 and FP4 loops touch
+  // disjoint pages.
+  template <bool FP8, bool EXACT>
   CUTLASS_DEVICE void expand_format_pages(Params const& prm, bool isK, ExpandBases const& e,
-                                          OperandBases const& b, uint32_t m, uint32_t i,
-                                          Packed cur, uint32_t sw, uint32_t t) const {
+                                          OperandBases const& b, uint32_t m, uint32_t t) const {
     if (m == 0) return;  // warp-uniform
+    float g = 0.f;
+    if constexpr (EXACT) g = global_plain<FP8>(prm, isK);
+    (void)prm; (void)isK;
+    uint32_t i0 = __ffs(m) - 1;
+    m &= m - 1;
+    uint32_t i1 = m ? __ffs(m) - 1 : i0;
+    m &= m - 1;
+    Packed c0 = load_packed<FP8>(e, dynamic_page(i0).off);
+    Packed c1 = load_packed<FP8>(e, dynamic_page(i1).off);
 #pragma unroll 1
     for (;;) {
-      m &= m - 1;
-      uint32_t const n = m ? __ffs(m) - 1 : 0u;
-      Packed next{};
-      uint32_t nsw = 0;
-      if (m) {
-        next = load_packed<FP8>(e, dynamic_page(n).off);
-        nsw = mixed_detail::lds32(e.sc + dynamic_page(n).sc_off);
+      bool const more = m != 0;
+      uint32_t const n0 = more ? __ffs(m) - 1 : i0;
+      uint32_t mm = m & (m - 1);
+      uint32_t const n1 = mm ? __ffs(mm) - 1 : n0;
+      mm &= mm - 1;
+      uint32_t const sw0 = mixed_detail::lds32(e.sc + dynamic_page(i0).sc_off);
+      uint32_t const sw1 = mixed_detail::lds32(e.sc + dynamic_page(i1).sc_off);
+      Packed const x0 = load_packed<FP8>(e, dynamic_page(n0).off);
+      Packed const x1 = load_packed<FP8>(e, dynamic_page(n1).off);
+      uint32_t sf0, sf1;
+      if constexpr (EXACT) {
+        sf0 = a16x2_broadcast(mixed_detail::mul_rn_f32_denorm(scale_byte_f32(sw0, sc_sel(t)), g));
+        sf1 = a16x2_broadcast(mixed_detail::mul_rn_f32_denorm(scale_byte_f32(sw1, sc_sel(t)), g));
+      } else {
+        sf0 = a16x2_broadcast(scale_product<FP8>(b, sw0, t));
+        sf1 = a16x2_broadcast(scale_product<FP8>(b, sw1, t));
       }
-      expand_block_voted<FP8>(prm, isK, e, b, cur, sw, dynamic_page(i).off, t);
-      if (m == 0) break;
-      i = n;
-      cur = next;
-      sw = nsw;
+      __syncwarp();  // every lane's loads of pages i0, i1 before any lane's stores of them
+      expand_block<FP8, EXACT>(e, c0, sf0, dynamic_page(i0).off);
+      expand_block<FP8, EXACT>(e, c1, sf1, dynamic_page(i1).off);
+      if (!more) break;
+      i0 = n0;
+      i1 = n1;
+      c0 = x0;
+      c1 = x1;
+      m = mm;
     }
   }
 
