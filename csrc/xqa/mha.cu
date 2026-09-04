@@ -120,9 +120,24 @@ constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #else
-#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+#elif __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+// Track W [26]: sm120 decode is request-rate-bound (P0.8 (b)/(c)); 128 B K parts make every
+// compressed K copy fetch whole 64 B (FP8) / 32 B (FP4) runs of the token row instead of one
+// 32 B / 16 B fragment (K line requests per SM-tile 1024 -> 512).  cacheVTileSeqLen 16 pays for
+// the 32 KB larger K ring inside the 99 KB SharedMem cap (K 64 KB + V 16 KB + Q 4 KB + X 8 KB).
+// Only the mixed-page transport build (CACHE_ELEM_ENUM 5, A16 tiles) takes it: SPEC_DEC
+// (warpTile.y 32: Q 8 KB + X 16 KB) does not fit, and the native block-scaled builds (3/4)
+// copy 4 B scale grains that need >= 32 V rows per warp pair; those keep 64/32.
+#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC
+constexpr uint32_t preferedKHeadPartBytes = 128;
+__constant__ constexpr uint32_t cacheVTileSeqLen = 16;
+#else
+constexpr uint32_t preferedKHeadPartBytes = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+#endif
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;

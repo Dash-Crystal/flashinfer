@@ -255,6 +255,12 @@ __device__ inline bool needsMixedPageExpansion(
 #define MIXED_KV_PROBE_C 0
 #endif
 
+// FP8 block payload copy in the expansion form: 0 = two 8 B cp.async.ca, 1 = one 16 B
+// cp.async.ca (default), 2 = one 16 B cp.async.cg (measurement only, see below).
+#ifndef MIXED_FP8_COPY
+#define MIXED_FP8_COPY 1
+#endif
+
 // Preserve copyPartialHeadsAsync's warp ownership and circular-buffer
 // schedule. Each lane owns one 16-value block. Compressed payload occupies
 // the first A16 grain; its single scale byte is staged in the second grain.
@@ -383,12 +389,24 @@ __device__ inline void copyMixedPartialHeadsAsync(
       if (!probeTaken) {
         // Expansion form: expandMixedPartialHeadsInPlace rewrites `second` (and, for
         // FP4, the upper 8 B of `first`) from the packed payload before anything reads
-        // them, so those grains are not zero-filled here: 3 -> 2 (FP8) / 1 (FP4) LDGSTS
-        // per block.  A16 blocks copy their full 32 B.  `format` is warp-uniform.
-        ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
-        if (!isFP4) {
+        // them, so those grains are not zero-filled here.  One LDGSTS per compressed
+        // block: FP4 8 B, FP8 the whole 16 B packed block as one L1-allocating
+        // cp.async.ca (Track W [26]; was two 8 B halves.  cp.async.cg 16 B measured
+        // 122 -> 177 us on the sm120 fp8 q=4 build: the L1-bypassing path does not
+        // merge the lanes' 16 B pieces of a sector).  A16 blocks copy their full 32 B.
+        // `format` is warp-uniform.
+        if (isFP4) {
+          ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
+        } else {
+#if MIXED_FP8_COPY == 0
+          ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
           ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(first) + 8, firstSource + 8,
                                valid ? 8U : 0U);
+#elif MIXED_FP8_COPY == 1
+          ldgsts::copyAsyncCa16(first, firstSource, valid ? 16U : 0U);
+#else
+          ldgsts::copyAsync<grainBytes>(first, firstSource, valid ? grainBytes : 0U);
+#endif
         }
         if (isA16) {
           ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
