@@ -918,7 +918,7 @@ __device__ inline void expandMixedPartialHeadsInPlace(
 
 // ---- [44] Track S step 6 (sm90 SPEC_DEC bf16 build): placement decode + folded scale ----
 //
-// Selected by mha.cu's kMixedBF16PlacementExpansion at the two expansion call sites; every
+// Selected by mha.cu's MIXED_BF16_PLACEMENT_EXPANSION at the two expansion call sites; every
 // other build keeps expandMixedPartialHeadsInPlace above byte-for-byte.  The block expanders
 // mirror mha_sm90.cu's expandE4M3BlockBF16 / expandE2M1BlockBF16 (that file is owned by another
 // track and is not included here).
@@ -997,29 +997,40 @@ __device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t pa
 }
 
 // In-place expansion of one 128 B K part (maxNbCopiedHeads rows) or one 32-row V half-tile
-// with the bit-placement decode and the block scale folded with 2^k.  Same lane ownership as
-// expandMixedPartialHeadsInPlace: lane l owns block b = l % 4 of rows r0 = 16 * span + l / 4
-// and r1 = r0 + 8 (the copy's own lanes, mhaUtils.cuh copyMixedPartialHeadsAsync: blockInSpan =
-// 32 * iteration + lane).  Geometry is fixed by static_assert (128 B parts, 16-token pages, 4 B
-// scale words, one warp, 128 B swizzled rows); any other instantiation fails to compile.
+// with the bit-placement decode and the block scale folded with 2^k, half-row owner cut: lane l
+// owns token tok = l % 16 of the span (page) and blocks 2h, 2h+1 with h = l / 16 (32 values), so
+// the scale pair is one LDS.U16 and the vote / scale prep amortise over 32 values.  The copy's
+// ownership is different (blockInSpan = 32 * iteration + lane: row lane / 4 + 8 * iteration,
+// block lane % 4), hence the __syncwarp on entry.  Geometry is fixed by static_assert (128 B
+// parts, 16-token pages, 4 B scale words, one warp, 128 B swizzled rows); any other
+// instantiation fails to compile.
 //
 // Data flow, one call:
 //   tile rows (128 B, physical grain = logical ^ (row % 8)); compressed block b of a row sits in
 //   logical grain 2b (FP8: 16 B; FP4: 8 B in the low half), staged by the copy; one 4 B scale
 //   word per row (byte b = E4M3 block scale of block b), staged by the copy's scale loop.
-//   Per span and lane: 2 x LDS.U8 (scales of rows r0, r1) -> fp32 s_i (exact) -> f_i = s_i * g
-//   * 2^k -> warp vote -> [fold body] sf2_i = bf16x2(f_i) | [fallback] sf2_i = bf16x2(s_i * g);
-//   per row: LDS.128 / LDS.64 of grain 2b -> placement decode -> (fallback: x 2^k) -> x sf2 ->
-//   2 x STS.128 to grains 2b, 2b+1 of the same row.  Every address is a lane constant plus a
-//   span / row immediate (r % 8 = l / 4 for every row a lane owns, so the swizzle XOR is
-//   lane-constant; rows advance by 8 / 16).
+//   Lane: row r = 16 * span + tok, x = tok % 8 = r % 8 for every span; logical grains 4h + j
+//   (j = 0..3) are physical (4h ^ x) ^ j - a permutation of one 4-aligned group that depends on
+//   x & 3, so the lane holds four u32 addresses a_j = tileBase + byteOffset(tok, 4h + j), each
+//   used as [a_j + 2048 * span]; the scale pair is bytes 2h, 2h+1 of the row's word:
+//   [scales + 4 * tok + 2h + 64 * span].
+//   Per span: LDS.U16 -> fp32 s_0, s_1 (exact) -> f_i = s_i * g * 2^k -> warp vote ->
+//   [fold] sf2_i = bf16x2(f_i) | [fallback] sf2_i = bf16x2(s_i * g);
+//   block 2h:   LDS.128 / LDS.64 [a_0] -> placement decode -> (fallback: x 2^k) -> x sf2_0 ->
+//               STS.128 [a_0], STS.128 [a_1]
+//   block 2h+1: LDS.128 / LDS.64 [a_2] -> ... x sf2_1 -> STS.128 [a_2], STS.128 [a_3]
+//   A lane writes only grains it alone reads (its sources a_0, a_2 are among its outputs), so no
+//   barrier is needed between its loads and stores.  Bank behaviour: an 8-lane LDS/STS phase is
+//   8 consecutive rows at one logical grain -> 8 distinct physical grains, conflict-free; the
+//   LDS.U16 phase reads 16 consecutive words (lanes 16-31 the same words' upper halves).
 // Control flow:
-//   __syncwarp  (cp.async.wait_group completes the executing thread's copies only; the scale
-//                word of a row was copied by lane row % 32, not by the lanes that read it)
+//   __syncwarp  (cp.async.wait_group completes the executing thread's copies only; the payload
+//                grains of row tok were copied by lanes 4 * (tok % 8) + 2h, + 2h + 1 at
+//                iteration tok / 8, the scale word by lane tok + 16 * (span % 2))
 //   for span (unrolled in static modules, rolled in the dynamic one):
 //     format (warp-uniform: per-page tag; the dynamic module branches, static ones fold)
 //     scales -> vote (convergent: inside the warp-uniform branch, all 32 lanes)
-//     fold ? body<true> : body<false>   (both straight-line over the lane's two rows)
+//     fold ? body<true> : body<false>   (both straight-line over the lane's two blocks)
 //   __syncwarp  (before the warp's ldmatrix reads)
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, uint32_t dstNbHeads,
           uint32_t dstNbGrains, uint32_t nbPages, typename _LdGrain>
@@ -1040,13 +1051,13 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   constexpr uint32_t headsPerSpan = mha::min(tokensPerPage, maxNbCopiedHeads);
   static_assert(headsPerSpan == 16 && maxNbCopiedHeads % headsPerSpan == 0);
   constexpr uint32_t nbSpans = exactDiv(maxNbCopiedHeads, headsPerSpan);
-  static_assert(headsPerSpan * blocksPerPart == 2 * warp_size, "two rows per lane per span");
+  static_assert(headsPerSpan * blocksPerPart == 2 * warp_size,
+                "one row and two adjacent blocks per lane per span");
   static_assert(mha::max(4U, blocksPerPart) == 4, "4 B scale word per row (scaleLoadBytes)");
   constexpr uint32_t scaleRowBytes = 4;
-  constexpr uint32_t rowsPerIter = exactDiv(warp_size, blocksPerPart);  // 8
-  static_assert(rowsPerIter % 8 == 0 && headsPerSpan % 8 == 0,
-                "row + 8k keeps row % 8: the swizzle term is a lane constant");
-  constexpr uint32_t rowStepBytes = rowsPerIter * Tile::rowBytes;         // 1024
+  constexpr uint32_t blocksPerLane = exactDiv(blocksPerPart, exactDiv(warp_size, headsPerSpan));
+  static_assert(blocksPerLane == 2);
+  static_assert(headsPerSpan % 8 == 0, "row + 16 span keeps row % 8: lane-constant swizzle term");
   constexpr uint32_t spanTileBytes = headsPerSpan * Tile::rowBytes;       // 2048
   constexpr uint32_t spanScaleBytes = headsPerSpan * scaleRowBytes;       // 64
   constexpr uint32_t pageLoopUnroll = mixedPageLoopUnroll(nbSpans);
@@ -1060,15 +1071,17 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   // group visible to all lanes (the compact path has the same barrier at both sites).
   __syncwarp();
 
-  // Lane constants.  rowInSpan0 = r % 8 for every row this lane touches.
+  // Lane constants: token tok of every span (row % 8 = tok % 8 for all spans), block pair h.
   uint32_t const lane = laneId();
-  uint32_t const blockInPart = lane % blocksPerPart;
-  uint32_t const rowInSpan0 = lane / blocksPerPart;
+  uint32_t const tok = lane % headsPerSpan;
+  uint32_t const h = lane / headsPerSpan;
+  uint32_t const grain0 = blocksPerLane * 2 * h;  // logical grain of block 2h = 4h
   uint32_t const tileBase = smemAddr(&dst);
-  uint32_t const addrA = tileBase + Tile::template byteOffset<swizzle>(rowInSpan0, 2 * blockInPart);
-  uint32_t const addrB =
-      tileBase + Tile::template byteOffset<swizzle>(rowInSpan0, 2 * blockInPart + 1);
-  uint32_t const scaleAddr = smemAddr(scales) + rowInSpan0 * scaleRowBytes + blockInPart;
+  uint32_t const addr0 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 0);
+  uint32_t const addr1 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 1);
+  uint32_t const addr2 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 2);
+  uint32_t const addr3 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 3);
+  uint32_t const scaleAddr = smemAddr(scales) + tok * scaleRowBytes + blocksPerLane * h;
 
   auto const expandSpan = [&](uint32_t span, auto formatTag) {
     constexpr uint8_t formatValue = decltype(formatTag)::value;
@@ -1080,10 +1093,9 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     bool const foldOk = fabsf(g) >= 0x1p-117f;     // every s * g fp32-normal
     uint32_t const tileOff = span * spanTileBytes;
     uint32_t const scaleOff = span * spanScaleBytes;
-    uint32_t const s0 = ldsU8(scaleAddr + scaleOff);
-    uint32_t const s1 = ldsU8(scaleAddr + scaleOff + rowsPerIter * scaleRowBytes);
+    uint32_t const s01 = ldsU16(scaleAddr + scaleOff);  // scales of blocks 2h (lo), 2h+1 (hi)
     float r0, r1;
-    e4m3x2ScalesToFloat(s0 | (s1 << 8), r0, r1);
+    e4m3x2ScalesToFloat(s01, r0, r1);
     float const f0 = r0 * gFold;
     float const f1 = r1 * gFold;
     bool const fold = foldScalePairFinite(f0, f1, foldOk);
@@ -1092,10 +1104,8 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
       constexpr bool kFold = decltype(foldTag)::value;
       uint32_t const sf2_0 = kFold ? bf16x2Broadcast(f0) : bf16x2Broadcast(r0 * g);
       uint32_t const sf2_1 = kFold ? bf16x2Broadcast(f1) : bf16x2Broadcast(r1 * g);
-      // One row: grain 2b (a) holds the packed block; outputs go to grains 2b (a), 2b+1 (b).
-      auto const row = [&](uint32_t rowOff, uint32_t sf2) {
-        uint32_t const a = addrA + rowOff;
-        uint32_t const b = addrB + rowOff;
+      // One block: grain a holds the packed block; outputs go to grains a, b (logical 2b, 2b+1).
+      auto const block = [&](uint32_t a, uint32_t b, uint32_t sf2) {
         LdGrain out[2];
         if constexpr (isFP8) {
           LdGrain const packed = ldsGrain(a);
@@ -1108,8 +1118,8 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
         stsGrain(a, out[0]);
         stsGrain(b, out[1]);
       };
-      row(tileOff, sf2_0);                 // row r0 = 16 * span + lane / 4
-      row(tileOff + rowStepBytes, sf2_1);  // row r1 = r0 + 8
+      block(addr0 + tileOff, addr1 + tileOff, sf2_0);  // block 2h   (logical grains 4h, 4h+1)
+      block(addr2 + tileOff, addr3 + tileOff, sf2_1);  // block 2h+1 (logical grains 4h+2, 4h+3)
     };
     if (fold) {
       body(MixedFoldTag<true>{});

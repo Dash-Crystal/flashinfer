@@ -630,7 +630,7 @@ buy nothing.
 
 ## 8. As written (code state of this worktree; updated per commit)
 
-### 8.1 Item 1 — placement decode + fold vote (`expandMixedPartialHeadsInPlaceBF16Placement`, today's lane ownership)
+### 8.1 Item 1 — placement decode + fold vote (`expandMixedPartialHeadsInPlaceBF16Placement`)
 
 Files: `csrc/xqa/mhaUtils.cuh` (new helpers after `expandMixedPartialHeadsInPlace`: `ldsU16`,
 `ldsB64`, `e4m3x2ScalesToFloat`, `bf16x2Broadcast`, `MixedFoldTag`, `foldScalePairFinite`,
@@ -638,54 +638,75 @@ Files: `csrc/xqa/mhaUtils.cuh` (new helpers after `expandMixedPartialHeadsInPlac
 `expandMixedPartialHeadsInPlaceBF16Placement`), `csrc/xqa/mha.cu` (guard after `grpLoadV`; K
 site in `runGemm0`, V site in the gemm1 loop, both `#if MIXED_BF16_PLACEMENT_EXPANSION`).  The
 stock helper and `mha_sm90.cu` are untouched; the block expanders mirror `mha_sm90.cu:2792-2830`
-under new names because that file belongs to another track.
+under new names because that file belongs to another track.  Commit "item 1" carried today's
+lane ownership (block `l % 4` of rows `l / 4`, `l / 4 + 8`; two `LDS.U8`); commit "item 2"
+replaced it with the half-row cut below — the decode, vote and bodies are unchanged between the
+two.
 
-Data flow (one call = one 128 B K part of 64 rows, or one 32 x 128 B V half-tile; 16-row spans =
-pages):
+Decode / scale data flow (per lane, per span, both commits):
 
 ```
-smem tile row r (128 B, physical grain = logical ^ (r % 8)); block b of the row in logical grain 2b
-  (FP8 16 B; FP4 8 B in the low half), staged by copyMixedPartialHeadsAsync
-scale word per row (4 B, byte b = E4M3 scale of block b), staged by its scale loop
-lane l: b = l % 4, rows r0 = 16 span + l / 4, r1 = r0 + 8            (today's ownership; item 2 changes it)
-  addrA = tileBase + byteOffset<swz>(l/4, 2b), addrB = ... (l/4, 2b+1), scaleAddr = scales + (l/4)*4 + b
-  per span:  s0 = LDS.U8 [scaleAddr + 64 span], s1 = LDS.U8 [.. + 32]
-             r_i = float(E4M3 s_i)                        cvt.rn.f16x2.e4m3x2 + HADD2.F32 (exact)
-             f_i = r_i * (g * 2^k)                        k = 120 (FP8) / 126 (FP4)
-             fold = __all_sync(|g| >= 2^-117 && max|f_i| < 255.5 * 2^120)
-             fold:     sf2_i = bf16x2{f_i, f_i}           one F2FP.PACK_AB each
-             fallback: sf2_i = bf16x2{r_i g, r_i g}
-  per row j: FP8: LDS.128 [addrA + 2048 span + 1024 j] -> 4 x e4m3x4ToBF16x2Pow2m120 (x * 2^-120)
-             FP4: LDS.64  [same]                        -> 2 x e2m1x8ToBF16x2Pow2m126 (mag * 2^-126)
-             fallback only: HMUL2 by 0x7B80 / 0x7E80 (exactly 2^120 / 2^126)
-             HMUL2 by sf2_j; STS.128 [addrA + ...] , STS.128 [addrB + ...]
+s_i = E4M3 block scale bytes            (item 1: LDS.U8 x2 of rows r0, r1; item 2: one LDS.U16)
+r_i = float(s_i)                        cvt.rn.f16x2.e4m3x2 + HADD2.F32 (both exact embeddings)
+f_i = r_i * (g * 2^k)                   k = 120 (FP8) / 126 (FP4); g * 2^k exact for |g| < 2^8, inf beyond
+fold = __all_sync(|g| >= 2^-117 && max(|f_0|, |f_1|) < 255.5 * 2^120)     (warp-uniform by construction)
+fold:     sf2_i = bf16x2{f_i, f_i}      one F2FP.BF16.PACK_AB each (no PRMT broadcast)
+fallback: sf2_i = bf16x2{r_i g, r_i g}
+FP8 block: LDS.128 -> 4 x e4m3x4ToBF16x2Pow2m120 (PRMT, PRMT, SHF, SHF, LOP3, LOP3 -> x * 2^-120)
+FP4 block: LDS.64  -> 2 x e2m1x8ToBF16x2Pow2m126 (SHF + 4 x (PRMT, SHF, LOP3) -> mag * 2^-126)
+fallback only: HMUL2 by 0x7B807B80 / 0x7E807E80 (exactly 2^120 / 2^126; E4M3/E2M1 magnitudes have
+               <= 4 significant bits and x < 449, so the product is exact)
+HMUL2 by sf2_i (8 per block); STS.128 x2 per block
 ```
 
-Control flow: `__syncwarp()` on entry (each lane has passed its own `cp.async.wait_group`; the
-scale word of a row was copied by lane `row % 32`, so the read is cross-lane even in today's
-cut) -> span loop (`#pragma unroll(pageLoopUnroll)`: unrolled in static modules, rolled in the
-dynamic one) -> per span the warp-uniform format branch (dynamic module) -> scale loads, vote
-(inside the format branch, all 32 lanes: convergent) -> `body(MixedFoldTag<true/false>)`, each
-straight-line over the lane's two rows via an explicit `row(rowOff, sf2)` called twice ->
-`__syncwarp()` before the `ldmatrix` reads.  No runtime-indexed register arrays (`out[2]` is
-indexed by literals; the two rows are two calls), no pointer selects (`g` / `pow2k` are
-`if constexpr`-resolved), every shared address is a lane-constant u32 plus an immediate.
+### 8.2 Item 2 — half-row owner cut (same helper; commit "item 2")
 
-Static guarantees: `static_assert`s for bf16 `InputElem`, 16 B grains, `swizzle`, 128 B rows with
-8 grains, `partBytes 128` / `blocksPerPart 4`, `headsPerSpan 16`, 64 blocks per span = 2 lanes per
-row... (item 1: two rows per lane), 4 B scale words, `rowsPerIter % 8 == 0` (the swizzle term is
-lane-constant), `dstNbHeads >= maxNbCopiedHeads`; `MIXED_BF16_PLACEMENT_EXPANSION` is
+Lane geometry, one call = one 128 B K part (64 rows = 4 spans) or one 32 x 128 B V half-tile (2
+spans):
+
+```
+lane l: tok = l % 16 (row of every span), h = l / 16 (blocks 2h, 2h+1 = logical grains 4h..4h+3)
+row r = 16 span + tok; x = r % 8 = tok % 8 (lane constant: spans advance rows by 16)
+physical grain of logical 4h + j = (4h + j) ^ x = (4h ^ x) ^ j    (4h and j < 4: disjoint bits)
+  -> the four grains are a permutation of one 4-aligned group that depends on x & 3, so the lane
+     holds FOUR u32 addresses  addr_j = tileBase + Tile::byteOffset<swz>(tok, 4h + j)
+     and uses [addr_j + 2048 * span]        (Tile::rowBytes * headsPerSpan, a template constant)
+scale pair: [scales + 4 tok + 2h + 64 span]  (LDS.U16: lo = block 2h, hi = block 2h+1)
+sources: block 2h in grain addr_0 (FP8 16 B / FP4 low 8 B), block 2h+1 in addr_2
+outputs: block 2h -> addr_0, addr_1; block 2h+1 -> addr_2, addr_3
+```
+
+Control flow: `__syncwarp()` on entry — each lane has passed its own `cp.async.wait_group`
+(`mha.cu` K: `waitGroup<1>` before the part body; V: `syncVTileLoad` = `waitGroup<nbVBuffers-1>`),
+but that completes the executing thread's copies only, and the payload grains of row `tok` were
+copied by lanes `4 (tok % 8) + 2h`, `+ 2h + 1` at copy iteration `tok / 8`, the scale word by lane
+`tok + 16 (span % 2)`; the `bar.warp.sync` makes all lanes' completed copies visible to all lanes
+(the compact path has the same barrier at both sites).  Then the span loop
+(`#pragma unroll(pageLoopUnroll)`: unrolled in static modules, rolled in the dynamic one) -> the
+warp-uniform format branch (dynamic module) -> `LDS.U16`, vote (inside the branch, all 32 lanes:
+convergent) -> `body(MixedFoldTag<true/false>)`, straight-line over the lane's two blocks via an
+explicit `block(a, b, sf2)` called twice -> `__syncwarp()` before the `ldmatrix` reads.  A lane
+writes only grains it alone reads (its sources are among its outputs), so no barrier sits between
+its loads and stores.  No runtime-indexed register arrays (`out[2]` is indexed by literals), no
+pointer selects (`g` / `pow2k` are `if constexpr`-resolved), every shared address is a
+lane-constant u32 plus an immediate.
+
+Static guarantees (`static_assert`): bf16 `InputElem`, 16 B grains, `swizzle`, 128 B rows with 8
+grains, `partBytes 128` / `blocksPerPart 4`, `headsPerSpan 16` = `tokensPerPage`, 64 blocks per
+span = 2 x `warp_size` (one row, two adjacent blocks per lane), `blocksPerLane 2`, 4 B scale words,
+`headsPerSpan % 8 == 0` (the swizzle term is lane-constant), `dstNbHeads >= maxNbCopiedHeads`; the
+helper takes no `dstHeadOffset` / `idxPart` / `idxWarp` (row 0 origin, one warp; both call sites
+passed the literal 0 / their own warp).  `MIXED_BF16_PLACEMENT_EXPANSION =
+ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_TILE_LOOPS && !INPUT_FP16 && !(GRP_LOAD_V)` is
 `static_assert`ed to imply `kCompactTileLoops && bf16 && !grpLoadV && !compactMixedPages`.
 
 Instantiations: K `<64, 2, true>` on `KSmemBuffer` (64 x 8 grains), V `<32, 2, true>` on
 `VSmemBuffer` (32 x 8 grains); both pass `sourceHeadOffset = 0`.
 
-Expected SASS per FP8 lane-call in this intermediate state (32 values, fold body): 2 LDS.U8 + 1
-LOP3 (pack) + F2FP + 2 HADD2 + 2 FMUL + FMNMX + FSETP + VOTE + PLOP3 + 2 F2FP.PACK + 2 (LDS.128 +
-24 + 8 HMUL2 + 2 STS.128) + ~3 = **~89** (today 106 for the same two lane-blocks); FP4 2 LDS.64 +
-... + 2 (26 + 8 + 2) = **~87**.  Item 2 (owner cut) removes nothing from this count except the
-second LDS.U8 / pack (the two scales become one LDS.U16) — its purpose is the cross-lane layout
-that lets the copy hoist (item 3) and the vote amortise over one row.  The verification list of
-section 6 A1 applies unchanged: F2FP per FP8 lane-call 18 -> 3, HADD2.F32 16 -> 2, HMUL2 16 per
-lane-call (32 in the fallback body), STS.128 4, `WARPSYNC` between the `DEPBAR` and the first LDS.
-
+Expected SASS per lane-call (32 values; the section 6 A1 list applies): FP8 fold body — LDS.U16,
+F2FP.E4M3, 2 HADD2.F32, 2 FMUL, FMNMX, FSETP, VOTE, PLOP3, 2 F2FP.PACK, 2 x (LDS.128 + 24 + 8
+HMUL2 + 2 STS.128) = 68, ~4 address / loop = **~85** (today 2 x 53 = 106); FP4 — 2 x (LDS.64 +
+26 + 8 + 2) = 74 + 13 + 4 = **~91**; fallback bodies +16 HMUL2.  Per 16 values ~43-46, the
+section-4 budget's 46.  F2FP per FP8 lane-call 18 -> 3, HADD2.F32 16 -> 2, HMUL2 16 (32 in the
+fallback body), STS.128 4, LDS.128 2 / LDS.64 2, LDS.U16 1, one `WARPSYNC` between the `DEPBAR`
+and the first LDS, no LDL / STL, REG <= 128.
