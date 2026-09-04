@@ -299,8 +299,11 @@ def test_xqa_mixed_a16_stream_matches_stock_decode(pages_per_request):
     all-A16 mixed stream (mha_sm90.cu on SM90 at q=1) against the stock bf16
     XQA decode (mha.cu), which shares none of the mixed kernel's consumer code.
     The two kernels differ in P precision and reduction order, so the
-    comparison has a tolerance; 256 pages per request cover 64 tiles, the
-    running max/sum update on every tile and the multi-block merge.
+    comparison has a tolerance calibrated on the unmodified kernel (max |diff|
+    1.95e-3 at |ref| <= 0.38 for 18 pages, 4.9e-4 at |ref| <= 0.10 for 256:
+    one bf16 ulp; the tolerance below allows ~3).  256 pages per request cover
+    64 tiles, the running max/sum update on every tile and the multi-block
+    merge.
     """
 
     torch.manual_seed(13)
@@ -349,4 +352,4 @@ def test_xqa_mixed_a16_stream_matches_stock_decode(pages_per_request):
     ref = expected.float().abs().max().item()
     print(f"[a16_vs_stock-{pages_per_request}] max|diff|={err:.3e} max|ref|={ref:.3e}",
           flush=True)
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=2e-3)

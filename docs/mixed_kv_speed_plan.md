@@ -106,6 +106,23 @@ Predicted effect (per tile per CTA, and wall): consumer floor (converters-skippe
 
 Deferred inside Phase 1: **[3]** colSum-to-epilogue (both maybe; ~0.05 us/tile, order change breaks bit-exactness against external references; do only as part of L8). **[6]** gemm0 software pipelining (both maybe): only with a `test_wait.parity`-guarded prefetch (issue QK(t+1) early only if kBar[t+1].produced is complete), otherwise it lengthens the chain while converters pace; revisit after Phase 2 when the trace shows converters leading.
 
+Result (2026-09-04, worktree A, branch `wt/A`; details in backends.md "Phase 1 — sm90 consumer
+cheap set"): [4] [0] [2] [1] [35] landed, one commit each; [33c] built, measured negative
+(s3-s2 unchanged, floor wall +1.4 us) and reverted; [11] not built (P0.3: cadence is max(),
+gemm0-bound, no wait on gemm1).  SASS (fp4 static object): gemm0 BAR.SYNC 0 -> 1, PHASECHK 6 -> 3,
+ATOMS 4 -> 0; gemm1 BAR.SYNC 0 -> 1, PHASECHK 12 -> 7, DEPBAR 4 -> 1; 3336 -> 3312 instr, REG 48
+STACK 0.  Trace (fp4, converters skipped, CTA 0 tiles 2-7): cadence 2039/2030 -> 1884/1888 cyc
+(-7.5 %), T_g0 1848 -> 1676, gemm1 work 1082 -> 869, s2-s1 682 -> 454, s6-s5 446 -> 208; the
+per-segment accept thresholds (s2-s1 <= 250, s6-s5 <= 100, s7-s6 <= 250) were not met because those
+segments also hold the softmax / rescale arithmetic and the PV chain is not drain-bound (~85
+cyc per m64n8k16 HGMMA, gemm0 and gemm1 alike).  Walls (5x5, locked, base re-timed alongside):
+fp4 floor 57.2-57.5 -> 55.0-55.1; production fp4 95.9-96.4 -> 92.7, fp8 91.0-91.8 -> 88.7-88.8,
+mixed 114.1-115.7 -> 109.4-109.7, a16 82.7-83.0 -> 82.0-82.3 us (q=4 `mha.cu` unchanged).  The
+production gain comes through the K-wait (269 -> 895 cyc of idle per tile instead of barrier
+spins) at an unchanged converter-paced cadence; the predicted 45-50 us floor wall is not reached
+because ~18 us of the floor wall is per-wave fill/drain/tail ([8]'s territory), not per-tile chain.
+Correctness 36/36 (34 bit-exact + 2 independent-reference cases added in this track).
+
 ---
 
 ## Phase 2 — sm90 IO/converter cheap set (worktree B: `mha_sm90.cu` warpIdx.z 2/3/4 branches, loader, barrier init :1185-1220; `mhaUtils.cuh` convert helpers under an sm90 arch guard)
