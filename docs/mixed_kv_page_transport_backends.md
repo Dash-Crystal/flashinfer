@@ -2018,3 +2018,11 @@ top 28.
   `__syncwarp` is provably converged again and the 22 `BRA.DIV` guards
   disappear), (d) the a16-style 12-warp layout re-measured with (a)-(c) before
   deciding whether the second warp group pays for its protocol duplication.
+
+### FA3 merged-tree confirmation @ 64a70b9c (F23 + F24 on main; 2026-09-04, nkcut2 H200)
+
+88/88 bit-exact.  Locked bench `--repeats 1 --trials 5`, medians (q=1 / q=64
+us): stock_a16 299.1 / 308.5, transport_a16 282.2 / 287.4, fp8 460.1 / 474.5,
+fp4 494.3 / 509.0, mixed 719.1 / 726.9 — equal to the wt/F24 record.  Target
+<= 330 open on all compressed modes; next design F25 (12-warp layout, producer
+136 registers, per-operand vote, one IMAD.WIDE per copy) in wt/F25.
