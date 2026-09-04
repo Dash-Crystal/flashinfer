@@ -1004,3 +1004,167 @@ unrolled per-tile body (the 64 B parts run 4 copy/expand/MMA rounds per tile)
 or the `mha_sm90.cu` SPEC_DEC route whose smem arithmetic is in the step-3
 section (K3/V2 fits 2 CTAs/SM at 99 KB).  The a16 mode is 1.48x its 67.5 us
 byte floor with 680 CTAs x ~6 us of fixed cost = 15 us of the gap.
+
+### Track S step 5 — [43] 128 B K parts, rolled tile loops, one copy body per format (2026-09-04, nkcut2 H200 + ws-1 RTX 5090, worktree E)
+
+**Smem arithmetic (before any build; sm90, enum 5, SPEC_DEC, M_TILESIZE 16,
+`!grpLoadV`, tokensPerPage 16, D 128, bf16).**  Cap for two CTAs per SM:
+2 x (sizeof(SharedMem) + 1,024 B reserve) <= 228 KB = 233,472 B, i.e.
+sizeof(SharedMem) <= 115,712 B (allocation granularity 128 B).
+
+| SharedMem member | step 4: K 64 B / V 32 rows | K 128 B / V 32 rows | K 64 B / V 64 rows | [43]: K 128 B / V 32 rows, 4 B vScales |
+|---|---|---|---|---|
+| `q[1][1]` 16 rows x 256 B | 4,096 | 4,096 | 4,096 | 4,096 |
+| `k[4][2]` 64 rows x part bytes | 32,768 | 65,536 | 32,768 | 65,536 |
+| `x[1][4]` 16 rows x 128 B | 8,192 | 8,192 | 8,192 | 8,192 |
+| `v[2][2][2]` rows x 128 B | 32,768 | 32,768 | 65,536 | 32,768 |
+| `kFormats[4][2]` (4 tags) / `vFormats[2][2][2]` (2 tags) | 32 + 16 | 32 + 16 | 32 + 32 | 32 + 16 |
+| `kNeedsExpansion` / `vNeedsExpansion` | 8 + 8 | 8 + 8 | 8 + 8 | 8 + 8 |
+| `kScales[4][2][65][4]` (4 B = max(4, part/32)) | 2,080 | 2,080 | 2,080 | 2,080 |
+| `vScales[2][2][2][rows+1][stride]` | 33 x 8: 2,112 | 33 x 8: 2,112 | 65 x 8: 4,160 | 33 x 4: **1,056** |
+| `warpRowMax` / `warpRowSum` / `ctaRowMax` [1][4] x 128 B | 3 x 512 | 3 x 512 | 3 x 512 | 3 x 512 |
+| `qBarrier[1]` 8 B + `xBarriers[1][4]` 4 x 16 B | 72 | 72 | 72 | 72 |
+| sum / `alignas(128)` | 83,688 / **83,712** | 116,456 / **116,480** | 118,568 / 118,656 | 115,400 / **115,456** |
+| 2 x (size + 1,024) vs 233,472 | 169,472 yes | 235,008 **no (+768 B)** | 239,360 no | 232,960 **yes (512 B spare)** |
+
+The step-4 column reproduces ncu's 83,712 B, so the accounting is exact.  The V
+scale rows were the slack: `copyMixedPartialHeadsAsync` writes them at
+`scaleLoadBytes = max(4, blocksPerPart)` = 4 B for a warp's 128 B half row
+(`nbPartsPerHead = gemm1WarpsPerGrp = 2`) and `expandMixedPartialHeadsInPlace`
+reads them at the same stride, while `mixedVScaleBytes` allocated 8 B per row
+(the whole-head value that only `grpLoadV` uses).  No other member is
+compressible without touching the consumers (`SMemWarpRowMax` holds 32 rows
+for a 16-row tile: 768 B, the exact deficit, but it is indexed by the
+gemm0/gemm1 softmax code; the X ring is already depth 1; kScales' dump row is
+32 B).  64-row V tiles do not fit in any combination.
+
+**Per-tile rounds and code footprint (predicted from the step-4 SASS).**  The
+gemm0 K-part loop is fully unrolled for 16-bit tiles (`nbUnroll =
+nbPartsPerKHead`), so the dynamic module's hot gemm0 loop (3,239 SASS,
+back-edge 0x02ee0-0x0f940) held four part bodies of ~790 instructions (each:
+copy with 3 formats x {isFull, partial} = 6 bodies, expansion with 2 format
+bodies, 16 HMMA, and the per-round fixed cost: wait_group, tag broadcast, flag
+stores, page advance); the gemm1 X-tile loop (`#pragma unroll` over
+`nbXItersPerCtaTile` = 4) held four V bodies of ~875 (3,500 SASS,
+0x16080-0x23b30).  Two co-resident CTAs put a gemm0 and a gemm1 warp of each
+on every SMSP: 6.7 K instructions = 108 KB of hot code per SMSP, hence the
+`no_instruction` 2.2-2.8 warps per issue cycle of step 4.  [43]: 128 B parts
+(2 rounds per K tile, the round's fixed cost paid twice not four times), the
+part loop rolled (one 128 B body: 32 HMMA, 10 LDGSTS, 2 expansion iterations
+per format), the X-tile loop rolled (one V body), and every K/V copy through
+the bounds-checked variant (`isFullTile` forced false in the compact build;
+one ISETP per block instead of a second copy body).  Predicted hot footprint:
+dyn ~1,300 + ~920, i.e. 6,739 -> ~2,200-2,500 (below the fp4 static module's
+6,647 and the a16 module's 4,426); executed instructions -5 to -8 % (two fewer
+rounds of fixed cost, minus ~30-50 loop-control instructions per rolled
+iteration); no_instruction -> <= 0.8; q=4 mixed 95-115, fp8 88-105, fp4
+100-125, a16 90-100 us.
+
+**Levers.**  `csrc/xqa/mha.cu`: the `__CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM ==
+5 && SPEC_DEC && M_TILESIZE == 16` branch selects `preferedKHeadPartBytes =
+128`, `cacheVTileSeqLen = 32` and defines `MIXED_COMPACT_TILE_LOOPS 1` ->
+`kCompactTileLoops`; `SharedMem::mixedVScaleBytes` = 4 B under
+`kCompactTileLoops && !grpLoadV` (8 B elsewhere, so every other build keeps its
+SharedMem layout byte-for-byte); gemm0 `nbUnroll = 1` and gemm1 `#pragma unroll
+1` (a `#if MIXED_COMPACT_TILE_LOOPS` branch around the stock `#pragma unroll`)
+under the compact build; K and V `isFullTile = !kCompactTileLoops && ...` with
+the bounds-checked copy's `nbHeadsAvail` clamped to the tile only there.  No
+change to `mhaUtils.cuh` (the page loop of the mixed helpers is already rolled
+in the dynamic module: 9-10 LDGSTS per body confirm it in the SPEC_DEC SASS).
+
+**Artifact (sm90 q=4 modules, `cuobjdump -sass` / `-res-usage`, workspace
+`/tmp/mixedkv-wtE-s5-v1`; loops delimited by their back-edges).**
+
+| module | SASS total | gemm0 loop | gemm1 loop | hot total (code bytes) | LDGSTS / LDS / STS static | REG / STACK / LDL / STL |
+|---|---|---|---|---|---|---|
+| dyn (-1) before | 9,288 | 3,239 (4 x 790 part bodies) | 3,500 (4 x 875) | 6,739 (105 KB) | 121 / 340 / 82 | 128 / 0 / 0 / 0 |
+| dyn (-1) after | **4,968** | **1,588** (part body 921: 32 HMMA, 10 LDGSTS) | **888** (V body: 16 HMMA, 9 LDGSTS) | **2,476 (39 KB)** | 54 / 152 / 35 | 124 / 0 / 0 / 0 |
+| fp4 (2) before / after | 9,104 / **4,688** | 2,816 / 1,818 | 3,831 / 771 | 6,647 / **2,589** | 101 / 342 / 98 -> 46 / 131 / 43 | 128 / 0 -> 128 / 0 |
+| fp8 (1) before / after | 8,160 / **4,352** | 2,342 / 1,591 | 3,352 / 652 | 5,694 / **2,243** | 101 / 342 / 98 -> 46 / 131 / 43 | 128 / 0 -> 127 / 0 |
+| a16 (0) before / after | 7,008 / **3,928** | 2,230 / 1,205 | 2,196 / 443 | 4,426 / **1,648** | 176 / 119 / 34 -> 64 / 59 / 19 | 128 / 0 -> 127 / 0 |
+
+Every module's hot footprint is below the step-4 fp4 module's (the target) and
+below the step-4 a16 module's.  The gemm0 part body carries 32 HMMA / 20 LDSM
+/ 10 LDGSTS / 2 x (F2FP 20, PRMT 24) - the 128 B round predicted above.
+
+**ncu (q=4, one launch, `--launch-skip 1 --launch-count 1`, co-tenant present so
+durations are serialized; "before" = step-4 record).**
+
+| metric | mixed before -> after | fp4 before -> after | fp8 before -> after | a16 before -> after |
+|---|---|---|---|---|
+| launch__shared_mem_per_block_dynamic | 83,712 -> **115,456** | same | same | same |
+| launch__occupancy_limit_registers / _shared_mem | 2 / 2 -> 2 / 2 | 2 / 2 | 2 / 2 | 2 / 2 |
+| launch__registers_per_thread | 128 -> 124 | 128 -> 128 | 128 -> 127 | 128 -> 127 |
+| launch__grid_size / waves | 680 / 2.58 | 680 / 2.58 | 680 / 2.58 | 680 / 2.58 |
+| sm__warps_active (% peak, active) | 21.1 -> 21.1 | 21.5 -> 20.9 | 21.7 -> 21.5 | 22.1 -> 21.0 |
+| smsp__issue_active (% active cycles) | 43.9 -> **58.3** | 43.7 -> **58.1** | 41.5 -> 52.0 | 33.9 -> 50.4 |
+| smsp__inst_executed.sum | 50.21 M -> 51.47 M (+2.5 %) | 48.79 -> 50.85 M (+4.2 %) | 40.50 -> 42.76 M (+5.6 %) | 24.54 -> 29.85 M (+21.6 %) |
+| warp-cycles per issued instruction | 7.61 -> **5.78** | 7.87 -> **5.76** | 8.25 -> 6.61 | 10.31 -> 6.61 |
+| .. no_instruction (warps per issue-active cycle) | 2.16 -> **0.51** | 2.42 -> **0.30** | 1.64 -> **0.15** | 1.86 -> **0.14** |
+| .. long_scoreboard | 1.19 -> 0.93 | 1.35 -> 0.99 | 1.63 -> 1.39 | - -> 2.81 |
+| .. short_scoreboard / wait / barrier | 0.51 / 1.24 / 0.12 | 0.69 / 0.97 / 0.13 | 1.32 / 1.02 / 0.18 | 0.28 / 0.92 / 0.23 |
+| dram__throughput (% peak, elapsed) | 21.1 -> 28.3 | 11.9 -> 15.4 | 21.7 -> 27.1 | - -> 66.9 |
+| gpu__time_duration (serialized) | 198.3 -> **148.7** | 189.2 -> **147.7** | 173.2 -> 139.3 | 123.0 -> 98.0 |
+
+The i-fetch stall is gone (0.14-0.51) and issue utilisation rose by a third;
+the executed instruction count did **not** fall: the rolled loops' control and
+dynamic indexing (~60-100 instructions per iteration, e.g. `idxXTile`,
+`smemQOffset`, the CircIdx and page-advance selects, 8 R2UR / 35 UMOV in the
+part body) cancel the two saved rounds of fixed cost, and the a16 module's
+single bounds-checked copy adds a compare per block (+22 %; a16 is DRAM-side,
+67 % of peak, so it still gained 20 %).  The remaining latency per issued
+instruction is `wait` (fixed-latency dependencies, 1.0-1.2) and long scoreboard
+(0.9-1.4): the next lever for the sm90 q=4 targets is the executed instruction
+count per tile (51 M for mixed against 30 M for a16 on the same tiles), not
+occupancy or fetch.
+
+**Timing (nkcut2, flock'd, `--repeats 2 --trials 5`, three rounds; the
+co-tenant rule holds: 2 x 116 us = 0.23 ms per event pair).  q=1 is the
+untouched `mha_sm90.cu` control.**
+
+| mode | q=4 step-4 record | q=4 [43] r1 / r2 / r3 | ratio | predicted band | q=4 target | q=1 control |
+|---|---|---|---|---|---|---|
+| transport_a16 | 99.7 | 86.1 / 86.0 / 86.7 | **0.86x** | 90-100 (better) | 135 (pass) | 82.3 |
+| fp8 | 124.3 | 113.8 / 114.0 / 114.9 | **0.92x** | 88-105 (9 us above) | <= 94 (open, 1.21x) | 91.3 |
+| fp4 | 144.3 | 114.8 / 116.4 / 116.5 | **0.80x** | 100-125 (in band) | <= 59 (open, 1.96x) | 96.2 |
+| mixed | 137.8 | 116.2 / 116.1 / 115.9 | **0.84x** | 95-115 (1 us above) | <= 101 (open, 1.15x) | 114.7 |
+
+Track S acceptance (mixed <= 1.5x fp4) holds at 1.00x.  fp8 gained least
+because it had the smallest i-fetch component (1.64) and now sits on short
+scoreboard (1.32: the LDS -> F2FP chains of the FP8 expansion, P0.4's finding
+on sm90-io).
+
+**Correctness.**  34/34 bit-exact on nkcut2 (default and `XQA_NB_SUB_SEQ=2`)
+and on ws-1 (default and `XQA_NB_SUB_SEQ=2`) on the final tree, and on each
+intermediate cut (four builds per host).
+
+**sm120 regression table (ws-1 RTX 5090, flock'd, `--repeats 5 --trials 5`,
+three rounds, final code: the sm120 modules are unchanged by [43] - the guard
+is sm90-only and their SharedMem layout is byte-for-byte the step-4 one).**
+
+Regression proof by construction first: `cuobjdump -sass` (addresses stripped) of the
+eight sm120 mixed-page modules (static formats -1/0/1/2 x q=1/q=4) built from
+this tree is **byte-identical** to a pristine `e777da96` checkout built in the
+same session for 7 of 8 (`fmt2/fmt1/fmt0 q=1`, all four q=4; REG 146 / 151 /
+163 / 178 / 196 / 202 / 200, STACK 0); the dynamic q=1 module differs between
+the two pristine builds themselves (step-4 workspace `1604033e8955` == this
+tree, fresh pristine build `cb834699b703`): ptxas build-to-build variation, not
+a source effect.  Two earlier cuts of this step did change the sm120 SASS and
+were reverted: the vScales stride shrink for every `!grpLoadV` build, and a
+`#pragma unroll(nbXItersPerCtaTile)` spelling of the stock `#pragma unroll`
+(nvcc lays the 4-trip loop out differently).  Timing, interleaved pristine
+base / this tree per round (a VLLM tensor-parallel pair was resident on the
+GPU during this session, so absolute numbers sit 0-2 % above the idle-GPU
+records; the interleaving is the control):
+
+| mode | q=1 record | q=1 base r1/r2/r3 | q=1 [43] r1/r2/r3 | q=4 record | q=4 base r1/r2/r3 | q=4 [43] r1/r2/r3 | q=4 target |
+|---|---|---|---|---|---|---|---|
+| transport_a16 | 174.7 | 173.2 / 173.5 / 172.9 | 173.7 / 173.3 / 174.6 | 176.1 | 176.7 / 176.1 / 176.3 | 176.6 / 176.0 / 176.1 | - |
+| fp8 | 100.5 | 100.6 / 100.5 / 100.6 | 100.3 / 100.7 / 100.6 | 115.1 | 116.4 / 115.6 / 116.8 | 116.9 / 116.7 / 116.4 | <= 128 (pass) |
+| fp4 | 59.5 | 59.8 / 59.7 / 60.5 | 60.7 / 59.9 / 59.8 | 65.7 | 65.9 / 65.7 / 65.9 | 65.9 / 65.8 / 65.6 | <= 81 (pass) |
+| mixed | 113.5 | 115.9 / 115.5 / 116.1 | 115.5 / 115.4 / 115.6 | 119.0 | 123.5 / 123.5 / 123.3 | 123.2 / 123.3 / 123.1 | <= 138 (pass) |
+
+Identical binaries, identical numbers within the round-to-round spread
+(<= 0.9 us); the mixed q=4 +4 us against the record is the co-tenant session
+offset, present in the base column too.
+
