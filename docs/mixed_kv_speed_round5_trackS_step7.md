@@ -1,4 +1,4 @@
-# Track S step 7 — [45] register-only dependency cuts for the sm90 SPEC_DEC q=4 build (design; no kernel edits in this worktree)
+# Track S step 7 — [45] register-only dependency cuts for the sm90 SPEC_DEC q=4 build (design rev 2 + implementation; no build or GPU run in this worktree)
 
 Tree `claude/mixed-kv-sm90-tma` @ `659eacfa`, worktree `wt/S7`.  Design only: no build, no GPU
 timing.  Every number below is either arithmetic on the source at this tip or a reading of the
@@ -31,11 +31,35 @@ buy that depth at 2 CTAs/SM, and if not, what does?
 
 Answer in one line: **no layout buys a third 128 B K buffer at 2 CTAs/SM, and none is needed —
 the step-6 PC samples put < 0.1 % of the time on the `cp.async.wait_group` (`DEPBAR`) of either
-ring; the long-scoreboard time is (i) the gemm1 warps waiting on `xBar.produced` for gemm0 (9.6 %
-of all fp8 samples: gemm0 is the pacing role, gemm1 has 20 % slack in its loop), (ii) the
-consumers of the page-index / page-tag `LDG`s inside the copy (6.3 % fp8, 7.2 % mixed) and (iii)
-the barrier poll's `NANOSLEEP` (2.3 %).  The lever is the per-warp dependency depth of the gemm0
-tile — register-only items under the existing [44] guards, no SharedMem change.**
+ring.  The long-scoreboard time is (i) the per-CTA pipeline fill (the gemm1 warps' `xBar.produced`
+wait, 9.6 % of all fp8 samples, is quantitatively one gemm0 tile-time per gemm1 warp per CTA
+start — rev 2, section 2: the two roles run in lock-step with ~0 steady-state slack, so the wall
+follows max(gemm0 tile, gemm1 tile) and every cut is priced as min(gemm0 cut, gemm1 cut)), (ii)
+`R2UR` at the page-index load sites (ptxas parks the warp-uniform page index in a uniform
+register as soon as it is loaded, exposing the L2 round trip there) and register WAR behind the
+`LDGSTS` batch (MIO-queue drain, not recoverable), and (iii) the barrier poll's `NANOSLEEP`
+(2.3 %, part of the fill).  The lever is the per-warp dependency depth of both roles' tile bodies
+— register-only items under the existing [44] guards, no SharedMem change.**
+
+**Revision 2 (judge blockers, before code).**  Five blockers were raised against rev 1 and are
+answered in place: (1) [45b] in the dynamic module would have paired spans of different formats
+inside one format branch — [45b] is now static-modules-only (section 3.2); (2) the "gemm0 paces,
+gemm1 has 20 % slack" reading was wrong — the produced-wait samples are the pipeline fill, two
+barrier sites were mislabelled, and the wall is now budgeted as min(gemm0 cut, gemm1 cut) with a
+discriminating measurement specified (section 2); (3) the 6.3 % / 7.2 % "page-index / tag LDG
+consumer" bucket is `R2UR`-at-load-site plus address-register WAR, which a deeper prefetch does
+not touch — [45d] is redesigned as lane-distributed page indices that never enter the uniform
+datapath, and the WAR part is priced at zero (sections 2, 3.4); (4) the budget is re-derived per
+item with a mechanism-specific realisation factor (section 3.7): the defensible cut is -9..-12 %
+on gemm0 and -7.5..-11 % on gemm1, fp8 lands at 99-105 us, the <= 94 target is not reached by
+this step; (5) the accept / reject table is gap-free and the produced-wait rule is replaced
+(section 5 A2).  Notes taken: the (a') column of the smem table sums to 117,000 (not 117,008;
+conclusion unchanged); [45e] is budgeted on the 111 `MATCH.ANY`-group samples (the 33 at
+`0x11410` are an unrelated `IMAD.SHL`); [45f] is a CTA-lifetime saving with a ~1-2 % wall share;
+the dynamic module's per-span fold predicate is a *select* on the register tag, never a multiply
+by a possibly stale smem scale word; the [45c] flag / tag rotation is two named registers, not a
+`bool[2]` indexed by the `CircIdx`; the loader lambdas become `#if MIXED_HOISTED_COPY <new> #else
+<stock verbatim> #endif` so the sm120 and sm90 q=1 preprocessed source is unchanged.
 
 ## 1. Smem arithmetic first: the four depth options
 
@@ -57,7 +81,7 @@ reproduced ncu's 115,456 with this accounting):
 | `vScales[2][2][nbV][33][4]` | 1,056 | 1,056 | 1,584 | 2,112 | 1,584 |
 | `warpRowMax` / `warpRowSum` / `ctaRowMax` `[1][4]` x 128 B | 1,536 | 1,536 | 1,536 | 1,536 | 1,536 |
 | `qBarrier[1]` 8 B + `xBarriers[1][4]` 4 x 16 B | 72 | 72 | 72 | 72 | 72 |
-| sum -> `alignas(128)` | 115,400 -> **115,456** | 100,076 -> **100,096** | 132,324 -> **132,352** | 216,904 -> **216,960** | 117,008 -> **117,120** |
+| sum -> `alignas(128)` | 115,400 -> **115,456** | 100,076 -> **100,096** | 132,324 -> **132,352** | 216,904 -> **216,960** | 117,000 -> **117,120** |
 | 2 CTAs/SM (<= 115,712) | yes (256 B spare) | **yes (15,616 spare)** | **no (+16,640)** | no (1 CTA: 216,960 <= 232,448 yes) | **no (+1,408)** |
 
 (d) M tile: `warpTile.y = roundUp(nbValidRows, 16)` (`mha.cu:104-111`) is 16 for q x GQA = 16 and
@@ -112,275 +136,415 @@ no_inst 5.2; fp4 21.0 / 19.8 / 14.6 / 14.5 / 9.2 / 7.1; mixed wait 24.0, long_sb
 
 Conclusion of the arithmetic: pipeline depth is neither available nor the bottleneck; the record's
 "landing latency" is two other things, decomposed next.
-
-## 2. What the step-6 samples say (fp8 [44] module, 9,960 samples; fp4 / mixed in parentheses)
+## 2. What the step-6 samples say (fp8 [44] module, 9,960 samples; fp4 / mixed in parentheses) — rev 2
 
 Regions are the SASS loops delimited by back-edges (`v2-fmt1.nvdis`; the gemm1 code is laid out
-first).  Per warp-tile = region `Instructions Executed` / 8,704.
+first).  Per warp-tile = region `Instructions Executed` / 8,704.  Both roles are compared by
+*samples* (rev 1 mixed an instruction-count estimate for gemm0 with samples for gemm1; by
+instructions the gemm0 tile would be ~16,700 cycles, by samples ~14,000 — the ratio below is the
+one that matters).
 
 | region | SASS | samples | inst per warp-tile | stall mix |
 |---|---|---|---|---|
-| gemm1 V-iteration loop `[0x2390, 0x50f0]` (`mha.cu:3173-3345`) | 726 | 4,744 (47.6 %) | **1,959** (4 iterations) | long_sb 26 % (**953 = the `xBar.produced` TRYWAIT branch at `0x2e40`, `mha.cu:3229` = 20 % of the loop**), short_sb 25, selected 15, wait 12 |
-| gemm0 tile loop `[0xa790, 0x11740]` (`:2570-2790`) | 1,787 | 3,628-3,873 (36-39 %) | **1,773-2,067** | short_sb 27-29 %, long_sb 11-16, wait 14, selected 13-14, not_selected 10-11, no_inst 6 |
+| gemm1 V-iteration loop `[0x2390, 0x50f0]` (`mha.cu:3173-3345`) | 726 | 4,744 (47.6 %), of which **953 on the `xBar.produced` TRYWAIT branch `0x2e40` (`mha.cu:3229`)**; busy 3,791 | **1,959** (4 iterations) | long_sb 26 %, short_sb 25, selected 15, wait 12 |
+| gemm0 tile loop `[0xa790, 0x11740]` (`:2570-2790`) | 1,787 | **3,873** (38.9 %) | **2,067** | short_sb 27-29 %, long_sb 11-16, wait 14, selected 13-14, not_selected 10-11, no_inst 6 |
 | .. gemm0 part loop `[0xa990, 0xef30]` (`:2594-2696`) | 1,114 | 2,817 (28.3 %) | 1,451 (2 parts) | short_sb 33, selected 13, wait 12, long_sb 11, not_selected 11, no_inst 6, mio 5 |
 | .. gemm0 outer (softmax, X hand-off) | ~670 | ~700 | ~600 | FMNMX <- SHFL chains, `MATCH.ANY` group (below), MUFU |
-| out-of-line barrier poll (`NANOSLEEP` `0x11770`, `barriers.cuh:352-378`) | | 228 (2.3 %) | | long_sb (mostly gemm1's `produced` poll) |
+| out-of-line barrier poll (`NANOSLEEP` `0x11770`, `barriers.cuh:352-378`) | | 228 (2.3 %) | | long_sb (the gemm1 `produced` poll's sleep) |
 
-**The pacing role is gemm0.**  gemm1 idles 20 % of its loop on `xBar.produced` (fp4 862 samples =
-9.4 % of all, mixed 873 = 8.9 %); gemm0's own `xBar.consumed` wait (`0xa600`, `mha.cu:2777`) has
-73 samples (0.7 %).  So the wall follows the gemm0 warp-tile (~16,700 cycles), and a gemm1-only
-gain is worth nothing until gemm0 has gained ~20 %.
+**Pacing (rev 2): lock-step, no steady-state slack.**  gemm0 3,873 samples per launch vs gemm1
+busy 3,791: the two tile bodies are equal within 2 %.  Through a single X buffer (`nbXBuffers 1`)
+that is what lock-step looks like — either role can be at most a few per cent shorter than the
+other before it waits.  The 953 + 228 = 1,181 `xBar.produced` samples are the **per-CTA fill**:
+each of the 4 gemm1 warps waits one gemm0 tile-time at CTA start (its first `produced` cannot
+arrive before gemm0's first tile), while the gemm0 warps `EXIT` early after their last tile
+(`0x11750`).  Expected fill = 4 warps x 680 CTAs x (gemm0 samples per warp-tile 3,873 / (3.2 x 4
+x 680)) = 3,873 / 3.2 = **1,210 samples**, i.e. the whole wait (fp4 862 + its sleep, mixed 873
++ sleep: same arithmetic, same conclusion).  Rev 1 read this as 20 % gemm1 slack; it is 0-2 %.
+Two barrier sites were also mislabelled in rev 1: `0xf190` (fp8, 73 long_sb) / `0xfb10` (mixed,
+178 = 1.8 %) are `SYNCS.PHASECHK.TRANS64.TRYWAIT [+0x1c290]` = `getAndFlip` (`mhaUtils.cuh:1677`)
+inside `xBar.consumed.wait_parity` (`mha.cu:2777`) — **gemm0 waiting for gemm1**, i.e. gemm1
+already paces part of the time (most on mixed); `0xa600` waits on `[+0x1c280]` before the tile
+loop = the `qBarrier`, not `xBar.consumed`.
 
-**Where the gemm0 tile goes (samples -> cycles at 4.31 cycles per sample):**
+Consequences for the design: (i) the wall follows max(gemm0 tile, gemm1 tile), so every item is
+priced on both roles and the achieved cut is **min(gemm0 cut, gemm1 cut)**; (ii) the gemm1
+(V-side) items are load-bearing from the first commit, not a reserve; (iii) the fill (1 gemm0
+tile-time per CTA ~ 1,181 samples ~ 8.5 us of a 31 us CTA lifetime, overlapped with the
+co-resident CTA) is [42]'s domain (`nbSubSeqPerSeq`, `kFixedCostInTiles`), not this step's.
+**Discriminating measurement (A0 of this step, one ncu `SourceCounters` run of the pristine tip at
+`XQA_NB_SUB_SEQ=1`, 136 CTAs x 16 tiles instead of 680 x 3.2):** if the `0x2e40` + `NANOSLEEP`
+share drops ~5x (one CTA start per 16 tiles), the wait is fill and this section stands; if it
+stays ~12 %, it is steady-state slack and rev 1's reading was right — either way the number is
+known before the first timing run.  In the same run the `R2UR` sites (next paragraph) should
+keep their share: they are per-load, not per-CTA.
+
+**Where the gemm0 tile goes (samples -> cycles at 4.31 cycles per sample), rev 2 attribution:**
 
 | item (gemm0, per warp-tile) | evidence (address, samples, top reason) | cycles per tile |
 |---|---|---|
-| expansion scale chain: `LDS.U16 -> F2FP.F16.E4M3 -> HADD2 -> FMUL -> FMNMX -> FSETP -> VOTE.ALL -> BRA`, once **per span** (4 per K part) | `F2FP.E4M3` `0xbaf0/0xc640/0xd100/0xdbc0` 72+72+62+31 short_sb; `LDS.U16` `0xc620/0xd0e0` 71+48; fold `BRA` `0xc6e0/0xd1a0/0xdc60/0xbc20` 50+48+41+27 (`mhaUtils.cuh:1107-1144`) | ~2,300 |
-| next span's payload `LDS.128` WAR on the previous span's `STS.128` registers | `0xdbb0` 51 short_sb (`mhaUtils.cuh:1111`) | ~220 (+ the hidden serialisation) |
-| `kNeedsExpansion` flag: `LDS.U8 -> ISETP -> BRA` right after the DEPBAR | `0xb970` 114 short_sb (`mha.cu:2629`) | ~490 |
-| page tags: `LDG.E.U8` (lane) -> 4 x `SHFL.IDX` -> `PRMT` x3 -> `STS.U8` flag + `STS` formats | `0xaa60` 90 short_sb (`mha.cu:2409`, `:2454-2456`, `mhaUtils.cuh:219-227`) | ~390 |
-| page-index / tag consumers in the hoisted copy: `R2UR UR, R(page)`, `LDC.64 c[..]` (per-format strides), `IADD3.X`, `IMAD.WIDE`, `IMAD.U32 <- UR` | `0xb710/0xb870/0xb7d0/0x97a0` 75+40+32+26 long_sb; `0xb200` 55; `0xb360` 35; `0xa370/0xb390` 48+17; `0xb700` 41; scale-loop `BRA` `0xf190` 73 (`mhaUtils.cuh:1294`, `:1319`, `:1368-1370`, `:1519`, `:1677`) | ~1,340 |
-| `computeRowSum` quad broadcast with a lane-dependent mask -> `WARPSYNC / MATCH.ANY / REDUX / VOTEU / BRA.DIV` | `0x11310` 66 branch_resolving, `0x11410` 33, `0x11350` 30, `0x11360` 15 (`mha.cu:802`) | ~650 |
+| expansion scale chain: `LDS.U16 -> F2FP.F16.E4M3 -> HADD2 -> FMUL -> FMNMX -> FSETP -> VOTE.ALL -> BRA`, once **per span** (4 per K part) | `F2FP.E4M3` `0xbaf0/0xc640/0xd100/0xdbc0` 72+72+62+31 short_sb; `LDS.U16` `0xc620/0xd0e0` 71+48; fold `BRA` `0xc6e0/0xd1a0/0xdc60/0xbc20` 50+48+41+27 (`mhaUtils.cuh:1107-1144`) | ~2,300 measured; of which ~440 is the serialisation of four ~110-cycle chains (the rest is XU / issue at 4 warps per SMSP) |
+| next span's payload `LDS.128` WAR on the previous span's `STS.128` registers | `0xdbb0` 51 short_sb (`mhaUtils.cuh:1111`) | ~220 (MIO-queue: the STS operands are read late) |
+| `kNeedsExpansion` flag: `LDS.U8 -> ISETP -> BRA` right after the DEPBAR | `0xb970` 114 short_sb (`mha.cu:2629`) | ~490 (MIO-queue congestion behind the just-issued LDGSTS batch: mio stalls at `0xb920-0xb940`; the queue wait moves to the next MIO op if only this LDS is removed) |
+| page tags: `LDG.E.U8` (lane) -> 4 x `SHFL.IDX` -> `PRMT` x3 -> `STS.U8` flag + `STS` formats | `0xaa60` 90 short_sb (`mha.cu:2409`, `:2454-2456`, `mhaUtils.cuh:219-227`) | ~390 (dead work in the static modules) |
+| **(a) `R2UR` at the page-index LOAD site** (`mhaUtils.cuh:1519` `getPage`): `@!P6 LDG.E R40,[R40]` `0xb650` -> `@!P6 R2UR UR39, R40` `0xb710` 12 instructions later | `0xb710` 75, `0xb7d0` 32, `0xb870` 40, `0x97a0` 26 long_sb = **173** (mixed `0x3ff0` `@!P1 R2UR UR29, R13` 269 + 43 = 312, 3.1 %) | ~750 (mixed ~1,350).  ptxas keeps the warp-uniform page index in a uniform register (register pressure at 124-127) and moves it there as soon as it is loaded: the full L2 round trip is exposed at the load, whatever the distance to the copy that uses it.  A deeper rotation gives ptxas more values to `R2UR`, not fewer stalls. |
+| **(b) WAR on address registers of in-flight `LDGSTS` / `LDG`**: `IADD3 R8` `0x2cc0` rewrites the LDGSTS `0x2be0` address; `LDC.64 R32` `0xb200` the LDGSTS `0xb110` address; `IMAD.WIDE R14` `0xa370`; `0x2e30` rewrites R8 after `LDG.E.U8 [R8.64]` `0x2e00`; `0x2d00` R44 (LDGSTS `0x2c60`); `0xb700` R41 (LDG `0xb650` high half) | 66 + 55 + 48 + 84 + 41 + 41 = **335** long_sb | ~1,440 — **not recoverable by this step**: a store-class instruction holds its source registers until the MIO has read them, so this is the LDGSTS batch draining; keeping the address registers live longer only moves the wait onto the next LDGSTS issue (`lg_throttle`).  Priced at 0. |
+| (c) `0xf190` 73 = `xBar.consumed` wait (above), rev 1 booked it as a scale-loop `BRA` | | gemm1-pacing time, not a gemm0 item |
+| `computeRowSum` quad broadcast with a lane-dependent mask -> `WARPSYNC / MATCH.ANY / REDUX / VOTEU / BRA.DIV` | `0x11300-0x11360` = 111 samples (`0x11310` 66 branch_resolving, `0x11350` 30, `0x11360` 15) (`mha.cu:802`); `0x11410` `IMAD.SHL.U32 R0, R2, 0x8` 33 is unrelated | ~480 |
 | `HMMA <- LDSM` first-use waits | `0xee70` 59 short_sb | ~250 |
 | loop control / address chains (`wait`: fixed-latency dependent ALU pairs) | 338 samples spread over the part loop | ~1,460 |
 | issue (selected) | 366 | ~1,580 (1,451 instructions) |
 
-gemm1 shows the same items at its scale (per V iteration: `PRMT <- SHFL` `0x2510` 151, flag `ISETP`
-`0x32c0` 125, `LDS.128` `0x3f90` 127, fold `BRA` 93+80, `F2FP` 91+70, page/tag long_sb `R2UR`
-`0x2d00`-`0x2dc0` + `IADD3` `0x2cc0` ~ 300) plus its own rescale ballot (`FSETP.NEU` `0x2eb0` 112).
-Mixed (dyn) adds the per-span format `LDS.U8 [UR]` from `smem.kFormats` (`mhaUtils.cuh:35`, 228
-`wait` samples = 2.3 %) and has the largest page/tag long_sb share (`R2UR` `0x3ff0` 269 + 43,
-format/scale branches 178+137+40+31: 7.2 % of all samples).
+gemm1 shows the same items at its scale (per V iteration: `PRMT <- SHFL` `0x2510` 151, flag
+`ISETP` `0x32c0` 125, `LDS.128` `0x3f90` 127, fold `BRA` 93+80, `F2FP` 91+70, `R2UR` at the V
+page load ~150, WAR `0x2cc0/0x2d00/0x2e30` 191) plus its own rescale ballot (`FSETP.NEU` `0x2eb0`
+112).  Mixed (dyn) adds the per-span format `LDS.U8 [UR]` from `smem.kFormats` (`mhaUtils.cuh:35`,
+228 `wait` samples = 2.3 %) and has the largest `R2UR` share (312 = 3.1 %) plus format / scale
+branches 178+137+40+31.
 
 Two facts the record did not have: (1) in the **static fp8 / fp4 / a16 modules the whole tag
 pipeline is dead work** — `needsMixedPageExpansion` is a constant (`mhaUtils.cuh:231-236`), the
 hoisted copy ignores `formats` (`:1319`, `:1341-1345`), the expansion ignores them (`:1149-1152`)
 — yet the tag `LDG.E.U8`, the four shuffles, the `PRMT`s and the lane-0 stores execute per copy
-call because the stores are side effects (`mha.cu:2409`, `:2454-2457`, `:2965`, `:2972-2979`); and
-the tag address depends on the page-index `LDG` (`mhaUtils.cuh:212`, 66 long_sb samples), which is
-the dependent-load pair the "two tiles ahead" prefetch was built to hide (`mha.cu:2360-2392`).
+call because the stores are side effects (`mha.cu:2409`, `:2454-2457`, `:2965`, `:2972-2979`).
 (2) The per-span fold vote is a control dependency: the `asm volatile` loads of span s+1 cannot be
 hoisted above span s's `if (fold)` (`mhaUtils.cuh:1140-1144`), so the four chains of a K part run
 in series (~4 x 110 cycles) — step 6's "loads-first" order helped inside a span, not across spans.
 
-## 3. Design [45]: six register-only items, all under the [44] guards
+## 3. Design [45]: six register-only items, all under the [44] guards (rev 2)
 
-All code changes sit in `#if MIXED_BF16_PLACEMENT_EXPANSION` / `MIXED_HOISTED_COPY` blocks of
-`mha.cu` (kernel body: preprocessor guards, as [44] item 1 explains — an `if constexpr` there is
-still instantiated) and in the two [44] helpers of `mhaUtils.cuh` (never instantiated by sm120,
-sm90 q=1 or `mla_sm120`), so every other build's preprocessed source is unchanged.  No
-`SharedMem` member is added or removed (115,456 B stays; the four metadata arrays become unread
-in the guarded build but keep their slots so the barrier addresses do not move).
+All code changes sit in `#if MIXED_HOISTED_COPY` / `MIXED_BF16_PLACEMENT_EXPANSION` /
+`MIXED_COMPACT_TILE_LOOPS` blocks of `mha.cu` (kernel body: preprocessor guards, as [44] item 1
+explains — an `if constexpr` there is still instantiated) and in the two [44] helpers of
+`mhaUtils.cuh` (never instantiated by sm120, sm90 q=1 or `mla_sm120`), so every other build's
+preprocessed source is unchanged.  The loader lambdas (`loadPages` `mha.cu:2360-2392`, the flag /
+format stores `:2450-2457`, V `:2851-2867`, `:2966-2979`) are today under `#if
+ENABLE_MIXED_KV_CACHE` only; they become `#if MIXED_HOISTED_COPY <new> #else <stock verbatim>
+#endif`.  No `SharedMem` member is added or removed (115,456 B stays; the four metadata arrays
+become unread in the guarded build but keep their slots so the barrier addresses do not move).
+A new derived guard `MIXED_ALL_HOISTED_COPY = MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT != 0`
+marks the modules whose every K / V copy is the hoisted copy (fp8 / fp4: the stock A16 path is
+dead once the expansion flag is the constant true; dyn: `kA16CopyFastPath` is false); the a16
+module keeps the stock A16 copy, whose `HeadPtr` wants the page vector.
 
 ### 3.1 [45a] One fold vote per call (expansion helper, `mhaUtils.cuh:1090-1162`)
 
-Load every span's scale word first (K: 4 x `LDS.U16` at `scaleAddr + 64 span`, V: 2), run the
-chain once — 4 x `F2FP.F16.E4M3` (independent, back-to-back on the XU pipe), 4 x `HADD2.F32`,
-8 x `FMUL`, a 7-deep `FMNMX` tree, `FSETP`, one `VOTE.ALL`, one `BRA` — then the span bodies.
-Static modules: two whole-call bodies (fold / fallback), spans unrolled and branch-free inside.
-Dynamic module: `f_i` per span with the span's own `(g, 2^k)` selected by its tag (A16 spans
-contribute 0), one vote over the call, then the rolled span loop with the per-span format branch
-selecting `body<fold>` from the call-level flag (warp-uniform).  `sf2` per span is recomputed from
-the kept scale word after the vote (1 `F2FP` + 1 `HADD2` + 2 `FMUL` + 2 `F2FP.PACK`, a ~30-cycle
-chain with no vote and no branch; +2 live registers) rather than kept for all spans (+8).
-Bit-exactness is unchanged: both bodies give the reference's single rounding ([44] rev 2); a call
-takes the fallback iff any span would have.  The fold frequency is unchanged on the bench (FP8
-scales capped at 128, unit global scales) and the `tinyglobal` / `maxscale` matrix rows exercise
-the fallback.
+Static modules: load every span's scale word first (K: 4 x `LDS.U16` at `scaleAddr + 64 span`,
+V: 2) and span 0's payload (loads-first, as [44]), run the chain once — 4 x `F2FP.F16.E4M3`
+(independent, back-to-back on the XU pipe), 4 x `HADD2.F32`, 8 x `FMUL`, `FABS`/`FMNMX` tree,
+`FSETP`, one `VOTE.ALL`, one `BRA` — then two whole-call bodies (fold / fallback) with the spans
+unrolled and branch-free inside.  `sf2` per span is recomputed from the kept scale word inside the
+body (1 `F2FP` + 2 `HADD2` + 2 `FMUL` + 2 `F2FP.PACK`, ~30 cycles, no vote, no branch), so the
+live set across the vote is `s01[nbSpans]` (4) + span 0's payload (8) = 12 registers against
+today's `s01 + r0 + r1 + f0 + f1` (5) + payload (8) = 13: **-1 register**, +3 instructions per
+span.  Dynamic module: the pre-vote pass is unrolled over the 4 spans with each span's `(g 2^k,
+foldOk)` **selected** by its tag byte from the register format word ([45c]) — `f_i = compressed ?
+|r_i g 2^k| : 0` is a select, never a multiply of a possibly stale smem word (A16 / BAD-page scale
+rows are never written by the copy's scale loop, `mhaUtils.cuh:1350-1372`, so a stale NaN would
+otherwise force a spurious whole-call fallback); `foldOk` is ANDed over the formats present; one
+vote; then the rolled span loop with the per-span format branch and `fold ? body<true> :
+body<false>` selected from the call-level flag (warp-uniform, no vote).  The rolled body re-reads
+its span's scale word (`LDS.U16`, register-neutral) instead of indexing `s01[]` at run time.
+Bit-exactness is unchanged: both bodies give the reference's single rounding ([44] rev 2), and a
+call takes the fallback iff any span would have (per-span bounds are still evaluated exactly).
+The fold frequency is unchanged on the bench (FP8 scales capped at 128, unit global scales) and
+the `tinyglobal` / `maxscale` matrix rows exercise the fallback.  Pre-existing and out of scope
+(follow-up): a BAD page inside a compressed static module's tail part has a stale scale word
+(payload zero-filled) — bit-identical to today (both bodies give NaN x 0 for that span, as today),
+but under [45a] the stale word can also send the *other* spans of the call to the fallback body
+(bit-exact, perf-only); a zero-length `cp.async` for BAD-page scale rows would make it
+deterministic.
 
 Dependency depth per K part: today 4 x (11-deep chain, ~110 cycles, serialised by the branch) =
-~440 cycles of exposed latency + the branch-resolve `wait` per span; after: 1 x ~130 + 4 x ~30 =
-~250: **-190 cycles per part, -380 per tile**, plus -10 instructions per K call and -5 per V call
-(-160 U).  Counted conservatively against the measured 2,300 cycles of chain samples per tile:
-the design budgets **-660 cycles per gemm0 tile** (the measured chain time is 2,300 because the
-XU conversion and the vote are also issue-limited at 4 warps per SMSP; only the serialisation part
-is removed).
+~440 cycles of exposed latency + a branch-resolve `wait` per span; after: 1 x ~130 + 4 x ~30 =
+~250: **-190 cycles per part, -380 per tile** (V: 2 x 110 -> 130 + 60: -90 per iteration, -360 per
+tile).  The remaining ~1,900 measured cycles of the chain items are XU conversion + issue at 4
+warps per SMSP and are not claimed.
 
-### 3.2 [45b] Two register sets, software-pipelined spans (same helper)
+### 3.2 [45b] Two register sets, block-pipelined spans (static modules only)
 
-With the branch gone, a span body is straight-line; issue span s+1's payload `LDS.128` x2 (FP8) /
-`LDS.64` x2 (FP4) into the *other* register set before span s's decode and `STS.128` x4, so the
-next load never WARs on registers the previous stores still read and each span's LDS latency is
-covered by ~40 instructions of the previous span's decode.  +8 registers (FP8) / +4 (FP4).  Static
-modules: explicit `packedA` / `packedB` in the unrolled spans; dynamic module: unroll the span
-loop by 2 inside the format branch only if the hot loop stays <= 2,800 SASS (step-6 A1 bound),
-else keep one set (the dyn module's short_sb is 0.73, the smallest).  Budget: -30..-40 cycles per
-span -> **-240..-320 per gemm0 tile**, and the `LDS.128` short_sb samples (51 / 127) -> ~0.
+With the branch gone, a static span body is straight-line; issue span s+1's block-0 payload `LDS`
+before span s's block-0 decode + `STS.128` x2, and span s+1's block-1 `LDS` before span s's
+block-1 decode + stores, into the *other* register set (`packed[2][2]`, indexed by the unrolled
+span parity — compile-time indices).  The next load then never WARs on registers a still-draining
+`STS` reads (the load is issued before those `out` registers exist), and each `LDS` latency is
+covered by ~24 instructions of the previous block's decode.  Peak live set: `packed[set][1]` (4) +
+`packed[nxt][0]` (4) + `packed[nxt][1]` (4) + `out` (8) + `sf2` (2) = 22 vs today's 18: **+4
+registers (FP8), +2 (FP4)** (`ldsB64` fills two words per block).  **Dynamic module: one set** —
+one span = one page and adjacent spans may differ in format (`mhaUtils.cuh:1140-1152` branches per
+span), so pairing spans inside one format branch would decode an FP4 page with the FP8 body; the
+format-agnostic alternative (issue `LDS.128` x2 for every span and let the FP4 decode consume the
+low 8 B) was not taken because the dyn module's short_sb is the smallest (0.73) and the [45b]
+gain there is < 0.3 %.  Budget: the `LDS.128` short_sb samples (51 gemm0 / 127 gemm1 on fp8) at
+an MIO-queue realisation (section 3.7).
 
-### 3.3 [45c] Metadata in registers: flags, formats, tags (`mha.cu` K and V loaders)
+### 3.3 [45c] Metadata in registers: flags, formats, tags (`mha.cu` K and V loaders) — rev 2
 
-- `kNeedsExpansion` / `vNeedsExpansion`: the value is warp-uniform and produced by the same warp
-  one part / one iteration earlier (`mha.cu:2450-2457`, `:2966-2979`); keep it in a two-entry
-  register rotation with the `CircIdx` instead of the lane-0 `STS.U8` + `__syncwarp` + `LDS.U8 ->
-  ISETP -> BRA` after the DEPBAR (`:2629`, `:3310`).  Static modules: `if constexpr` on
-  `MIXED_PAGE_STATIC_FORMAT > 0` (the flag is the constant `true`), so the flag store, its
-  `__syncwarp` and the read disappear entirely.  Removes the 114 + 125 (fp8) short_sb samples:
-  **-490 cycles per gemm0 tile**, -540 per gemm1 tile.
-- `kFormats` / `vFormats`: pass the tag word by value (one `u32` = 4 tags, two rotated registers)
-  to the expansion instead of by reference to smem; the dynamic module's `selectByIndex` then
-  works on a register (`mhaUtils.cuh:1149-1152`; today `LDS.U8 [UR]`, 228 `wait` samples on mixed).
-- Tags without shuffles: static modules **do not load tags at all** (dead work, section 2 fact 1):
-  `mixedPageTagLane` / `broadcastMixedPageTags` and the `STS` of formats are skipped under
-  `MIXED_PAGE_STATIC_FORMAT >= 0` (the a16 module too: `kA16CopyFastPath`, `mha.cu:94`).  The
-  dynamic module has every lane load the four tags itself (4 predicated `LDG.E.U8` to the same
-  addresses: one L1 wavefront each) into byte registers packed once, in place of 1 `LDG` + 4
-  `SHFL.IDX` + 3 `PRMT` per copy call (`mhaUtils.cuh:205-227`).  Removes the `PRMT <- SHFL`
-  samples (90 gemm0 / 151 gemm1 on fp8): **-390 cycles per gemm0 tile**.  Register cost: +2 (flag
-  rotation folds into the tag word: A16 tag is 0; `needsExpansion = tagWord != 0`), +3 for the
-  direct tags in the dyn module.
+- **Static modules (`MIXED_PAGE_STATIC_FORMAT >= 0`): no tags at all.**  The decision
+  `needsExpansion` is the build constant `kMixedStaticNeedsExpansion = MIXED_PAGE_STATIC_FORMAT
+  > 0` (fp8 / fp4: every part is expanded; a16: never).  `mixedPageTagLane`,
+  `broadcastMixedPageTags`, the `STS.U8` flag + `STS` formats, the `__syncwarp` and the `LDS.U8 ->
+  ISETP -> BRA` after the DEPBAR disappear (the copy and the expansion ignored the tags already:
+  section 2 fact 1).  In fp8 / fp4 the stock A16 copy branch is provably dead and is removed by
+  the preprocessor (`MIXED_ALL_HOISTED_COPY`); in a16 the hoisted branch is dead and removed, the
+  stock A16 copy stays, so the a16 module changes only by losing its tag pipeline.  Dropping the
+  loader `__syncwarp()` is safe: it existed only for the lane-0 `STS -> LDS` flag path (the stock
+  loaders issue `cp.async` with no `__syncwarp` before it).
+- **Dynamic module: one packed tag word per buffer, in registers.**  `pageTagLane` (lane s holds
+  the tag of page s, BAD / past-the-tile lanes 0 = `kA16`) is packed once per copy call by
+  `packMixedPageTags`: one `redux.sync.or.b32` over `tag << 8 lane` (sm80+; the word is
+  warp-uniform by construction and lands in the uniform datapath) instead of 4 `SHFL.IDX` + 3
+  `PRMT`.  The word is (i) passed by value to the hoisted copy, whose per-span format is
+  `(word >> 8 span) & 0xFF` (uniform ALU; the scale loop's per-lane page uses the same shift with
+  a lane-dependent count), (ii) kept in **two named registers** `kTagWordNext` (written by the
+  copy of buffer *next*) / `kTagWordCurr` (read by the expansion of buffer *curr*), copied at the
+  two `idxCurrSMemKBuf++` sites (prologue and loop) — a `bool[2]` / `u32[2]` indexed by the runtime
+  `CircIdx` would go to local memory (the `mixedVExpandParity` comment records the same trap; the
+  LDL/STL 0 gate would catch it), (iii) the expansion's `needsExpansion` is `word != 0` (`ISETP` on
+  a register) and its per-span format is the same byte extract (today `LDS.U8 [UR]`, 228 `wait`
+  samples on mixed).  V: `vTagWordNext` / `vTagWordCurr` at the two `idxCurrSMemVBuf++` sites.
+  **Register cost: +2 (two words; `pageFormats` and the flag disappear: net +1).**
+- Not done in rev 2: rev 1's "every lane loads the four tags itself" (4 `LDG.E.U8` to the same
+  address) — uniform addresses would give ptxas four more values to `R2UR` at the load site
+  (blocker 3); the lane-distributed tag load stays and is consumed by one `REDUX`.
+- Probe build (`MIXED_KV_PROBE_C`: placement expansion on, hoisted copy off): the expansion takes
+  the word from the staged `MixedPageFormats` (`mixedPageTagsWord`), so that build still compiles.
 
-### 3.4 [45d] Metadata prefetch one stage deeper (dyn module; static modules need only the pages)
+### 3.4 [45d] Lane-distributed page indices (replaces rev 1's "prefetch one stage deeper")
 
-Today (`mha.cu:2360-2392`, `:2531-2536`; V `:2851-2867`, `:2881-2919`): `loadPages(p)` moves
-`pageIdxNext -> pageIdx`, issues the tag `LDG` for `pageIdx` and the index `LDG` for `pageIdxNext`;
-the K copy for tile t+1 consumes `pageIdx` and the tag one part body (~3 us) after the tag issue,
-one tile after the index issue; the V side consumes them one V iteration (~2 us) later.  The
-samples say the consumers still stall (section 2: 6.3 % fp8, 7.2 % mixed on `R2UR` / `LDC.64` /
-`IADD3.X` / `IMAD.WIDE` / the tag-address `IADD3`).  Two changes, both register-only: (i) in the
-static modules the tag load and its dependency on the index disappear with [45c], so the index has
-a full tile of cover before its only consumer (the copy); (ii) in the dynamic module rotate three
-index vectors (`pageIdx`, `pageIdxNext`, `pageIdxNext2`: +4 registers K, +2 V) and two tag words
-(+1), so the tag `LDG` for tile t+2 is issued at tile t from indices loaded at tile t-1, and every
-consumer is >= one tile behind its load.  Budget: the copy's page/tag long_sb (~1,340 cycles per
-gemm0 tile fp8; ~2,500 mixed) -> **<= 200**.  This is the "pipeline depth" the step-6 followup
-asked for, in the only pipeline where the samples show exposure.
+Rev 1 proposed a third index vector and a second tag word.  Section 2 (a) shows the stall is at
+the *load* site: `getPage` loads the same address in every lane, ptxas proves the value uniform
+and, at 124-127 registers, parks it in a uniform register with an `R2UR` 12 instructions after the
+`LDG` — the L2 round trip is exposed there regardless of how far away the copy is.  Rotating more
+uniform vectors changes nothing.  The fix is structural: **the page index must never be provably
+uniform**.  `getPageLaneUngated<nbLoadedPages>` has lane s (s < nbLoadedPages) load page
+`idxPageBeg + s` (one predicated `LDG` per warp, one 16 B sector, `ld.global.nc` in an `asm
+volatile` so the compiler cannot fold the [45f] bounds predicate into the `nbPages` select) and
+returns one `KVCachePageIndex` per lane (BAD for lanes past the tile and pages past `nbPages`):
+**1 register instead of 4 (K) / 2 (V) per rotation stage, no `R2UR`**.  The tag load becomes
+`mixedPageTagOfLane(transport, pageLane)` (each lane loads the tag of its own page; no
+`selectByIndex`).  Consumers read the value in the copy with `__shfl_sync(~0, pageLane, span)`
+— one `SHFL.IDX` per span (K 4, V 2) plus one per scale-loop iteration with a lane-dependent
+source (K 2, V 1) — so the value stays in vector registers until its use, and the `SHFL` result
+is not uniform-provable either.  Cost: +6 `SHFL` per K copy call (+12 issue slots per tile,
+~50 cycles), +3 per V call; today's 4 `SHFL` + 3 `PRMT` of the tag broadcast are gone ([45c]).
+Applies to the `MIXED_ALL_HOISTED_COPY` modules (fp8 / fp4 / dyn); the a16 module keeps the
+`Vec` form (its stock copy's `HeadPtr` indexes the vector).  The prefetch distance is unchanged
+(indices two tiles ahead, tags one tile ahead): the `R2UR` was never a distance problem.  (b) is
+not addressed: the address-register WAR is the LDGSTS batch draining; the design prices it at 0
+and gates only that the `LDGSTS` count is unchanged.  Budget: the `R2UR` sites (173 samples fp8
+gemm0, ~150 gemm1; 312 mixed) at a latency realisation (section 3.7).  A1 gates: `R2UR` fed by
+the page-index `LDG` 0 in every module; `LDG` in `loadPages` 1 (index) + 1 (tag, dyn) per call
+instead of 4 + 1.
 
 ### 3.5 [45e] `computeRowSum` quad broadcast with a constant mask (`mha.cu:798-805`)
 
 `__shfl_sync(0xF << (laneId() / 4 * 4), rowSum[i], 0, 4)` has a lane-dependent mask, so ptxas
 emits `WARPSYNC / MATCH.ANY / REDUX.OR / VOTEU / BRA.DIV` convergence code around every shuffle
-(`0x11300-0x11410`, ~150 samples = 1.5 % of fp8, on gemm0's critical path).  The same broadcast as
+(`0x11300-0x11360`, 111 samples = 1.1 % of fp8, on gemm0's critical path).  The same broadcast as
 `__shfl_sync(~0U, rowSum[i], laneId() & ~3U)` (full mask, quad-base source lane, width 32) is one
-`SHFL.IDX`.  Values are identical (a broadcast of lane 0 of the quad either way).  Guarded under
-`#if MIXED_COMPACT_TILE_LOOPS` so the sm120 and M32 modules keep their SASS.  **-650 cycles per
-gemm0 tile.**
+`SHFL.IDX`.  Values are identical (a broadcast of lane 0 of the quad either way);
+`computeRowSum` runs unconditionally in the converged gemm0 warp (`mha.cu:2777`).  Guarded under
+`#if MIXED_COMPACT_TILE_LOOPS` inside the function body so the sm120 and M32 modules keep their
+SASS.  **-480 cycles per gemm0 tile modelled.**
 
 ### 3.6 [45f] Prologue: page-list load not gated on `cacheSeqLen` (`mha.cu:2280-2305`, `:2385-2392`)
 
 The per-CTA chain before the first K copy is `getCacheSeqLen` (`LDG`, `:2280`) -> `nbPages`
-(`:2304`) -> `getPage` (`idxPage < nbPages ? LDG : BAD`, `mhaUtils.cuh` `getPage`) -> tag `LDG` ->
-copy -> landing: three dependent round trips plus the landing, ~3-5 us of a ~31 us CTA lifetime
-(the [42] host model already carries it as `kFixedCostInTiles = 1`, `mha.cu:3941`; at n = 5 a CTA
-runs 3.2 tiles).  The page-list read does not need `nbPages`: `kvCachePageList[maxNbPagesPerSeq x
-idxReq + idxPage]` is in bounds for every `idxPage < maxNbPagesPerSeq`, so load unconditionally
-(predicated on `idxPage < maxNbPagesPerSeq`, a kernel parameter) and select `BAD` after both loads
-land.  Removes one round trip per CTA (~0.7-1.5 us): **-2.5..-5 % of the wall on every mode**,
-including a16.  Guarded (`kCompactTileLoops`); the `XQA_NB_SUB_SEQ` sweep of step 4 is *not*
-re-run in this step (the [42] constants stay).
+(`:2304`) -> `getPage` (`idxPage < nbPages ? LDG : BAD`) -> tag `LDG` -> copy -> landing: three
+dependent round trips plus the landing.  The page-list read does not need `nbPages`:
+`kvCachePageList[maxNbPagesPerSeq x idxReq + idxPage]` is in bounds for every `idxPage <
+maxNbPagesPerSeq` (`maxNbPagesPerSeq = page_table.shape[-1]`, `flashinfer/xqa.py:430-431`,
+`mha.cu:3851`: the row stride `getPage` already indexes with), so load predicated on
+`idxPage < maxNbPagesPerSeq` (a kernel parameter) and select BAD on `idxPage < nbPages` after
+both loads land (`cacheSeqLen == 0` gives `nbPages 0` and the select reproduces today's values).
+The load is an `asm volatile ld.global.nc` so the compiler cannot merge the two predicates back
+into one that depends on `nbPages`.  Removes one round trip per CTA (3 -> 2 dependent round trips
+in the dyn module, whose tag `LDG` still depends on the BAD select; 2 -> 1 in the static modules,
+which load no tags after [45c]).  Under `SLIDING_WINDOW=1` `idxPageBeg` depends on `cacheSeqLen`
+and the item is a no-op (still correct); the bench builds have `SLIDING_WINDOW=0`.  Guarded
+(`MIXED_COMPACT_TILE_LOOPS`) at the two `loadPages` call sites: `kCompactTileLoops` is defined in
+`mha.cu` after `mhaUtils.cuh` is included, so the helper is a separate `getPageUngated` (rev 1
+said "guarded in getPage", which cannot see the macro).  **Wall share (rev 2):** ~0.7-1 us per
+CTA lifetime of 31 us, overlapped with the co-resident CTA's issue: ~2.6 waves x ~1 us / 113 us
+= **~1-2 %** on every mode incl. a16 (rev 1's 2.5-5 % counted the per-CTA saving 1:1).  The
+`XQA_NB_SUB_SEQ` sweep of step 4 is *not* re-run in this step (the [42] constants stay).
 
-### 3.7 Budget: per gemm0 warp-tile (fp8) and the predicted wall
+### 3.7 Budget (rev 2): per item, per role, with the realisation factor of its mechanism
 
-| item | gemm0 cycles per tile (of 16,700) | gemm1 cycles per tile (of 16,340 busy) | registers |
-|---|---|---|---|
-| [45a] vote once | -660 | -440 | +2 |
-| [45b] two sets | -280 | -240 | +8 / +4 |
-| [45c] flags / formats / tags in registers | -880 | -1,190 | +2 (+3 dyn) |
-| [45d] prefetch depth | -1,140 | -1,700 | +5 (dyn) |
-| [45e] rowSum mask | -650 | 0 | 0 |
-| **sum** | **-3,610 (-21.6 %)** | -3,570 | +12..+20 |
-| [45f] prologue | -0.7..-1.5 us per CTA lifetime (31 us) | | 0 |
+Realisation factors, by mechanism (step 6's lesson: removed stalls migrate): **deterministic
+instruction removal** (convergence code, dead work) 0.8-0.9; **exposed latency of a dependency
+chain** (R2UR at load, serialised chains) 0.5-0.7 — the three co-resident warps per SMSP already
+cover part of it, and `not_selected` rises when it is removed; **MIO-queue waits** (an LDS behind a
+just-issued LDGSTS batch, STS -> LDS register WAR) 0.3-0.5 — the queue wait moves to the next MIO
+op in the same warp.  Cycles per tile at 4.31 cycles per sample, fp8 module.
 
-After the cut gemm0 ~13,100 cycles, gemm1 ~12,800: gemm0 still paces, gemm1's slack shrinks from
-20 % to ~2-5 % (its `xBar.produced` samples fall from 9.6 % to 3-6 %, which is the sign the
-model is right).  Realisation: the removed stalls are one warp's, and the three co-resident warps
-per SMSP take part of the freed issue slots (not_selected rises); step 5 -> 6 taught that a
-count-only model over-predicts, so the design takes **0.7-0.9 of the modelled cut**.  Wall model:
-`t = fill + active x (1 - r x 0.216)` with fill ~5 us on fp8/fp4/mixed (a16: DRAM-side, only [45c]
-tags, [45d], [45e], [45f] apply, and its long_sb is DRAM landing at 67 % of peak).
-
-| mode | today | modelled (r = 0.7 / 0.9, + [45f] -2.5..-5 %) | **predicted band** | accept | reject (revert the step) | target |
+| item | mechanism | gemm0 modelled | gemm0 budget (x r) | gemm1 modelled | gemm1 budget | registers |
 |---|---|---|---|---|---|---|
-| fp8 | 113.5 (116.7 in the step-6 session) | 96.5 / 91.5 | **91-99** | <= 99 | > 116 (1.02x) or a16 > 87 | <= 94: **marginal** — needs r >= 0.85 and [45f] |
-| fp4 | 101.5 | 86 / 81.5 | **82-90** | <= 90 | > 104 | <= 59: not this kernel (step 6 section 5.3) |
-| mixed | 107.8 | 91 / 85.5 (its page/tag + format-LDS share is the largest) | **88-97** | <= 99 | > 110 | <= 101: **pass** |
-| transport_a16 | 83.4 | 80 / 77 | **77-84** | 77-86 | > 87 | 135: pass |
+| [45a] one vote per call | serialised chains (latency) | -380 | **-190..-270** | -360 | -180..-250 | -1 |
+| [45b] block-pipelined spans (static) | STS -> LDS WAR (MIO queue) | -220 (51) | **-70..-110** | -550 (127) | -160..-270 | +4 FP8 / +2 FP4 |
+| [45c] flag in registers | LDS.U8 behind the LDGSTS batch (MIO queue) | -490 (114) | -150..-250 | -540 (125) | -160..-270 | +1 (dyn), -1 (static) |
+| [45c] tags: dead work / REDUX | deterministic removal (90 `PRMT <- SHFL` + ~24 instructions per tile) | -390 - 100 | -350..-440 | -650 (151) - 100 | -520..-680 | 0 |
+| [45d] lane-distributed pages | R2UR at load (latency); +6 SHFL per K call | -750 (173) + 50 | **-320..-470** | -650 (~150) + 50 | -270..-400 | -6 (K), -2 (V) |
+| [45e] rowSum mask | deterministic removal | -480 (111) | **-380..-430** | 0 | 0 | 0 |
+| **sum** | | -2,760 | **-1,460..-1,970 = -8.7..-11.8 % of 16,700** | -2,800 | **-1,290..-1,870 = -7.9..-11.4 % of 16,340** | net -2..+4 over 124-127 |
+| [45f] prologue | one round trip per CTA lifetime | | -1..-2 % of the wall, all modes | | | 0 |
+| (b) address-register WAR | LDGSTS batch drain | 1,440 | **0** | ~820 | 0 | |
 
-The honest statement for the targets table: **mixed <= 101 is predicted with margin; fp8 <= 94 is
-inside the band but at its good end** — it needs the gemm0 cut to land at >= 85 % of the model
-*and* [45f]; fp8 in 95-99 with the A2 counters at their predicted values means the model was right
-about the mechanism and the remaining 1-5 us is the fill / wave tail ([42]'s n and the per-CTA
-fixed cost: a re-sweep of `XQA_NB_SUB_SEQ` on the new build is then the follow-up, not another
-dependency cut).
+Wall model (lock-step): `t = today x (1 - min(gemm0 cut, gemm1 cut)) x (1 - [45f])` with the
+fill unchanged in absolute terms (it is one gemm0 tile-time per CTA start and shrinks with the
+tile).  fp8: cut 7.9-11.4 % + 1-2 % -> **99-105 us**.  fp4 (101.5; its chain / F2FP / LDS
+samples are larger, R2UR similar): **88-93**.  mixed (107.8; R2UR 3.1 % + format `LDS.U8 [UR]`
+2.3 % + branch `wait` on the staged flag, all removed or turned into register ALU; no [45b]):
+**92-97**.  transport_a16 (83.4; only the tag pipeline, [45e] and [45f] apply; its long_sb is DRAM
+landing at 67 % of peak): **80-82**.
 
-## 4. Order of work and the register gate
+| mode | today | predicted band | target | verdict on the target |
+|---|---|---|---|---|
+| fp8 | 113.5 | **99-105** | <= 94 | **not reached by this step** (rev 1's 91-99 assumed 20 % gemm1 slack and a 1:1 [45f]); the residual is the fill / wave tail ([42]) and the LDGSTS-batch drain (b), i.e. copy shape (A2/D6), both out of scope here |
+| fp4 | 101.5 | **88-93** | <= 59 | not this kernel (step 6 section 5.3) |
+| mixed | 107.8 | **92-97** | <= 101 | **pass predicted** (margin 4-9 us) |
+| transport_a16 | 83.4 | **80-82** | 135 | pass |
 
-One commit per item, measured by A1 after each; the order puts the cheapest, most certain items
-first and the register-hungriest last: **[45c] -> [45e] -> [45f] -> [45d] -> [45a] -> [45b]**.
-Gate after every commit: `cuobjdump -res-usage` REG <= 128, STACK 0, LDL 0, STL 0 on all four
-sm90 q=4 modules.  If a commit breaks the gate, its fallback is: [45b] -> single set (drop the
-item); [45a] -> recompute `sf2` per span (already the default) or keep the per-span vote in the
-dyn module only; [45d] -> static modules only (no extra registers); [45c] -> keep the format word
-in smem for the dyn module.  Nothing is traded for registers: 2 CTAs/SM is the step-4 lever and
-outranks every item here.
+## 4. Order of work, the register gate, live-set arithmetic per item
 
-## 5. Verification artifacts (mechanism first, stopwatch last)
+One commit per item, in the order **[45c] -> [45e] -> [45f] -> [45d] -> [45a] -> [45b]** (cheapest
+and most certain first; the register-costing item last).  Gate after every commit (remote, not in
+this worktree): `cuobjdump -res-usage` REG <= 128, STACK 0, LDL 0, STL 0 on all four sm90 q=4
+modules.  Live-set deltas at the kernel's pressure point (the gemm0 part body: `acc` 32 + Q / K
+fragments + loop state + the expansion's 18-22), against the 124 (dyn) / 127 (a16) / 126 / 126
+(fp8 / fp4) of step 6:
 
+| commit | static fp8 / fp4 | dyn | why |
+|---|---|---|---|
+| [45c] | -1 (`pageTagLane`, `pageFormats` word and the flag register go) | +1 (`kTagWordCurr/Next` +2, `pageFormats` -1) | by construction: nothing new is live across the part body except the two words |
+| [45e] | 0 | 0 | one SHFL replaces a convergence sequence |
+| [45f] | 0 | 0 | same values, one more predicate |
+| [45d] | -6 K side, -2 V side (a `Vec<int,4>` x 2 -> two scalars) if they were vector registers; 0 if ptxas held them in URs | same | fewer live values, none added |
+| [45a] | -1 | 0 (pre-vote temporaries die before the loop; the body re-reads the word) | `s01[4]` replaces `s01, r0, r1, f0, f1` |
+| [45b] | +4 (FP8) / +2 (FP4) | 0 (not applied) | second payload set |
+
+Net -4..+4 over 126: [45b] is the only item that can cross 128, and it is last.  Fallbacks if a
+commit breaks the gate: [45b] -> `MIXED_EXPANSION_PIPELINED_SPANS 0` (single set; drop the item);
+[45a] -> keep the per-span vote in the dyn module only (static modules keep the call vote);
+[45c] -> keep the format word in smem for the dyn module; [45d] -> none needed (it frees).  Nothing
+is traded for registers: 2 CTAs/SM is the step-4 lever and outranks every item here.
+
+## 5. Verification artifacts (mechanism first, stopwatch last) — rev 2
+
+- **A0 (before any timing; pristine tip `659eacfa`, one ncu `SourceCounters` launch at
+  `XQA_NB_SUB_SEQ=1` next to the step-6 default run):** the `0x2e40` + `NANOSLEEP` share at
+  n = 1 vs n = 5 (fill: ~5x lower; slack: unchanged) — decides whether section 2's lock-step
+  reading holds (if not, the rev 1 budget applies and this doc is amended before A4).  Same run:
+  the `R2UR` sites at `mhaUtils.cuh:1519` keep their share (per-load).
 - **A1 (SASS, `cuobjdump -sass` / `-res-usage`, loops delimited by back-edges as in step 5; all
-  four sm90 q=4 modules):** `VOTE.ALL` 6 -> 2 (fp8, fp4: one per call site; dyn 2), `F2FP.F16.E4M3`
-  in the expansion 4 per K call issued back-to-back before the vote, `MATCH.ANY` / `REDUX` /
-  `BRA.DIV` in `computeRowSum` 0, `SHFL.IDX` in the tile loops 0 in every module (tags), `LDS.U8`
-  at the flag offsets (`+0x1b030`, `+0x1b038` today) 0, `STS.U8` / `STS` flag and format stores 0
-  in the static modules, `LDG.E.U8` tag loads 0 (static) / 4 per copy call (dyn), `LDGSTS` static
-  counts unchanged (47 / 47 / 55 / 65), `LDS.128` / `LDS.64` 2 and `STS.128` 4 per span-call
-  unchanged, `DEPBAR.LE SB0, 0x1` 3 per module unchanged; REG <= 128, STACK 0, LDL 0, STL 0; hot
-  loops gemm0 part <= 1,200 SASS (1,114), gemm1 V <= 800 (726), dyn total hot <= 2,800.
+  four sm90 q=4 modules):** `VOTE.ALL` in the expansion 6 -> 2 (one per call site: K, V; dyn 2);
+  `F2FP.F16.E4M3` in the static expansion 4 per K call issued before the vote; `MATCH.ANY` /
+  `BRA.DIV` in `computeRowSum` 0; `SHFL.IDX` in the tile loops: 0 in the static modules for tags
+  (rev 1's "0 everywhere" is superseded: [45d] adds 6 per K copy call / 3 per V call for the page
+  index — `SHFL.IDX` count per copy call = nbSpans + scale iterations, no `PRMT` after them);
+  `REDUX` 1 per copy call in the dyn module (`packMixedPageTags`), 0 in static; `R2UR` whose source
+  is the page-index `LDG` 0 in every module; `LDG` in `loadPages` 1 (+1 tag in dyn) per call; `LDS.U8`
+  at the flag offsets (`+0x1b030`, `+0x1b038` today) 0; `STS.U8` / `STS` flag and format stores
+  0; `LDG.E.U8` tag loads 0 (static) / 1 per `loadPages` (dyn); `LDGSTS` static counts unchanged
+  (47 / 47 / 55 / 65); `LDS.128` / `LDS.64` 2 and `STS.128` 4 per span-call unchanged; the static
+  fold body's `LDS` of span s+1 precede the `STS` of span s ([45b]); `DEPBAR.LE SB0, 0x1` 3 per
+  module unchanged; REG <= 128, STACK 0, LDL 0, STL 0; hot loops gemm0 part <= 1,200 SASS
+  (1,114), gemm1 V <= 800 (726), dyn total hot <= 2,800.
 - **A2 (ncu one launch, `--launch-skip 1 --launch-count 1`, the step-6 metric list plus
   `SourceCounters` on the `-lineinfo` build whose stripped SASS must be byte-identical to
-  production):** `smsp__inst_executed.sum` fp8 36.0 -> 33.5-35 M, fp4 36.5 -> 34-35.5, mixed
-  42.4 -> 39-41, a16 29.9 -> 28.5-29.9; warp-cycles per issued instruction fp8 8.13 -> <= 6.8,
-  fp4 7.30 -> <= 6.2, mixed 6.56 -> <= 5.7; short_scoreboard fp8 2.01 -> <= 1.3, fp4 1.64 ->
-  <= 1.1; long_scoreboard fp8 1.81 -> <= 1.2, mixed 1.34 -> <= 0.9; issue-active fp8 43 -> >= 50 %;
-  no_instruction <= 0.8; `launch__shared_mem_per_block_dynamic` 115,456 B and occupancy limits
-  2 / 2 unchanged.  PC sampling by the section-2 regions: `xBar.produced` TRYWAIT-branch samples
-  9.6 % -> 3-6 % (gemm1's slack consumed — if it stays >= 8 %, gemm0 did not shorten and the
-  item counts are read again); page/tag consumer long_sb in the copy 6.3 % -> <= 1 %; flag `ISETP`
-  2.4 % -> 0; `PRMT <- SHFL` 2.4 % -> 0; `F2FP.E4M3` + fold `BRA` 4.0 % -> <= 1.2 %; the
-  `MATCH.ANY` group 1.5 % -> 0; the three DEPBAR neighbourhoods stay at ~0 long_sb (the
-  no-depth claim, re-checked on the new build).
+  production):** `smsp__inst_executed.sum` fp8 36.0 -> 34-35.5 M, fp4 36.5 -> 34.5-36, mixed
+  42.4 -> 39.5-41.5, a16 29.9 -> 28.8-29.9; warp-cycles per issued instruction fp8 8.13 -> <= 7.3,
+  fp4 7.30 -> <= 6.6, mixed 6.56 -> <= 6.0; short_scoreboard fp8 2.01 -> <= 1.5, fp4 1.64 ->
+  <= 1.25; long_scoreboard fp8 1.81 -> <= 1.45, mixed 1.34 -> <= 1.05 (the WAR part, ~3.4 %,
+  stays by design); `launch__shared_mem_per_block_dynamic` 115,456 B and occupancy limits 2 / 2
+  unchanged.  **PC sampling by the section-2 regions (the produced-wait rule of rev 1 is
+  replaced):** (i) gemm0 tile-loop samples per warp-tile 0.445 (3,873 / 8,704) -> 0.39-0.41 and
+  gemm1 busy samples 3,791 -> 3,350-3,500 — both roles shrink, that is the sign the model is right;
+  (ii) the `xBar.produced` wait stays ~1,150-1,250 samples in absolute terms (one gemm0 tile-time
+  per CTA start; its *share* rises to 11-12 % as the loops shrink — expected, not a failure);
+  (iii) the `xBar.consumed` TRYWAIT (`mhaUtils.cuh:1677` / `mha.cu:2777`, the `0xf190`-class site)
+  0.7 % fp8 / 1.8 % mixed -> if > 3 %, gemm1 has become the pacing role and the V-side items
+  decide the next step; (iv) `R2UR` long_sb at the page loads 1.7 % -> 0; flag `ISETP` 2.4 % -> 0;
+  `PRMT <- SHFL` 2.4 % -> 0; `F2FP.E4M3` + fold `BRA` 4.0 % -> <= 2 %; the `MATCH.ANY` group
+  1.1 % -> 0; the WAR sites (b) ~3.4 % -> unchanged or moved onto the `LDGSTS` themselves
+  (`lg_throttle`); the three DEPBAR neighbourhoods stay at ~0 long_sb.
 - **A3 (correctness and byte-identity — shared files):** `tests/attention/run_xqa_mixed_page_transport.py`
-  72/72 bit-exact on nkcut2 (default and `XQA_NB_SUB_SEQ=2`) and on ws-1, after every commit;
-  ws-1: all eight sm120 `xqa_mha` modules (formats -1/0/1/2 x q=1/q=4) and `mla_sm120` stripped
-  SASS byte-identical to a pristine `659eacfa` build made in the same session (the dyn q=1 pair may
-  show the known ptxas pristine-vs-pristine variation: compare against two pristine builds before
-  reading it as a leak); nkcut2: the sm90 q=1 `xqa_mha_sm90` and q=1 `xqa_mha` objects
-  byte-identical; the sm90 q=4 a16 module changes (its tag pipeline is removed) and is accepted on
-  its A1 counts.  `ptxas -v`: no C7507 anywhere (dataflow.md A4).
+  bit-exact (all cases; exit code 0) on nkcut2 (default and `XQA_NB_SUB_SEQ=2`) and on ws-1,
+  after every commit; ws-1: all eight sm120 `xqa_mha` modules (formats -1/0/1/2 x q=1/q=4) and
+  `mla_sm120` stripped SASS byte-identical to a pristine `659eacfa` build made in the same session
+  (the dyn q=1 pair may show the known ptxas pristine-vs-pristine variation: compare against two
+  pristine builds before reading it as a leak); nkcut2: the sm90 q=1 `xqa_mha_sm90` and q=1
+  `xqa_mha` objects byte-identical; the sm90 q=4 a16 module changes (its tag pipeline is removed;
+  the stock A16 copy is kept) and is accepted on its A1 counts.  `ptxas -v`: no C7507 anywhere
+  (dataflow.md A4).
 - **A4 (bench):** three locked rounds `--repeats 2 --trials 5` (2 x 117 us < 1.5 ms), pristine
   `659eacfa` checkout with its own JIT workspace interleaved (memory: a cached workspace rebuilds
-  from the checkout's source and is not a baseline), q=1 control rows included; accept / reject
-  per the section-3.7 table.
+  from the checkout's source and is not a baseline), q=1 control rows included; the table below.
+
+**Accept / reject (gap-free; medians of three rounds; record = merged-tree confirmation @
+67a6b4aa; "keep" = the step is merged, "open" = the target row stays open in targets.md):**
+
+| mode | interval | outcome |
+|---|---|---|
+| fp8 | t <= 94 | accept, target met |
+| fp8 | 94 < t <= 105 | **accept** (predicted band), target open; A2 counters reported |
+| fp8 | 105 < t <= 110 | keep, target open, **model missed**: A2 (i)-(iv) are read item by item and the item whose counter did not move is bisected by commit (each commit is independently revertible) |
+| fp8 | 110 < t <= 113.5 | keep only if fp4 and mixed are in their accept rows and A2 (i) shows both loops shrank; otherwise revert the commit(s) whose A2 counter did not move; target open |
+| fp8 | 113.5 < t <= 115.8 (1.02x) | within the co-tenant band: three more rounds interleaved with the base; if still > 113.5 revert item by item until <= 113.5 |
+| fp8 | t > 115.8 | **reject the step** (revert all six) |
+| fp4 | t <= 90 | accept |
+| fp4 | 90 < t <= 96 | keep, open (as the fp8 105-110 row) |
+| fp4 | 96 < t <= 101.5 | keep only with fp8 and mixed in their accept rows; otherwise bisect |
+| fp4 | 101.5 < t <= 103.5 | co-tenant band: re-run, then bisect |
+| fp4 | t > 103.5 | reject the step |
+| mixed | t <= 97 | accept, target met |
+| mixed | 97 < t <= 101 | accept, target met (low end of the model) |
+| mixed | 101 < t <= 105 | keep, target open, bisect by A2 (the R2UR and format-LDS counters are the mixed-specific ones) |
+| mixed | 105 < t <= 107.8 | keep only with fp8 and fp4 in their accept rows; otherwise bisect |
+| mixed | 107.8 < t <= 110 | co-tenant band: re-run, then bisect |
+| mixed | t > 110 | reject the step |
+| transport_a16 | t <= 84 | accept |
+| transport_a16 | 84 < t <= 87 | keep (a16 changes only by [45c]'s dead-work removal, [45e], [45f]; the step-6 a16 sessions ran 86.2-86.8 on byte-identical SASS: session offset); confirm on the interleaved base |
+| transport_a16 | t > 87 | reject the step (the a16 guard leaked or the tag removal changed the A16 copy) |
 
 ## 6. Do not build if
 
-1. The pristine-tip PC sampling (A2 run on `659eacfa` before any edit) does not reproduce the
-   section-2 shape: gemm1 `xBar.produced` wait >= 7 % of samples, DEPBAR neighbourhoods <= 0.2 %,
-   page/tag consumer long_sb >= 4 % — if gemm1 has no slack the pacing role has changed and the
-   budget is re-derived first.
+1. A0 shows the `0x2e40` + `NANOSLEEP` share unchanged at `XQA_NB_SUB_SEQ=1` (steady-state
+   slack, rev 1's reading): the wall follows gemm0 alone and the budget is re-derived (rev 1
+   section 3.7 numbers minus blockers 3-4) before A4 — the code is the same either way.
 2. Any item needs a `SharedMem` change, a third K/V buffer, 64 B K parts or 1 CTA/SM — rejected by
    section 1; do not revisit without new DEPBAR samples.
-3. REG > 128 or STACK > 0 after [45c]+[45e]+[45f]: stop, report; do not build the register-costing
-   items on a spilling base.
+3. REG > 128 or STACK > 0 after [45c]+[45e]+[45f]+[45d] (the register-freeing items): stop,
+   report; do not build [45a] / [45b] on a spilling base.
 4. The sm120 SASS changes (guard leak) at any commit — fix the guard before any timing.
 5. Another track has touched `mha.cu` `:2339-2545` / `:2851-3135` / `:3200-3345` or the two [44]
-   helpers since `659eacfa` — re-derive section 2 on the merged tip.
+   helpers since `659eacfa` — checked on the merged tip at coding time (659eacfa merged F26 and
+   [8] after the step-6 artefacts; `mha.cu` and `mhaUtils.cuh` are byte-identical to the wtS6v2
+   tree, md5 `7478...5f` / `24fc...85`).
 6. Not in scope, whatever the numbers say: `csrc/xqa/mha_sm90.cu` (SPEC_DEC route), the FA3
-   headers, the copy ownership / LDGSTS shape (A2/D6), unrolling the dyn module's span or page
-   loops beyond [45b]'s factor 2 (step 3/4 fetch stalls), the [42] `nbSubSeqPerSeq` constants.
+   headers, the copy ownership / LDGSTS shape (A2/D6 — the (b) WAR bucket lives there), unrolling
+   the dyn module's span or page loops (step 3/4 fetch stalls), the [42] `nbSubSeqPerSeq`
+   constants, the BAD-page scale-row zero fill (follow-up).
 7. The step is judged against fp4 <= 59 — it is not this kernel's number (step 6 section 5.3).
 
 ## 7. Go / no-go
 
 **Go** for [45] as a register-only package under the existing guards, in the section-4 order with
-the register gate after every commit.  **No-go** for every smem-depth option (section 1): none
-fits at 2 CTAs/SM except K3 x 64 B, and the wait it would deepen carries < 0.1 % of the samples.
-Predicted: fp8 91-99 (target 94 marginal — reachable only with >= 85 % realisation plus [45f]),
-fp4 82-90, mixed 88-97 (target 101 passes), a16 77-84.  Main risks: the realisation factor at
-four warps per SMSP (not_selected growth), the 128-register cap (+12..+20 registers over
-124-127), the dyn module's `wait`-dominated dispatch chains (24 % of mixed, untouched except the
-format LDS), gemm1 becoming the pacing role once gemm0 gains more than ~20 % (then the V-side
-items decide), and the co-tenant on nkcut2 (every A4 round interleaved with the pristine base).
+the register gate after every commit; **[45b] static-only, [45d] as lane-distributed page indices,
+[45a]'s dynamic-module predicate by select.**  **No-go** for every smem-depth option (section 1):
+none fits at 2 CTAs/SM except K3 x 64 B, and the wait it would deepen carries < 0.1 % of the
+samples.  Predicted (rev 2): fp8 99-105 (target 94 **not reached**; what remains is the fill / wave
+tail and the LDGSTS-batch drain), fp4 88-93, mixed 92-97 (target 101 passes), a16 80-82.  Main
+risks: the realisation factors (three of the six items are latency- or queue-class), the
+128-register cap (+4 for [45b] over a -2..-8 base), the dyn module's `wait`-dominated dispatch
+chains (24 % of mixed, touched only through the format word), and the co-tenant on nkcut2 (every
+A4 round interleaved with the pristine base).
 
 Artefacts read for this design (no new remote jobs; scripts left at
 `nkcut2:/tmp/mixedkv-wtS7-longsb.py`, `/tmp/mixedkv-wtS7-regions.py` — read-only over the step-6
 CSVs and nvdis files): `nkcut2:/tmp/mixedkv-wtS6-a0/{v2-fmt-1,v2-fmt0,v2-fmt1,v2-fmt2}.nvdis`,
 `{v2-fp8,v2-fp4,v2-mixed,new-transport_a16}.source.csv`, `buckets.py`, `stalls.py`.
+
+## 8. As written (code state of this worktree; one subsection per commit, appended as each lands)
+
