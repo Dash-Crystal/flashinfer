@@ -47,20 +47,30 @@ def main() -> int:
             failures += _run_many_items(mode)
         # [23] decode corner cases: E4M3 subnormal payload values (and -0), the
         # maximal block scale 448 and subnormal block scales, FP8 and FP4 pages.
+        # [24a] the same payloads under three FP8 global scales (C9): g = 1 (the
+        # 448 / 256 blocks fail the 2^120 fold vote, the others pass, within one
+        # page), g = 0.5 (every block folds, products up to 224 x 2^120) and
+        # g = 1.1 x 2^-118 (below the 2^-117 lower bound: the sentinel sends every
+        # block down the exact path; the reference scale is a bf16 subnormal).
         for mode in ("fp8", "mixed"):
             for q_len in (1, 64):
-                cases.append((q_len, "NHD", mode))
-                failures += _run_extremes(mode, q_len)
+                for gs in (1.0, 0.5, 1.1 * 2.0 ** -118):
+                    cases.append((q_len, "NHD", mode))
+                    failures += _run_extremes(mode, q_len, gs)
     print(f"{len(cases) - failures} passed, {failures} failed")
     return failures
 
 
-def _extreme_transport(shape, dtype, dev, mode):
+def _extreme_transport(shape, dtype, dev, mode, gs=1.0):
     """_make_transport with FP8 payload bytes drawn from all of E4M3 (subnormals,
     +-0, +-448, normals; no NaN) and block scales from {448, 2^-9, 2^-7, 2^-6, 1, 256}
-    for both formats; the A16 reference is recomputed for the compressed pages."""
+    for both formats; the FP8 global scale is `gs` (FP4's stays 1); the A16
+    reference is recomputed for the compressed pages as
+    A16(x * A16(float(s) * g)) - the kernel's contract (dataflow C9)."""
     import torch
     ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+    g8 = torch.full((), gs, dtype=torch.float32, device=dev)
+    t = t._replace(fp8_k_global_scale=g8, fp8_v_global_scale=g8)
     num_pages, page_size, num_heads, head_dim = shape
     g = torch.Generator(device=dev)
     g.manual_seed(23)
@@ -81,8 +91,10 @@ def _extreme_transport(shape, dtype, dev, mode):
     scale_shape = (num_pages, page_size, num_heads, head_dim // 16)
 
     def dec8(payload, scales):
-        return (payload.float().reshape(*scale_shape, 16)
-                * scales.view(torch.float8_e4m3fn).float().unsqueeze(-1)).reshape(shape)
+        # sf = A16(float(s) * g): one rounding; x * sf is exact in f32 (<= 4 + 8
+        # significant bits), so .to(dtype) below is the second, single rounding.
+        sf = (scales.view(torch.float8_e4m3fn).float() * g8).to(dtype).float()
+        return (payload.float().reshape(*scale_shape, 16) * sf.unsqueeze(-1)).reshape(shape)
 
     def dec4(payload, scales):
         return (_mod._xqa_mod._decode_fp4(payload).reshape(*scale_shape, 16)
@@ -97,16 +109,16 @@ def _extreme_transport(shape, dtype, dev, mode):
     return ck, cv, rk, rv, t
 
 
-def _run_extremes(mode: str, q_len: int) -> int:
+def _run_extremes(mode: str, q_len: int, gs: float = 1.0) -> int:
     import torch
     from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    name = f"[extremes-{mode}-{q_len}]"
+    name = f"[extremes-{mode}-{q_len}-g{gs:.3g}]"
     try:
         dev, dtype = torch.device("cuda"), torch.bfloat16
         B, H, D, P, pages_per_req = 2, 2, 128, 16, 18
         shape = (B * pages_per_req, P, H, D)
-        ck, cv, rk, rv, t = _extreme_transport(shape, dtype, dev, mode)
+        ck, cv, rk, rv, t = _extreme_transport(shape, dtype, dev, mode, gs)
         kv_len = pages_per_req * P - 3
         qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)
         kv_indptr = torch.arange(0, (B + 1) * pages_per_req, pages_per_req, dtype=torch.int32, device=dev)

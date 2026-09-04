@@ -727,3 +727,58 @@ payload set.
   `chunk_store`, `TileRegs` / `read_meta` (dynamic: `w7` + row address),
   dynamic arms of `issue_tile_copies` and `expand_operand` (format-outer rolled
   loops); this document (as written).
+
+---
+
+## As written: F24a (decode floor + exact fold fallback)
+
+Files: `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh`,
+`flashinfer/mixed_page_prefill.py`, `tests/attention/run_fa3_mixed_page_transport.py`.
+Not built or run in this worktree (review by reading; the confirmation run is
+the remote step listed in section 5).
+
+**Data flow (bf16 modules).**
+- `mixed_detail::e4m3x4_to_a16<bf16>(w)`: `a = prmt(w, w, 0x9180)`, `b = prmt(w,
+  w, 0xB3A2)`, `p01 = (a << 4) & 0x87F087F0`, `p23 = (b << 4) & 0x87F087F0` —
+  values `x * 2^-120`.  The f16 instantiation keeps the two `cvt.rn.f16x2.e4m3x2`.
+- `make_bases`: `gs8 = |g| >= 2^-117 ? g * 2^120 : +inf` (`kFp8FoldMinGlobal`,
+  `kFp8Fold`, `kFp8FoldSentinelBits`); f16: `gs8 = g`.
+- `expand_block<FP8>(prm, isK, e, b, packed, sw, i, t)`: `v = scale_byte_f32(sw,
+  sel) * gs8`; placed decode of the four words; `fold_ok = |v| <
+  kFp8FoldMax (255.5 * 2^120)`; `if (__all_sync(~0, fold_ok))` -> `sf2 =
+  a16x2_broadcast(v)`; else -> eight `mul.rn.bf16x2` by `0x7B807B80` (2^120),
+  `sf2 = a16x2_broadcast(scale_byte_f32(sw, sel) * fp8_global_plain(prm, isK))`
+  where `fp8_global_plain` dereferences the operand's global-scale pointer from
+  the grid-constant `Params` (cold `LDC + LDG`; no register held across the
+  loop).  Then the eight rounding multiplies by `sf2`, `__syncwarp`, the two
+  `STS.128` — unchanged.  FP4 arm: LUT decode into `lo, hi`, `sf2 =
+  a16x2_broadcast(v)` with `v = f32(s) * gs4`, same tail.
+- `block_scale_a16x2` is split into `scale_byte_f32` (PRMT, F2FP.E4M3, HADD2)
+  and `a16x2_broadcast` (F2FP.PACK) so the cold path can reuse the byte step.
+- `decode_fp8_block` / `decode_fp4_block` are removed (the vote sits between
+  decode and multiply, so the decode is inlined in `expand_block`).
+
+**Control flow.**  `expand_pending(prm, op, t)` -> `expand_operand(prm, op.isK,
+...)` -> `expand_block(prm, isK, ...)`; the K / V call sites in
+`finish_pending_pair` stay explicit (`op.isK` is a constant after inlining, used
+only to pick the pointer on the cold path).  Everything else in `load` is
+untouched: copies, pending records, waits, fences, commits, chunk table.
+
+**Host.**  `mixed_page_prefill_run_args` no longer inspects the FP8 global
+scales (the `.item()` sync per call is gone); the comment records C9.
+
+**Tests.**  `_extreme_transport(shape, dtype, dev, mode, gs)` sets both FP8
+global scales to `gs` and recomputes the reference as `A16(x * A16(float(s) *
+g))`; `_run_extremes(mode, q_len, gs)` runs for `gs` in {1, 0.5, 1.1 x 2^-118}
+x {fp8, mixed} x {q 1, 64} = 12 cases (was 4); the matrix is 64 + 2 + 12 = 78.
+
+**Expected artifacts (section 5, restated for what was written).**  fp8 module
+producer region: `F2FP.E4M3` ~30 (from 270), `PRMT` 9 per block, `IMAD` sign-fix
+0, `VOTE.ALL` one per block site, no `BSSY/BSYNC` in the pair body, `STACK 0`,
+`LDGSTS 36+36`, `BAR.SYNC 4`, `FENCE.VIEW.ASYNC 3`; a16 module byte-identical to
+`5cc416fd` (no code path of the a16 module touches `expand_block`, `make_bases`'
+FP8 arm or the removed helpers).  Bench fp8 440-460 / 450-470 us; 78/78
+bit-exact.
+
+**Deviation from revision 1.**  The E2M1 placement variant is not built (LUT
+kept); fp4 is unchanged by this commit.

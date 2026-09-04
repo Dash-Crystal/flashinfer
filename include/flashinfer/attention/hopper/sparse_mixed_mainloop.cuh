@@ -25,8 +25,9 @@
  *    The pair's copies form one cp.async commit group.  One pair later each
  *    thread waits for its own copies (cp.async.wait_group; no group barrier:
  *    a thread reads only bytes its own copies wrote, and the row's eight lanes
- *    are one warp, ordered by __syncwarp before their stores), decodes its blocks (FP8: cvt + shift with 2^112 folded into the
- *    scale; FP4: prmt LUT) and stores them to chunks 2b, 2b+1 with STS.128 at
+ *    are one warp, ordered by __syncwarp before their stores), decodes its blocks (FP8 bf16: bit
+ *    placement x 2^-120 with 2^120 folded into the block scale, exact fallback by a
+ *    per-block warp vote ([24a], C9); FP4: prmt LUT) and stores them to chunks 2b, 2b+1 with STS.128 at
  *    immediate offsets from per-stage 32-bit bases; one fence.proxy.async per
  *    pair, then the commits.  No byte is read by a thread that did not copy it.
  *
@@ -141,33 +142,55 @@ CUTLASS_DEVICE void e2m1x8_to_a16(uint32_t src, uint32_t (&out)[4]) {
 }
 
 // E4M3 x4 (bytes of w) -> two A16 pairs {b1 : b0}, {b3 : b2}.  f16: cvt is exact.
-// bf16: the f16 bit pattern s|eeeee|mmmmmmmmmm shifted right by 3 is
-// 000s|eeeee|mmmmmmm, a bf16 whose exponent field is the f16's, i.e. the value
-// x 2^-112 (exact: an E4M3 value has at most 3 significant mantissa bits, so
-// the 3 bits shifted out - and the neighbouring half's bits that shift in - are
-// zero; the f16 exponent field is 6..30 for nonzero E4M3, never 0 or 31).  The
-// sign moves from bit 12 to bit 15 with one IMAD: a + 7 * (a & 0x1000).  The
-// 2^112 is folded into the block scale (OperandBases::gs8), and one
-// HMUL2.BF16 then rounds the exact product v * s once, as the reference does.
-// Per pair: F2FP, SHF, LOP3, IMAD (versus F2FP, 2 x HADD2.F32, F2FP.PACK).
+//
+// bf16 ([24a]; XQA [16], csrc/xqa/mhaUtils.cuh:633-662): bit placement, no cvt.
+// Data flow per word: prmt with sign-replicate selectors spreads bytes b0, b1
+// (b2, b3) to bytes 0, 2 with their sign bytes at 1, 3: [rep(s1), b1, rep(s0), b0];
+// << 4 moves each byte to bits [11:4] of its half and the replicated sign to
+// bit 15; the mask 0x87F0 per half keeps s | eeee | mmm and clears the sign copy
+// at bit 11.  The half s|0000 eeee|mmm 0000 is a bf16 whose exponent field is
+// the E4M3 exponent unbiased, i.e. exactly x * 2^-120 for every finite code:
+// normal 1.mmm * 2^(E-7) -> 1.mmm * 2^(E-127); subnormal mmm * 2^-9 -> the bf16
+// subnormal mmm * 2^-129 (unit 2^-133; mul.rn.bf16x2 handles subnormal inputs
+// exactly, verified exhaustively on H200 for [16]).  NaN codes 0x7F / 0xFF
+// become the finite 1.111 * 2^-112 (C9; the quantizer never emits NaN).
+// The 2^120 is folded into the block scale (OperandBases::gs8, C9 bounds and
+// the exact fallback in expand_block), and one HMUL2.BF16 rounds x * s once, as
+// the reference does.  Per 4 values: 2 PRMT, 2 SHF, 2 LOP3 (from 2 F2FP, 2 SHF,
+// 2 LOP3, 2 IMAD of the [23] cvt form).
 template <typename A16>
 CUTLASS_DEVICE void e4m3x4_to_a16(uint32_t w, uint32_t& p01, uint32_t& p23) {
-  uint32_t h01, h23;
-  asm("{\n\t.reg .b16 lo, hi;\n\t"
-      "mov.b32 {lo, hi}, %2;\n\t"
-      "cvt.rn.f16x2.e4m3x2 %0, lo;\n\t"
-      "cvt.rn.f16x2.e4m3x2 %1, hi;\n\t}"
-      : "=r"(h01), "=r"(h23)
-      : "r"(w));
   if constexpr (std::is_same_v<A16, cutlass::half_t>) {
-    p01 = h01;
-    p23 = h23;
+    asm("{\n\t.reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, %2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %1, hi;\n\t}"
+        : "=r"(p01), "=r"(p23)
+        : "r"(w));
   } else {
-    uint32_t const a01 = h01 >> 3, a23 = h23 >> 3;
-    p01 = a01 + 7u * (a01 & 0x10001000u);
-    p23 = a23 + 7u * (a23 & 0x10001000u);
+    uint32_t const a = prmt(w, w, 0x9180u);  // [rep(sign b1), b1, rep(sign b0), b0]
+    uint32_t const b = prmt(w, w, 0xB3A2u);  // [rep(sign b3), b3, rep(sign b2), b2]
+    p01 = (a << 4) & 0x87F087F0u;
+    p23 = (b << 4) & 0x87F087F0u;
   }
 }
+
+// bf16 FP8 fold constants (C9).  The placed value is x * 2^-120; the block
+// scale carries 2^120.  bf16_rn(f32(s) * g * 2^120) is finite iff
+// |s * g| < 255.5 (bf16 max is 255 * 2^120; [255.5, 256) rounds to +inf under
+// round-to-nearest-even), and equals 2^120 * bf16_rn(f32(s) * g) iff the latter
+// is a bf16 normal, i.e. |s * g| >= 2^-126, which for the smallest E4M3 scale
+// 2^-9 is |g| >= 2^-117.  kFp8FoldMax is the per-block test bound (as f32:
+// 1.99609375 * 2^127, representable); kFp8FoldSentinel is the per-operand
+// "never fold" value: f32(s) * inf is inf (or NaN for s = 0), so |v| < bound is
+// false for every block and the exact two-multiply path is taken.
+template <typename A16>
+inline constexpr bool kFp8FoldsPow2 = std::is_same_v<A16, cutlass::bfloat16_t>;
+inline constexpr float kFp8Fold = 0x1p120f;
+inline constexpr float kFp8FoldMax = 255.5f * 0x1p120f;
+inline constexpr float kFp8FoldMinGlobal = 0x1p-117f;
+inline constexpr uint32_t kFp8FoldSentinelBits = 0x7F800000u;  // +inf
+inline constexpr uint32_t kTwoPow120Bf16x2 = 0x7B807B80u;      // bf16x2 {2^120, 2^120}
 
 // Shared-window accesses with 32-bit addresses (the immediates are folded by ptxas).
 CUTLASS_DEVICE uint4 lds128(uint32_t a) {
@@ -644,7 +667,7 @@ struct SparseMixedCollectiveMainloop {
     uint32_t land8;           // FP8 landing: logical chunk 8+b of row r (D-block 1 line, see land_row_line)
     uint32_t land4;           // FP4 landing: 8 B in chunk 8 + b/2 + 4*(r&1), half b&1
     uint32_t sc_rd;           // smem address of this thread's scale slot, page 0, stage 0 (copy + read)
-    float gs8, gs4;           // global scales of this operand (FP8: x 2^112, see e4m3x4_to_a16)
+    float gs8, gs4;           // global scales of this operand (FP8 bf16: x 2^120 or the +inf sentinel, C9)
   };
   // Landing (land_row_line): a row's eight packed blocks land in the row's
   // D-block 1 line, FP8 block b at physical chunk b ^ (r&7) (logical chunk 8+b),
@@ -691,11 +714,20 @@ struct SparseMixedCollectiveMainloop {
     }
     if constexpr (HAS_FP8) {
       auto const& span = p.transport.formats[kTagFP8];
-      // bf16: the decode yields value x 2^-112 (exact), folded back here (exact
-      // while block_scale x global < 2^16; the quantizer caps block scales at
-      // 128 and the host checks the global).  f16 decodes directly.
-      float const fold = std::is_same_v<DTypeKV, cutlass::bfloat16_t> ? 0x1p112f : 1.0f;
-      b.gs8 = *(isK ? span.k_global_scale : span.v_global_scale) * fold;
+      float const g = *(isK ? span.k_global_scale : span.v_global_scale);
+      if constexpr (mixed_detail::kFp8FoldsPow2<DTypeKV>) {
+        // [24a] C9: the placed decode is x * 2^-120; the fold 2^120 goes into the
+        // block scale.  Lower bound per operand: |g| >= 2^-117 keeps bf16_rn(s * g)
+        // normal for every nonzero E4M3 scale; below it gs8 is +inf so that every
+        // block's fold test (expand_block) fails and the exact path is taken.  The
+        // upper bound (|s * g| < 255.5) is per block and tested there.  g * 2^120
+        // overflowing f32 (|g| >= 2^8) is +-inf and fails the same test.
+        b.gs8 = fabsf(g) >= mixed_detail::kFp8FoldMinGlobal
+                    ? g * mixed_detail::kFp8Fold
+                    : __uint_as_float(mixed_detail::kFp8FoldSentinelBits);
+      } else {
+        b.gs8 = g;  // f16 decodes directly (cvt is exact); no fold, no test
+      }
     }
     if constexpr (HAS_FP4) {
       auto const& span = p.transport.formats[kTagFP4];
@@ -823,18 +855,22 @@ struct SparseMixedCollectiveMainloop {
   // offsets from per-stage 32-bit bases (D3: it reads only what it wrote and
   // writes only what it owns, so no thread waits on any other thread).
   //
-  // Per FP8 block: LDS.128 + LDS.32 + scale (PRMT, F2FP, HADD2, FMUL, F2FP.PACK)
-  // + 8 x (F2FP, SHF, LOP3, IMAD) + 8 HMUL2 + 2 STS.128 = ~49 instructions.
+  // Per FP8 block ([24a], bf16): LDS.128 + LDS.32 + 8 (PRMT, F2FP.E4M3, HADD2,
+  // FMUL, FSETP, VOTE.ALL, BRA, F2FP.PACK) + 8 x (PRMT, SHF, LOP3) + 8 HMUL2 +
+  // 2 STS.128 = 44 instructions on the fold path (the cold path adds 8 HMUL2 by
+  // 2^120 and a reload of the global scale).
   // Per FP4 block: LDS.64 + LDS.32 + scale 5 + 2 x 20 (LUT) + 8 HMUL2 + 2 STS.
 
-  // E4M3 block scale x global scale -> A16 broadcast to both halves (bit-identical
-  // to static_cast<A16>(float(scale) * global); `global` carries the FP8 fold).
-  CUTLASS_DEVICE static uint32_t block_scale_a16x2(uint32_t scale_word, uint32_t sel,
-                                                   float global) {
+  // E4M3 scale byte (byte sel of the word) -> the reference's float(scale).
+  CUTLASS_DEVICE static float scale_byte_f32(uint32_t scale_word, uint32_t sel) {
     uint32_t const byte = __byte_perm(scale_word, 0u, sel);
     uint32_t h2;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(static_cast<uint16_t>(byte)));
-    float const v = __half2float(reinterpret_cast<__half const&>(h2)) * global;
+    return __half2float(reinterpret_cast<__half const&>(h2));
+  }
+  // f32 -> A16 broadcast to both halves (one rounding: the reference's
+  // static_cast<A16>(float(scale) * global)).
+  CUTLASS_DEVICE static uint32_t a16x2_broadcast(float v) {
     if constexpr (std::is_same_v<DTypeKV, cutlass::half_t>) {
       __half2 const r = __floats2half2_rn(v, v);
       return reinterpret_cast<uint32_t const&>(r);
@@ -843,38 +879,17 @@ struct SparseMixedCollectiveMainloop {
       return reinterpret_cast<uint32_t const&>(r);
     }
   }
-
-  // 16 E4M3 (w) -> 8 A16 pairs, scaled by sf2.  Pair 2j, 2j+1 = low, high
-  // halves of w[j] (the quantizer's layout).
-  CUTLASS_DEVICE static void decode_fp8_block(uint4 const& w, uint32_t sf2, uint4& lo, uint4& hi) {
-    mixed_detail::e4m3x4_to_a16<DTypeKV>(w.x, lo.x, lo.y);
-    mixed_detail::e4m3x4_to_a16<DTypeKV>(w.y, lo.z, lo.w);
-    mixed_detail::e4m3x4_to_a16<DTypeKV>(w.z, hi.x, hi.y);
-    mixed_detail::e4m3x4_to_a16<DTypeKV>(w.w, hi.z, hi.w);
-    lo.x = mixed_detail::mul_a16x2<DTypeKV>(lo.x, sf2);
-    lo.y = mixed_detail::mul_a16x2<DTypeKV>(lo.y, sf2);
-    lo.z = mixed_detail::mul_a16x2<DTypeKV>(lo.z, sf2);
-    lo.w = mixed_detail::mul_a16x2<DTypeKV>(lo.w, sf2);
-    hi.x = mixed_detail::mul_a16x2<DTypeKV>(hi.x, sf2);
-    hi.y = mixed_detail::mul_a16x2<DTypeKV>(hi.y, sf2);
-    hi.z = mixed_detail::mul_a16x2<DTypeKV>(hi.z, sf2);
-    hi.w = mixed_detail::mul_a16x2<DTypeKV>(hi.w, sf2);
+  // The operand's plain (unfolded) FP8 global scale, read from the grid-constant
+  // parameters: used on the cold path only, so it is not held in a register.
+  CUTLASS_DEVICE static float fp8_global_plain(Params const& p, bool isK) {
+    auto const& span = p.transport.formats[kTagFP8];
+    return *(isK ? span.k_global_scale : span.v_global_scale);
   }
 
-  // 16 E2M1 (v: nibbles 0..7 in v.x, 8..15 in v.y; low nibble = even coefficient).
-  CUTLASS_DEVICE static void decode_fp4_block(uint2 const& v, uint32_t sf2, uint4& lo, uint4& hi) {
-    uint32_t a[4], b[4];
-    mixed_detail::e2m1x8_to_a16<DTypeKV>(v.x, a);
-    mixed_detail::e2m1x8_to_a16<DTypeKV>(v.y, b);
-    lo.x = mixed_detail::mul_a16x2<DTypeKV>(a[0], sf2);
-    lo.y = mixed_detail::mul_a16x2<DTypeKV>(a[1], sf2);
-    lo.z = mixed_detail::mul_a16x2<DTypeKV>(a[2], sf2);
-    lo.w = mixed_detail::mul_a16x2<DTypeKV>(a[3], sf2);
-    hi.x = mixed_detail::mul_a16x2<DTypeKV>(b[0], sf2);
-    hi.y = mixed_detail::mul_a16x2<DTypeKV>(b[1], sf2);
-    hi.z = mixed_detail::mul_a16x2<DTypeKV>(b[2], sf2);
-    hi.w = mixed_detail::mul_a16x2<DTypeKV>(b[3], sf2);
-  }
+  // Block layouts: FP8 pair 2j, 2j+1 = low, high halves of w[j] (the quantizer's
+  // layout); FP4 nibbles 0..7 in v.x, 8..15 in v.y, low nibble = even coefficient.
+  // The decode is inlined in expand_block (the fold vote sits between decode and
+  // multiply).
 
   // Per-stage 32-bit bases of one operand's expansion (thread constants + stage).
   struct ExpandBases {
@@ -903,16 +918,63 @@ struct SparseMixedCollectiveMainloop {
     }
     return p;
   }
+  // One block.  Data flow (FP8, bf16): v = f32(s) * gs8 (gs8 = g * 2^120 or +inf);
+  // the placed decode lo, hi = x * 2^-120 is independent of the scale.  Control
+  // flow: ok = |v| < 255.5 * 2^120 per lane, voted over the warp (one page, four
+  // rows: the granularity XQA votes at); the vote passes -> sf2 = bf16x2(v), one
+  // rounding multiply per pair (fold path); it fails -> lo, hi *= 2^120 (exact:
+  // x * 2^-120 * 2^120 = x, subnormal placements included), sf2 = bf16x2(f32(s)
+  // * g) with g reloaded from the parameters, then the same rounding multiply -
+  // the reference's arithmetic for every finite s and g (C9).  The vote result is
+  // warp-uniform, so both arms reach the __syncwarp before the stores converged.
+  // FP4 and f16 have no fold: sf2 = a16x2(f32(s) * g) directly.
   template <bool FP8>
-  CUTLASS_DEVICE void expand_block(ExpandBases const& e, OperandBases const& b, Packed const& p,
-                                   uint32_t sw, uint32_t i, uint32_t t) const {
-    uint32_t const sf2 = block_scale_a16x2(sw, sc_sel(t), FP8 ? b.gs8 : b.gs4);
+  CUTLASS_DEVICE void expand_block(Params const& prm, bool isK, ExpandBases const& e,
+                                   OperandBases const& b, Packed const& p, uint32_t sw,
+                                   uint32_t i, uint32_t t) const {
+    float const v = scale_byte_f32(sw, sc_sel(t)) * (FP8 ? b.gs8 : b.gs4);
     uint4 lo, hi;
+    uint32_t sf2;
     if constexpr (FP8) {
-      decode_fp8_block(p.w, sf2, lo, hi);
+      mixed_detail::e4m3x4_to_a16<DTypeKV>(p.w.x, lo.x, lo.y);
+      mixed_detail::e4m3x4_to_a16<DTypeKV>(p.w.y, lo.z, lo.w);
+      mixed_detail::e4m3x4_to_a16<DTypeKV>(p.w.z, hi.x, hi.y);
+      mixed_detail::e4m3x4_to_a16<DTypeKV>(p.w.w, hi.z, hi.w);
+      if constexpr (mixed_detail::kFp8FoldsPow2<DTypeKV>) {
+        bool const fold_ok = fabsf(v) < mixed_detail::kFp8FoldMax;  // false for inf / NaN
+        if (__all_sync(0xFFFFFFFFu, fold_ok)) {
+          sf2 = a16x2_broadcast(v);
+        } else {
+          // Cold: exact two-multiply form (XQA mha_sm90.cu:2791-2806).
+          lo.x = mixed_detail::mul_a16x2<DTypeKV>(lo.x, mixed_detail::kTwoPow120Bf16x2);
+          lo.y = mixed_detail::mul_a16x2<DTypeKV>(lo.y, mixed_detail::kTwoPow120Bf16x2);
+          lo.z = mixed_detail::mul_a16x2<DTypeKV>(lo.z, mixed_detail::kTwoPow120Bf16x2);
+          lo.w = mixed_detail::mul_a16x2<DTypeKV>(lo.w, mixed_detail::kTwoPow120Bf16x2);
+          hi.x = mixed_detail::mul_a16x2<DTypeKV>(hi.x, mixed_detail::kTwoPow120Bf16x2);
+          hi.y = mixed_detail::mul_a16x2<DTypeKV>(hi.y, mixed_detail::kTwoPow120Bf16x2);
+          hi.z = mixed_detail::mul_a16x2<DTypeKV>(hi.z, mixed_detail::kTwoPow120Bf16x2);
+          hi.w = mixed_detail::mul_a16x2<DTypeKV>(hi.w, mixed_detail::kTwoPow120Bf16x2);
+          sf2 = a16x2_broadcast(scale_byte_f32(sw, sc_sel(t)) * fp8_global_plain(prm, isK));
+        }
+      } else {
+        sf2 = a16x2_broadcast(v);
+      }
     } else {
-      decode_fp4_block(uint2{p.w.x, p.w.y}, sf2, lo, hi);
+      uint32_t a[4], c[4];
+      mixed_detail::e2m1x8_to_a16<DTypeKV>(p.w.x, a);
+      mixed_detail::e2m1x8_to_a16<DTypeKV>(p.w.y, c);
+      lo = uint4{a[0], a[1], a[2], a[3]};
+      hi = uint4{c[0], c[1], c[2], c[3]};
+      sf2 = a16x2_broadcast(v);
     }
+    lo.x = mixed_detail::mul_a16x2<DTypeKV>(lo.x, sf2);
+    lo.y = mixed_detail::mul_a16x2<DTypeKV>(lo.y, sf2);
+    lo.z = mixed_detail::mul_a16x2<DTypeKV>(lo.z, sf2);
+    lo.w = mixed_detail::mul_a16x2<DTypeKV>(lo.w, sf2);
+    hi.x = mixed_detail::mul_a16x2<DTypeKV>(hi.x, sf2);
+    hi.y = mixed_detail::mul_a16x2<DTypeKV>(hi.y, sf2);
+    hi.z = mixed_detail::mul_a16x2<DTypeKV>(hi.z, sf2);
+    hi.w = mixed_detail::mul_a16x2<DTypeKV>(hi.w, sf2);
     __syncwarp();  // the row's octet has read its landings (other lanes' output chunks)
     mixed_detail::sts128(e.d0 + i * PAGE_REGION_BYTES, lo);
     mixed_detail::sts128(e.d1 + i * PAGE_REGION_BYTES, hi);
@@ -921,8 +983,8 @@ struct SparseMixedCollectiveMainloop {
   // One operand's pending tile.  `tv` is the tile's pending word (tags).  Static
   // modules: one body, loads pipelined one page ahead.  Dynamic module: the
   // per-page format is warp-uniform data from the pending word.
-  CUTLASS_DEVICE void expand_operand(OperandBases const& b, uint64_t tv, int stage,
-                                     uint32_t t) const {
+  CUTLASS_DEVICE void expand_operand(Params const& prm, bool isK, OperandBases const& b,
+                                     uint64_t tv, int stage, uint32_t t) const {
     ExpandBases const e = expand_bases(b, uint32_t(stage), t);
     uint32_t sw[PAGES_PER_TILE];
 #pragma unroll
@@ -942,8 +1004,8 @@ struct SparseMixedCollectiveMainloop {
           next0 = load_packed<FP8>(e, i + 2);
           next1 = load_packed<FP8>(e, i + 3);
         }
-        expand_block<FP8>(e, b, cur0, sw[i], i, t);
-        expand_block<FP8>(e, b, cur1, sw[i + 1], i + 1, t);
+        expand_block<FP8>(prm, isK, e, b, cur0, sw[i], i, t);
+        expand_block<FP8>(prm, isK, e, b, cur1, sw[i + 1], i + 1, t);
         cur0 = next0;
         cur1 = next1;
       }
@@ -962,9 +1024,9 @@ struct SparseMixedCollectiveMainloop {
         if (i + 1 < PAGES_PER_TILE) next = load(i + 1);
         uint32_t const f = tag(i);
         if (f == kTagFP8) {
-          expand_block<true>(e, b, cur, sw[i], i, t);
+          expand_block<true>(prm, isK, e, b, cur, sw[i], i, t);
         } else if (f == kTagFP4) {
-          expand_block<false>(e, b, cur, sw[i], i, t);
+          expand_block<false>(prm, isK, e, b, cur, sw[i], i, t);
         }
         cur = next;
       }
@@ -1028,10 +1090,13 @@ struct SparseMixedCollectiveMainloop {
 #endif
 
   // Caller guarantees this thread's copies of the operand landed (cp.async wait).
-  CUTLASS_DEVICE void expand_pending(Operand const& op, int thread_idx) const {
+  // `op` is always the K or the V local (explicit call sites), so op.isK is a
+  // constant after inlining; it selects the cold path's global-scale reload only.
+  CUTLASS_DEVICE void expand_pending(Params const& prm, Operand const& op, int thread_idx) const {
     if constexpr (HAS_COMPRESSED) {
       if (op.pending == 0) return;
-      expand_operand(op.bases, op.pending, int(op.pending >> 60), uint32_t(thread_idx));
+      expand_operand(prm, op.isK, op.bases, op.pending, int(op.pending >> 60),
+                     uint32_t(thread_idx));
     }
   }
   // After the fence: arrive on the pending stage's full barrier.
@@ -1112,11 +1177,11 @@ struct SparseMixedCollectiveMainloop {
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[0] = ft.t[1] = mixed_detail::globaltimer_ns();
 #endif
-        expand_pending(K, thread_idx);
+        expand_pending(mainloop_params, K, thread_idx);
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[2] = ft.t[3] = mixed_detail::globaltimer_ns();
 #endif
-        expand_pending(V, thread_idx);
+        expand_pending(mainloop_params, V, thread_idx);
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[4] = mixed_detail::globaltimer_ns();
 #endif
