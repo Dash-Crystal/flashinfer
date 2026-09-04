@@ -725,6 +725,29 @@ __device__ inline void expandMixedBlock16InPlace(
   }
 }
 
+// Shared-window accessors for the expansion (32-bit shared addresses; ptxas folds the
+// per-iteration constants into the LDS/STS immediate).
+__device__ inline uint32_t smemAddr(void const* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ inline LdGrain ldsGrain(uint32_t addr) {
+  LdGrain v;
+  asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3])
+               : "r"(addr));
+  return v;
+}
+__device__ inline uint32_t ldsU8(uint32_t addr) {
+  uint32_t v;
+  asm volatile("ld.shared.u8 %0, [%1];" : "=r"(v) : "r"(addr));
+  return v;
+}
+__device__ inline void stsGrain(uint32_t addr, LdGrain const& v) {
+  asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(addr), "r"(v[0]), "r"(v[1]),
+               "r"(v[2]), "r"(v[3])
+               : "memory");
+}
+
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle,
           uint32_t dstNbHeads, uint32_t dstNbGrains, uint32_t nbPages,
           typename _LdGrain, uint32_t nbWarps = 1>
@@ -737,6 +760,13 @@ __device__ inline void expandMixedPartialHeadsInPlace(
   // Page-outer like copyMixedPartialHeadsAsync ([40]): one format branch per page
   // span, a format-specialised body for its blocks, the page loop rolled in the
   // dynamic module.  A16 spans are skipped.
+  // Offloaded-KV discipline (docs/mixed_kv_page_transport_targets.md): one shared-window
+  // base per array with per-iteration constant offsets, and independent block bodies -
+  // each block is LDS.128 (+ LDS.U8 scale) -> registers -> convert -> 2 x STS.128; no
+  // generic LD/ST, no local memory.  `second` is never read (the packed payload lives in
+  // `first`).
+  using Tile = Array2D<_LdGrain, dstNbHeads, dstNbGrains>;
+  static_assert(sizeof(_LdGrain) == grainBytes);
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
   constexpr uint32_t nbThreads = nbWarps * warp_size;
@@ -748,11 +778,23 @@ __device__ inline void expandMixedPartialHeadsInPlace(
   constexpr uint32_t pageLoopUnroll = mixedPageLoopUnroll(nbSpans);
   static_assert(validElemsPerHead % 64 == 0);
   constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
+  static_assert(warp_size % blocksPerPart == 0,
+                "a lane's block column must be the same in every iteration");
+  constexpr uint32_t rowsPerIter = exactDiv(nbThreads, blocksPerPart);
   assert(idxWarp < nbWarps);
   using flashinfer::KVPageFormat;
   uint8_t constexpr a16Format = static_cast<uint8_t>(KVPageFormat::kA16);
   uint8_t constexpr fp8Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
   uint8_t constexpr fp4Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4);
+
+  // This lane's block column and first row; later iterations / spans add constants.
+  uint32_t const lane = laneId();
+  uint32_t const blockInPart = lane % blocksPerPart;
+  uint32_t const headInSpan0 = (idxWarp * warp_size + lane) / blocksPerPart;
+  uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
+  uint32_t const tileBase = smemAddr(&dst);
+  uint32_t const scaleBase =
+      smemAddr(scales) + headInSpan0 * scaleLoadBytes + (scaleBlock & (scaleLoadBytes - 1));
 
   auto const expandSpan = [&](uint32_t span, auto formatTag) {
     constexpr uint8_t formatValue = decltype(formatTag)::value;
@@ -762,16 +804,22 @@ __device__ inline void expandMixedPartialHeadsInPlace(
     uint32_t const spanHead0 = span * headsPerSpan;
 #pragma unroll
     for (uint32_t iteration = 0; iteration < iterationsPerSpan; ++iteration) {
-      uint32_t const blockInSpan = iteration * nbThreads + idxWarp * warp_size + laneId();
-      if (blockInSpan >= blocksPerSpan) continue;
-      uint32_t const localHead = spanHead0 + blockInSpan / blocksPerPart;
-      uint32_t const blockInPart = blockInSpan % blocksPerPart;
-      auto& first = dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2);
-      auto& second = dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2 + 1);
-      uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
-      uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
-      uint8_t const scaleBits = scales[localHead * scaleLoadBytes + scaleBlock - scaleGroup];
+      uint32_t const headInSpan = headInSpan0 + iteration * rowsPerIter;
+      if (headsPerSpan % rowsPerIter != 0 && headInSpan >= headsPerSpan) continue;
+      uint32_t const localHead = spanHead0 + headInSpan;
+      uint32_t const row = dstHeadOffset + localHead;
+      uint32_t const firstAddr =
+          tileBase + Tile::template byteOffset<swizzle>(row, blockInPart * 2);
+      uint32_t const secondAddr =
+          tileBase + Tile::template byteOffset<swizzle>(row, blockInPart * 2 + 1);
+      uint8_t const scaleBits =
+          static_cast<uint8_t>(ldsU8(scaleBase + localHead * scaleLoadBytes -
+                                     headInSpan0 * scaleLoadBytes));
+      LdGrain first = ldsGrain(firstAddr);
+      LdGrain second{};
       expandCompressedBlock16InPlace<format, InputElem>(scaleBits, globalScale, first, second);
+      stsGrain(firstAddr, first);
+      stsGrain(secondAddr, second);
     }
   };
 

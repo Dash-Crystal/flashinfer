@@ -339,6 +339,24 @@ struct alignas(mha::min<uint32_t>(maxArrayAlign<T>(rows_* cols_), cacheLineSize)
   static constexpr uint32_t size = rows * cols;
   static constexpr uint32_t rowBytes = sizeof(T) * cols;
 
+  // Byte offset of element (r, c) from the array base, with the same swizzle as at<swizzle>().
+  // For shared-window addressing: base + byteOffset() with 32-bit arithmetic folds to
+  // register + immediate per unrolled iteration (alignedForSwizzle only).
+  template <bool swizzle = false>
+  __device__ inline static uint32_t byteOffset(uint32_t r, uint32_t c) {
+    static_assert(alignedForSwizzle);
+    assert(r < rows && c < cols);
+    uint32_t c_swizzled = c;
+    if constexpr (swizzle) {
+      static_assert(rowBytes % cacheLineSize == 0 || cacheLineSize % rowBytes == 0);
+      constexpr uint32_t rowsPerSliding = exactDiv(
+          cacheLineSize, rowBytes % cacheLineSize == 0 ? cacheLineSize : rowBytes % cacheLineSize);
+      constexpr uint32_t swizzleRowsRepeat = exactDiv(cacheLineSize, sizeof(Elem));
+      c_swizzled = c ^ (r / rowsPerSliding % exactDiv(swizzleRowsRepeat, rowsPerSliding));
+    }
+    return (r * cols + c_swizzled) * static_cast<uint32_t>(sizeof(T));
+  }
+
   template <bool swizzle = false>
   __device__ inline T const& at(uint32_t r, uint32_t c) const {
     assert(r < rows && c < cols);
