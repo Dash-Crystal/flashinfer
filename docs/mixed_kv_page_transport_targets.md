@@ -40,6 +40,34 @@ from the measured record (docs/mixed_kv_page_transport_backends.md) and a
 verification artifact that reads the mechanism (SASS counts, per-tile trace,
 ncu launch/issue statistics); the stopwatch confirms, it does not steer.
 
+## RTX 5090 (sm120): gate PASSED — all six rows (2026-09-04, main @ 67a6b4aa, 72/72 bit-exact)
+
+Kernel: `csrc/xqa/mha.cu` (compute warps load + expand pages in place), levers
+[29] C2 fix, [26] 128 B K parts, [27] GRP_LOAD_V, [40] page-outer format
+dispatch, [41] M tile 16 / 2 CTAs per SM, [42] occupancy-aware
+`nbSubSeqPerSeq`; sm90-only changes ([43], [44]) verified SASS byte-identical
+on sm120.  Locked bench on ws-1, standard script (5 x 5), B=17, S=4096, 8 KV
+heads, GQA 4, D=128; min / median / max us and the fraction of the analytic
+byte-ratio speedup realised (gate = 50 %):
+
+| q | mode | time (us) | speedup vs A16 | analytic | realised | target | gate |
+|---|---|---|---|---|---|---|---|
+| 1 | A16 (transport) | 172.7 / **173.3** / 174.1 | 1.00x | — | — | — | reference |
+| 1 | FP8 | 100.2 / **100.7** / 100.8 | 1.72x | 1.87x | **83 %** | <= 125 | PASS |
+| 1 | FP4 | 59.8 / **59.9** / 60.4 | 2.89x | 3.56x | **74 %** | <= 79 | PASS |
+| 1 | mixed | 112.8 / **113.6** / 114.0 | 1.53x | 1.66x | **80 %** | <= 135 | PASS |
+| 4 | A16 (transport) | 175.6 / **176.0** / 177.0 | 1.00x | — | — | — | reference |
+| 4 | FP8 | 114.6 / **116.3** / 116.6 | 1.51x | 1.87x | **59 %** | <= 128 | PASS |
+| 4 | FP4 | 65.5 / **65.9** / 66.2 | 2.67x | 3.56x | **65 %** | <= 81 | PASS |
+| 4 | mixed | 119.2 / **119.8** / 120.1 | 1.47x | 1.66x | **71 %** | <= 138 | PASS |
+
+Realised = (measured speedup - 1) / (analytic speedup - 1).  Correctness: the
+72-case matrix (32 register-expansion, 2 native block-FP8, 36 tail /
+value-range incl. E4M3 subnormals, +-448, maximal and sub-2^-117 block/global
+scales at q=1 and q=4, 2 independent stock-decode references) is bit-exact
+against the A16-expansion reference on every case.  Per the project rule, the
+sm120 host is cleared for behavioural (divergence / acceptance) measurement.
+
 ## Offloaded KV cache (sm120 and any host reading pages over a link)
 
 When pages stream from a host tier (PCIe / NVLink) rather than local device
