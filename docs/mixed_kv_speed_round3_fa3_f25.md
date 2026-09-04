@@ -629,12 +629,20 @@ second page's stores predicated by "a second page exists" - an odd page count
 re-decodes its last page idempotently rather than branching), issues the next
 step's landing loads before this step's stores (F24c's one-ahead pipelining),
 and meets one `__syncwarp` before its stores (every lane's loads of the step's
-pages before any lane's stores of them, D3/A7).  Bench mix (page `p` tagged `p
-% 3` -> 2 A16 + 2 FP8 + 2 FP4 per tile): per thread per pair the votes ~70 per
-operand (6 x (3 + 2 + 2 + 2) + 2 x 5 + 4), 8 blocks x ~40 = 320, loop overhead
-~80 -> **~540 decode**, copies ~180, meta / protocol ~70 (+ 4 warp-uniform
-pending tests) -> **~790 per warp per pair**: at IPC 0.27 -> 2930 cycles =
-1.48 + 0.08 = 1.56 us -> **~340 us**; band 320-370 (IPC 0.25-0.30).  The
+pages before any lane's stores of them, D3/A7).  The six scale words are loaded once at immediate offsets for the vote and
+**reloaded per page inside the format loops** (two `LDS.32` per step, `sw0` /
+`sw1` at `dynamic_page(i).sc_off`): the loop's page index is a runtime value
+(`__ffs` of the mask), so indexing the vote's `sw[]` by it would send the array
+to local memory (`LDL`, the C2 violation); the reload is the correct shape and
+is counted here, not a miss against the 6.1 dyn row.  Bench mix (page `p`
+tagged `p % 3` -> 2 A16 + 2 FP8 + 2 FP4 per tile): per thread per pair the
+votes ~70 per operand (6 x (3 + 2 + 2 + 2) + 2 x 5 + 4), 8 blocks x ~40 = 320,
+scale-word reloads ~8 per operand (2 `LDS.32` per step x 2 steps + their
+`IADD`/`LEA` address forms; up to 6 per operand for a single-format tile),
+loop overhead ~80 -> **~550 decode**, copies ~180, meta / protocol ~70 (+ 4
+warp-uniform pending tests) -> **~800 per warp per pair**: at IPC 0.27 ->
+2960 cycles = 1.50 + 0.08 = 1.58 us -> **~340 us**; band 320-370 (IPC
+0.25-0.30).  The
 accept row (<= 330) needs IPC >= 0.29 on this count.  The tile-uniform fast
 path of F24c is not built (the bench has none); a sorted-page table with
 unrolled per-class bodies is the only listed follow-up if the module lands at
@@ -726,6 +734,25 @@ transport_a16 wall already and unchanged; the kernel prediction is
 
 ## 6. Verification artifacts (confirmation, not tuning; each with its accept / reject)
 
+**Gate reconciliation (rev 2 numbers are the gates; decided here, before any
+timing).**  Revision 1 of this document and the F25 brief carried three
+numbers that revision 2 re-derived from one model (section 4's IPC 0.27
+centre, sections 3.2 / 10.13): producer region `<= 1500` instructions,
+protocol `<= 60` per pair, trace `fin <= 0.60` us.  Those were rev 1's
+single-arm count (one operand body per site, no hot / cold pair, no peeled
+first pair) and an implied body IPC of 0.45.  **The F25e gates are the rev 2
+rows below and nowhere else**: region **2100-2400** total (loop site = hot +
+cold x two operands + copies + protocol, plus the two exact single-operand
+sites K(last) and drain), protocol **<= 70** per pair (loop-site count - 12 x
+43 - 14 - 2 - 48 - 8), `fin` **<= 1.1** us (centre 1.0), `iss <= 0.30`, `acq
+>= 0.25`, `IMAD.WIDE.U32` 24, `BRA.DIV` 0, `STACK 0`, `LDL/STL` 0, `VOTE.ALL`
+2 in the loop site (4 per finish site in the dynamic module), `USETMAXREG`
+`DEALLOC 0x88` / `TRY_ALLOC 0xB8`, ptxas -v without C7507, a16 module and
+stock kernel byte-identical to `5cc416fd`.  A build that meets the rev 2 rows
+and misses a rev 1 number is accepted; a build that meets a rev 1 number is
+not thereby accepted.  Any later change to a gate is a change to this
+paragraph and the 6.1-6.4 tables together, made before the run it judges.
+
 **6.0 The copy phase, decided from the existing a16 build before any F25
 timing (one ncu run, no new kernel code).**  The a16 module has no address
 chain, the stock copy form and the same 96 `LDGSTS` per SM per pair, yet its
@@ -754,7 +781,7 @@ were made for rev 2); it is the first step of F25e.
 | copy path | `IMAD.WIDE.U32` 24 per loop pair, `IADD3.X` <= 4, `VIADD` <= 4 in the loop; `LDGSTS` 24 per pair per thread (12 + 12 predicated) in the loop site; `BSSY/BSYNC` 0 in the loop site (no pending test, no `FULL` test) | more -> the per-item bases were not hoisted (check `make_bases` live set) or the peel did not fold |
 | protocol | loop-site count - 12 x 43 - 14 - 2 - 48 - 8 <= 70 | over -> list the extra opcodes before timing |
 | fp4 | body as fp8 with `SHF`/`IMAD.SHL` 2 + 4 `PRMT` + 4 `SHF` + 4 `LOP3` per word pair, `HMUL2` 8 hot / 16 cold; payload `LDGSTS.64` (8 B, unchanged form) | |
-| dyn | 36 predicated `LDGSTS` sites per operand copy body (six per page), `SEL` 0 on the address chain, no `FLO`/`POPC` in the copy path, `LDL/STL` 0 in the pair loop; 4 `VOTE.ALL` per finish site (two formats x two operands) | rolled copy loop or LDL present -> C17 / C2 violated |
+| dyn | 36 predicated `LDGSTS` sites per operand copy body (six per page), `SEL` 0 on the address chain, no `FLO`/`POPC` in the copy path, `LDL/STL` 0 in the pair loop; 4 `VOTE.ALL` per finish site (two formats x two operands); the format loops reload the scale word per page (2 `LDS.32` per step, section 3.5) - expected, not a miss; `FLO` (`__ffs`) only in the format loops' page selection | rolled copy loop or LDL present -> C17 / C2 violated |
 | a16 module, stock paged kernel | byte-identical to `5cc416fd` | any diff = the shared-file revert is incomplete |
 
 **6.2 Trace (`MIXED_FA3_TRACE`, fp8 q=1, CTA 0 items 0/1).**  The traced pairs

@@ -226,9 +226,13 @@ struct MixedAttentionKernelTraits
   static constexpr int CONSUMER_REGS = kMixedStaticFormat == 0 ? 216 : 184;
   static_assert(BaseTraits::NUM_WARPS == 12, "one producer warp group + two consumer warp groups");
   static_assert(PRODUCER_REGS % 8 == 0 && CONSUMER_REGS % 8 == 0, "setmaxnreg takes multiples of 8");
+  // The per-thread allocation unit is 8 registers: 65536 / 384 = 170 rounds
+  // down to 168, so the CTA's pool is 384 x 168 = 64512 (not 170 x 384 = 65280).
+  static constexpr int REGS_PER_THREAD_POOL = (65536 / BaseTraits::NUM_THREADS) / 8 * 8;
+  static_assert(REGS_PER_THREAD_POOL == 168, "12 warps: __launch_bounds__(384, 1) allocates 168 regs/thread");
   static_assert(BaseTraits::NUM_PRODUCER_THREADS * PRODUCER_REGS +
                         BaseTraits::NUM_MMA_THREADS * CONSUMER_REGS <=
-                    (65536 / BaseTraits::NUM_THREADS) * BaseTraits::NUM_THREADS,
+                    REGS_PER_THREAD_POOL * BaseTraits::NUM_THREADS,
                 "register pool: the setmaxnreg split must fit what __launch_bounds__ gives the CTA "
                 "(384 x 168 = 64512), not the SM's 65536 (C3)");
   using SharedStorage =

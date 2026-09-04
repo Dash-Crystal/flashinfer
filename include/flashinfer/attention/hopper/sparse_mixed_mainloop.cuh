@@ -798,7 +798,15 @@ struct SparseMixedCollectiveMainloop {
   // zero) is derived per use (one LOP3).
   CUTLASS_DEVICE static uint32_t sc_sel(uint32_t u) { return 0x4440u | (u & 3u); }
 
-  // Thread constants of one operand, once per work item.  Data flow: page j of
+  // Thread constants of one operand, once per work item.  Both formats' global
+  // scales are dereferenced here whenever the module carries the format
+  // (HAS_FP8 / HAS_FP4), so the dynamic module reads the FP8 and the FP4 global
+  // even for a transport whose pages are all of one format.  The host
+  // guarantees the pointers: MixedKVPagedCache's four global-scale fields are
+  // non-optional tensors (flashinfer/quantization/kv_cache_fp8.py) and
+  // mixed_page_prefill.py's arg packing takes their strides and passes all four
+  // unconditionally, so every span carries a readable one-element global.
+  // Data flow: page j of
   // a tile is base + j * PAGE_REGION_BYTES (+ j * SCALE_PAGE_BYTES for the scale
   // slot) - an immediate - in every copy, load and store (C2 / C3: [R+imm], no
   // runtime page index); the [24b] swap is folded into out0 / out1 here and
