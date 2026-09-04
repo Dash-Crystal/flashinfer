@@ -1012,8 +1012,13 @@ constexpr float kMixedFoldBound = 255.5f * 0x1p120f;
 // s's decode + STS (two register sets, indexed by the unrolled span parity), so no LDS destination
 // is a register a still-draining STS reads and each LDS latency is covered by the previous
 // block's decode.  0 = one set (the register-gate fallback of the design's section 4).
+// Set to 0 at verification (A1 STS -> LDS WAR gate, section 8.6): in the fp4 module's fold body
+// ptxas placed span 2's `LDS.64 R36` on the registers of span 0's `STS.128 [R51], R36` seven
+// instructions earlier (`0xc090` -> `0xc100`), i.e. the WAR the two-set body exists to remove
+// survived in one of the four static bodies; the design takes the single-set body rather than
+// the +4 / +2 registers.  The two-set code is kept under the switch for the record.
 #ifndef MIXED_EXPANSION_PIPELINED_SPANS
-#define MIXED_EXPANSION_PIPELINED_SPANS 1
+#define MIXED_EXPANSION_PIPELINED_SPANS 0
 #endif
 __device__ inline bool foldScalesFinite(bool finite, bool foldOk) {
   return __all_sync(0xFFFFFFFFu, foldOk && finite);
