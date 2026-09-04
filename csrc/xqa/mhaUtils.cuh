@@ -22,6 +22,21 @@
 #include "mha.h"
 #include "utils.cuh"
 
+// C2: read a register-resident vector element by index without local memory.  A
+// runtime index into a Vec makes the compiler spill the whole vector (STL) and read
+// it back (LDL); this compare/select chain stays in registers.  With a compile-time
+// index (the mixed block loops, once the tile origin is known to be page-aligned) it
+// folds to the element itself.
+template <typename T, uint32_t n>
+__device__ inline T selectByIndex(Vec<T, n> const& v, uint32_t idx) {
+  T ret = v[0];
+#pragma unroll
+  for (uint32_t i = 1; i < n; ++i) {
+    ret = (idx == i) ? v[i] : ret;
+  }
+  return ret;
+}
+
 // for beam search
 template <typename Head, uint32_t tokensPerPage, uint32_t nbPages>
 struct IndexedHeadPtrImpl {
@@ -81,7 +96,9 @@ struct HeadPtr {
 
   __device__ inline Head* operator+(uint32_t i) const {
     uint32_t const absoluteTokenIdx = tokenOffset + i;
-    auto const pageIdx = pageIndices[nbPages == 1 ? 0U : absoluteTokenIdx / tokensPerPage];
+    // pageIndices lives in registers; a lane-dependent index must not spill it (C2).
+    auto const pageIdx =
+        selectByIndex(pageIndices, nbPages == 1 ? 0U : absoluteTokenIdx / tokensPerPage);
     return (pageIdx & (1U << 31))
                ? nullptr
                : pool + pageIdx * stride_page + (absoluteTokenIdx % tokensPerPage) * stride_token +
@@ -171,8 +188,9 @@ __device__ inline MixedPageFormats<nbPages> gatherMixedPageFormats(
   MixedPageFormats<nbPages> ret;
   uint32_t const lane = laneId();
   uint32_t value = 0;
-  if (lane < nbPages && pages[lane] != kBAD_PAGE_INDEX) {
-    value = transport.page_format[pages[lane]];
+  KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
+  if (page != kBAD_PAGE_INDEX) {
+    value = transport.page_format[page];
   }
 #pragma unroll
   for (uint32_t i = 0; i < nbPages; ++i) {
@@ -189,8 +207,9 @@ __device__ inline uint32_t mixedPageTagLane(PageTransport const& transport,
                                             Vec<KVCachePageIndex, nbPages> const& pages) {
   uint32_t const lane = laneId();
   uint32_t value = 0;
-  if (lane < nbPages && pages[lane] != kBAD_PAGE_INDEX) {
-    value = transport.page_format[pages[lane]];
+  KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
+  if (page != kBAD_PAGE_INDEX) {
+    value = transport.page_format[page];
   }
   return value;
 }
@@ -247,9 +266,12 @@ __device__ inline void copyMixedPartialHeadsAsync(
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, uint32_t dstHeadOffset, PageTransport const& transport,
     Vec<KVCachePageIndex, nbPages> const& pages,
-    MixedPageFormats<nbPages> const& formats, uint32_t tokenOffset, uint32_t sourceHeadOffset,
+    MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset,
     uint32_t headIdx, bool isK, uint32_t idxPart, uint32_t nbAvailHeads = maxNbCopiedHeads,
     uint32_t idxWarp = 0, uint8_t* probeScratch = nullptr) {
+  // The tile origin is page-aligned (callers static_assert it), so a block's page is
+  // sourceHeadOffset / tokensPerPage + an unrolled-iteration constant: the pages[] /
+  // formats[] lookups fold to registers instead of runtime-indexed local memory (C2).
   static_assert(sizeof(PaddedCacheHead) % 32 == 0);
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytes);
@@ -274,18 +296,22 @@ __device__ inline void copyMixedPartialHeadsAsync(
     uint32_t const localHead = linearBlock / blocksPerPart;
     uint32_t const blockInPart = linearBlock % blocksPerPart;
     bool const validHead = isFull || localHead < nbAvailHeads;
-    uint32_t const absoluteToken = tokenOffset + sourceHeadOffset + localHead;
+    uint32_t const absoluteToken = sourceHeadOffset + localHead;
     uint32_t const localPage = absoluteToken / tokensPerPage;
-    KVCachePageIndex const page = localPage < nbPages ? pages[localPage] : kBAD_PAGE_INDEX;
+    assert(localPage < nbPages);
+    KVCachePageIndex const page = selectByIndex(pages, localPage);
     uint32_t const token = absoluteToken % tokensPerPage;
     uint32_t const elem = (idxPart * blocksPerPart + blockInPart) * 16;
     bool const validElem = elem + 16 <= validElemsPerHead;
     bool const valid = validHead && validElem && page != kBAD_PAGE_INDEX;
+    // The page's own format also for !valid blocks: their payload copies are zero-fills
+    // and the expansion of a zero payload is zero, i.e. the same tile bytes the former
+    // "treat as A16 and zero-fill 32 B" produced, without a lane-varying format.
     uint8_t const format =
 #if MIXED_PAGE_STATIC_FORMAT >= 0
-        valid ? MIXED_PAGE_STATIC_FORMAT : 0;
+        MIXED_PAGE_STATIC_FORMAT;
 #else
-        valid ? formats.values[localPage] : 0;
+        selectByIndex(formats.values, localPage);
 #endif
     auto const& span = transport.formats[format];
     auto const* payload = static_cast<uint8_t const*>(isK ? span.k_payload : span.v_payload);
@@ -355,11 +381,19 @@ __device__ inline void copyMixedPartialHeadsAsync(
       }
 #endif
       if (!probeTaken) {
+        // Expansion form: expandMixedPartialHeadsInPlace rewrites `second` (and, for
+        // FP4, the upper 8 B of `first`) from the packed payload before anything reads
+        // them, so those grains are not zero-filled here: 3 -> 2 (FP8) / 1 (FP4) LDGSTS
+        // per block.  A16 blocks copy their full 32 B.  `format` is warp-uniform.
         ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
-        ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(first) + 8,
-                             firstSource + 8, valid && !isFP4 ? 8U : 0U);
-        ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
-                                     valid && isA16 ? grainBytes : 0U);
+        if (!isFP4) {
+          ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(first) + 8, firstSource + 8,
+                               valid ? 8U : 0U);
+        }
+        if (isA16) {
+          ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
+                                       valid ? grainBytes : 0U);
+        }
       }
     }
   }
@@ -376,13 +410,20 @@ __device__ inline void copyMixedPartialHeadsAsync(
         iteration * nbThreads + idxWarp * warp_size + laneId();
     bool const validHead = (isFull || localHead < nbAvailHeads) &&
                            localHead < maxNbCopiedHeads;
-    uint32_t const absoluteToken = tokenOffset + sourceHeadOffset + localHead;
+    uint32_t const absoluteToken = sourceHeadOffset + localHead;
+    // One lane per head: the page is lane / tokensPerPage plus an iteration constant,
+    // a compare/select chain over the register vector (no local memory).
     uint32_t const localPage = absoluteToken / tokensPerPage;
-    KVCachePageIndex const page = localPage < nbPages ? pages[localPage]
-                                                      : kBAD_PAGE_INDEX;
+    KVCachePageIndex const page =
+        localPage < nbPages ? selectByIndex(pages, localPage) : kBAD_PAGE_INDEX;
     uint32_t const token = absoluteToken % tokensPerPage;
     bool const valid = validHead && page != kBAD_PAGE_INDEX;
-    uint8_t const format = valid ? formats.values[localPage] : 0;
+    uint8_t const format =
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+        valid ? MIXED_PAGE_STATIC_FORMAT : 0;
+#else
+        valid ? selectByIndex(formats.values, localPage) : 0;
+#endif
     auto const& span = transport.formats[format];
     bool const compressed =
         format != static_cast<uint8_t>(flashinfer::KVPageFormat::kA16);
@@ -639,9 +680,11 @@ template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle,
 __device__ inline void expandMixedPartialHeadsInPlace(
     Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst,
     uint8_t const* scales, uint32_t dstHeadOffset,
-    MixedPageFormats<nbPages> const& formats, uint32_t tokenOffset,
+    MixedPageFormats<nbPages> const& formats,
     uint32_t sourceHeadOffset, uint32_t idxPart, float fp8GlobalScale,
     float fp4GlobalScale, uint32_t idxWarp = 0) {
+  // Tile origins are page-aligned (see copyMixedPartialHeadsAsync): the page of a block
+  // is an unrolled-iteration constant, so the format lookup below is a fixed-offset load.
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
   constexpr uint32_t totalBlocks = maxNbCopiedHeads * blocksPerPart;
@@ -655,8 +698,9 @@ __device__ inline void expandMixedPartialHeadsInPlace(
     if (linearBlock >= totalBlocks) continue;
     uint32_t const localHead = linearBlock / blocksPerPart;
     uint32_t const blockInPart = linearBlock % blocksPerPart;
-    uint32_t const absoluteToken = tokenOffset + sourceHeadOffset + localHead;
+    uint32_t const absoluteToken = sourceHeadOffset + localHead;
     uint32_t const localPage = absoluteToken / tokensPerPage;
+    assert(localPage < nbPages);
     uint8_t const format =
 #if MIXED_PAGE_STATIC_FORMAT >= 0
         MIXED_PAGE_STATIC_FORMAT;

@@ -2353,6 +2353,10 @@ CUBIN_EXPORT __global__
       bool const isFullTile = (seqIter + 1 < nbSeqIters);
 #if ENABLE_MIXED_KV_CACHE
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
+      // The mixed copy/expand helpers take no token offset: the warp tile's origin
+      // is page-aligned, so a block's page is a compile-time index (C2).
+      static_assert(ctaTile.x % tokensPerPage == 0 && warpTile.x % tokensPerPage == 0);
+      assert(tokenOffset == 0);
       if (laneId() == 0) {
         smem.kNeedsExpansion[warpIdx.x][idxNextSMemKBuf] = needsExpansion;
         smem.kFormats[warpIdx.x][idxNextSMemKBuf] = pageFormats;
@@ -2372,7 +2376,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset, 0,
+            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, true, idxPart
 #if MIXED_KV_PROBE_C
             , warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
@@ -2383,7 +2387,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset, 0,
+            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, true, idxPart, nbHeadsAvail
 #if MIXED_KV_PROBE_C
             , 0, &smem.probeScratch[warpIdx.x][0]
@@ -2511,13 +2515,11 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE
           if constexpr (!compactMixedPages) {
             if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
-            uint32_t const currentSeqOffset =
-                ctaTile.x * seqIter + warpTile.x * warpIdx.x;
+            // Tile origin ctaTile.x * seqIter + warpTile.x * warpIdx.x is page-aligned.
             expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead,
                                            qkSwizzle>(
                 smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], 0,
-                smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
-                currentSeqOffset % tokensPerPage, 0, p, fp8KGlobalScale,
+                smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, p, fp8KGlobalScale,
                 fp4KGlobalScale);
             }
           }
@@ -2833,6 +2835,12 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE
       auto const pageFormats = broadcastMixedPageTags<nbPagesPerVTile>(pageTagLane);
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
+      // Page-aligned V tile origin (see loadKTilePart): no token offset for the helpers.
+      static_assert(ctaTile.x % tokensPerPage == 0 &&
+                    (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
+                    cacheVTileSeqStride % tokensPerPage == 0 &&
+                    cacheVTileSeqLen % tokensPerPage == 0);
+      assert(tokenOffset == 0);
       if (laneId() == 0) {
         smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] =
             needsExpansion;
@@ -2896,7 +2904,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.vScales[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf][0][0],
-            sourceHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset,
+            sourceHeadOffset, cacheList.transport, pageIdx, pageFormats,
             sourceHeadOffset, idxHeadGrp, false, 0,
             mha::min(warpHeadsAvail, headsPerWarp));
       }
@@ -2931,7 +2939,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
                                    vSwizzle, false, compactMixedPages>(
             dst, &smem.vScales[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf][0][0],
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, tokenOffset, 0,
+            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       }
@@ -3156,9 +3164,7 @@ CUBIN_EXPORT __global__
                 smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf];
             if constexpr (!compactMixedPages) {
               if (needsExpansion) {
-              uint32_t const currentSeqOffset =
-                  ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
-                  cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
+              // The V tile origin is page-aligned (static_assert in loadVTilePart).
               if constexpr (grpLoadV) {
                 constexpr uint32_t headsPerWarp =
                     exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp);
@@ -3168,8 +3174,7 @@ CUBIN_EXPORT __global__
                     &smem.vScales[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf][0][0],
                     sourceHeadOffset,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    currentSeqOffset % tokensPerPage, sourceHeadOffset, 0,
-                    fp8VGlobalScale, fp4VGlobalScale);
+                    sourceHeadOffset, 0, fp8VGlobalScale, fp4VGlobalScale);
               } else {
                 expandMixedPartialHeadsInPlace<cacheVTileSeqLen,
                                                gemm1WarpsPerGrp, true>(
@@ -3177,8 +3182,7 @@ CUBIN_EXPORT __global__
                     &smem.vScales[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf][0][0],
                     0,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    currentSeqOffset % tokensPerPage, 0, warpIdxInGrp,
-                    fp8VGlobalScale, fp4VGlobalScale);
+                    0, warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
               }
 #if GRP_LOAD_V
               auto& mixedVExpandBar =

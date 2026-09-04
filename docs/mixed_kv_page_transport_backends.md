@@ -516,3 +516,170 @@ RT ≈ 200–230 cycles; replacing an mbarrier RT with bar.sync saves ~120–200
 cycles per site under load (~65 isolated).  gemm0's 8 HGMMAs take 589–738
 cycles against a 185–227-cycle microbenchmark floor: ~400 cycles of
 descriptor arithmetic/issue on the critical path per tile (candidate lever).
+
+### P0.2 [39] SPEC_DEC attribution, Track S step 1 (no-op), Track W [29] C2 fix (2026-09-04, nkcut2 H200 + ws-1 RTX 5090)
+
+**Attribution (P0.2).** The bench's `kernel_family` line reports `mha.cu
+spec_dec=True` for every q=4 mode (module URIs `..._use_spec_dec_True_spec_q_seq_len_4`);
+q=1 compressed modes run `mha_sm90.cu`.  The q=4 `build.ninja` carries no
+`-DM_TILESIZE`, so `M_TILESIZE` is the `defines.h` default 32 and
+`mha.cu:3521` (`__CUDA_ARCH__ == 900 && M_TILESIZE == 16`) is false: the sm90
+SPEC_DEC build already has `nbCtaPerSM = 1`, i.e. `__launch_bounds__(256, 1)`
+and the 255-register cap.  `cuobjdump -res-usage` of the baseline q=4 `xqa_mha.cuda.o`:
+
+| module (sm90, q=4) | REG | STACK | LDL | STL | LDGSTS |
+|---|---|---|---|---|---|
+| fp4 static (format 2) | 251 | 48 | 114 | 14 | 263 |
+| fp8 static (format 1) | 255 | 48 | 114 | 14 | 263 |
+| mixed dynamic (format -1) | 226 | 112 | 378 | 38 | 455 |
+
+sm120 shows the same STACK 48 / 112 and LDL 118 / 338 at REG 166-242 (far from
+any cap), so the stack and the LDLs are the runtime-indexed register arrays
+(C2), not register-pressure spills, and the record's "226 registers, spills
+heavily" reading was wrong: the kernel was never register-capped at 128.
+**Track S step 1 (launch bounds) is therefore a no-op and was not applied.**
+
+**Where the LDLs were** (`-lineinfo` build, `nvdisasm --print-line-info`, sm120
+fp4 q=1, 118 LDL): `copyMixedPartialHeadsAsync` block loop `pages[localPage]` /
+`formats.values[localPage]` (54), its scale loop (59), `mixedPageTagLane`
+`pages[lane]` (8), the rest `Vec::operator[]`/shuffle spill traffic of the same
+sites.  After fixing those, the dynamic module still had 160 LDL / 40 STL, all
+in the A16 path it takes for all-A16 tiles: `HeadPtr::operator+`
+`pageIndices[absoluteTokenIdx / tokensPerPage]` (`mhaUtils.cuh:84`, 38 LDL +
+`Vec::operator[]` 10 + the `ldgsts` sites 8), with the STLs at the
+`HeadPtr src{..., pageIdx, ...}` constructions (`mha.cu:2320/2853`) that spill
+the page vector so it can be indexed.
+
+**The fix ([29], `csrc/xqa/mhaUtils.cuh`, `csrc/xqa/mha.cu`).**
+(i) `tokenOffset` is removed from `copyMixedPartialHeadsAsync` /
+`expandMixedPartialHeadsInPlace`; the callers `static_assert` that every tile
+origin (`ctaTile.x`, `warpTile.x`, `warpTile.x * nbXTilesPerXIter`,
+`cacheVTileSeqStride`, `cacheVTileSeqLen`) is a multiple of `tokensPerPage`
+(16, already required by `smemQKPartGemmMixed`), so a block's page is an
+unrolled-iteration constant.  (ii) `selectByIndex(Vec, idx)` - an unrolled
+compare/select chain - replaces every register-vector index that stays
+lane-dependent (scale loop `lane / 16`, `mixedPageTagLane` `pages[lane]`,
+`HeadPtr::operator+`); it folds to the element when the index is constant.
+(iii) The expansion form issues only payload copies: `second` and (FP4) the
+upper 8 B of `first` are rewritten by the expansion before any read, so their
+zero-fill `cp.async` was dead - 3 -> 2 (FP8) / 1 (FP4) LDGSTS per block,
+13 -> 9 / 5 per K part per lane on sm120.  The block format is the page's own
+format also for `!valid` blocks (zero-filled payload -> expansion yields zeros,
+the same tile bytes as the former "treat as A16, zero-fill 32 B").
+
+**Artifact (final tree, `cuobjdump -res-usage` / `-sass` of `xqa_mha.cuda.o`).**
+
+| module | REG | STACK | LDL | STL | LDGSTS | SASS instr |
+|---|---|---|---|---|---|---|
+| sm120 fp4 q=1 | 178 -> 166 | 48 -> 0 | 118 -> 0 | 18 -> 0 | 214 -> 94 | 6800 -> 6184 |
+| sm120 fp8 q=1 | 175 -> 169 | 48 -> 0 | 118 -> 0 | 18 -> 0 | 214 -> 154 | 6424 -> 5864 |
+| sm120 mixed q=1 | 186 -> 192 | 112 -> 0 | 338 -> 0 | 59 -> 0 | 374 -> 374 | 12064 -> 11040 |
+| sm120 a16 q=1 (format 0) | - -> 176 | - -> 0 | - -> 0 | - -> 0 | - -> 169 | - -> 5392 |
+| sm120 fp4 q=4 | 215 -> 206 | 48 -> 0 | 118 -> 0 | 18 -> 0 | 234 -> 114 | 8952 -> 8032 |
+| sm120 fp8 q=4 | 214 -> 212 | 48 -> 0 | 118 -> 0 | 18 -> 0 | 234 -> 174 | 8552 -> 7712 |
+| sm120 mixed q=4 | 242 -> 237 | 112 -> 0 | 338 -> 0 | 59 -> 0 | 394 -> 394 | 14512 -> 13792 |
+| sm90 fp4 q=4 | 251 -> 254 | 48 -> 0 | 114 -> 0 | 14 -> 0 | 263 -> 119 | 11112 -> 9968 |
+| sm90 fp8 q=4 | 255 -> 254 | 48 -> 0 | 114 -> 0 | 14 -> 0 | 263 -> 191 | 10088 -> 9016 |
+| sm90 mixed q=4 | 226 -> 239 | 112 -> 0 | 378 -> 0 | 38 -> 0 | 455 -> 455 | 18312 -> 17912 |
+
+LDGSTS by variant, sm120 fp4 q=1: `E.64` 60 + `E.64.ZFILL` 60 + `BYPASS.128`
+68 + `E` 25 -> `E.64.ZFILL` 60 + `BYPASS.128` 8 + `E.ZFILL` 25: exactly the 60
+upper-8-B zero-fills and the 60 `second`-grain zero-fills are gone; the 8
+remaining 16-B copies are the A16 path, the 25 4-B copies are the scales.  The
+dynamic module keeps the same static LDGSTS count (the FP8/FP4/A16 copies are
+now uniform branches on the page format); its executed count is measured with
+ncu below.  Correctness: `run_xqa_mixed_page_transport.py` 34/34 bit-exact on
+both hosts (the matrix covers the 285 = 18 x 16 - 3 token tail: partial page,
+partial tile and `kBAD_PAGE_INDEX` pages in the last tile).
+
+**Timing (flock'd; each row is the median of per-round medians, rounds
+interleaved baseline / final).  The baseline is a second pristine checkout
+(`dash-flashinfer-claude-wtEbase`, `git archive` of the unpatched tree) with its
+own workspace - a cached workspace is *not* a frozen baseline, because
+`JitSpec.try_load()` returns None for JIT specs and ninja's dependency scan
+rebuilds the cached module from whatever source the checkout now holds (first
+attempt at a "baseline" re-time produced the patched kernel's numbers).**
+
+ws-1 RTX 5090, B=17 S=4096 8 KV heads GQA 4 D=128 bf16, repeats 5 x trials 5, 3 rounds:
+
+| mode | q=1 baseline | q=1 final | ratio | q=4 baseline | q=4 final | ratio |
+|---|---|---|---|---|---|---|
+| transport_a16 | 180.3 | 174.7 | 0.969 | 184.3 | 179.1 | 0.972 |
+| fp8 | 139.5 | 118.8 | 0.851 | 153.7 | 125.0 | 0.814 |
+| fp4 | 83.4 | 65.5 | 0.785 | 100.8 | 81.9 | 0.813 |
+| mixed | 145.8 | 126.4 | 0.867 | 157.3 | 132.3 | 0.841 |
+
+Per-round medians agree within 0.5 %.  The sm120 targets (FP8 <= 125, FP4 <= 79,
+mixed <= 135) all pass from [29] alone, well beyond the lever's own model
+(FP4 84 -> 78-80, FP8/mixed +-2 %): the sm120 kernel was issue-bound on the
+copy path's local-memory traffic, not only latency/request-bound.  Branch (a)
+of Track W ([25] `nbSubSeqPerSeq`) and [26]/[27] are now optional headroom, not
+gate items.
+
+nkcut2 H200 (co-tenant present; q=4 repeats 3 x trials 7 so that repeats x t < 1.5 ms,
+q=1 repeats 5 x trials 5; 3 rounds for q=4):
+
+| mode | q=4 baseline (r1/r2/r3) | q=4 final (r1/r2/r3) | ratio | q=1 baseline -> final (mha_sm90.cu control) |
+|---|---|---|---|---|
+| transport_a16 | 137.6 / 137.7 / 138.4 | 131.4 / 131.3 / 131.5 | 0.955 | 83.0 -> 83.0 |
+| fp8 | 230.4 / 231.2 / 234.1 | 198.8 / 198.2 / 197.6 | 0.857 | 91.6 -> 91.4 |
+| fp4 | 276.7 / 276.5 / 276.4 | 239.5 / 238.9 / 239.8 | 0.866 | 96.5 -> 96.1 |
+| mixed | 436.9 / 438.9 / 435.7 | 424.8 / 422.8 / 422.2 | 0.968 | 115.1 -> 115.9 |
+
+Two further final-tree rounds from the first (contaminated-baseline) chain agree
+(fp4 240.1/239.6, fp8 199.5/198.8, mixed 421.3/423.1, a16 130.6/131.5).  The
+q=1 control is unchanged because sm90 q=1 runs `mha_sm90.cu`, which has its own
+copy/expand code.  **Track S verdict: steps 1-2 leave mixed q=4 at 422.8 /
+239.5 = 1.77x fp4 q=4 (acceptance <= 1.5x not met); the static modules gain
+13-14 %, the dynamic module 3 %.**
+
+**ncu, sm90 q=4, one launch (136 CTAs), `--launch-skip 1 --launch-count 1`
+(counts are contention-independent; durations are ncu-serialized with the
+co-tenant present):**
+
+| metric | mixed base | mixed final | fp4 base | fp4 final |
+|---|---|---|---|---|
+| registers / occupancy limit (regs) | 226 / 1 | 239 / 1 | 251 / 1 | 254 / 1 |
+| smsp__inst_executed_op_local_ld.sum | 741,472 | **0** | 458,592 | **0** |
+| smsp__inst_executed_op_local_st.sum | 208,352 | **0** | 64,736 | **0** |
+| smsp__inst_executed_op_ldgsts.sum (issued) | 924,800 | 924,800 | 935,680 | 361,216 |
+| ..._pred_on_any.sum (any lane active) | 924,800 | 655,677 | 935,680 | 361,216 |
+| sm__inst_executed_pipe_lsu.sum | 5,395,776 | 4,757,664 (-12 %) | 6,219,008 | 5,096,736 (-18 %) |
+| smsp__inst_executed.sum | 49.09 M | 48.11 M | 53.40 M | 48.41 M |
+| gpu__time_duration | 548.8 us | 540.7 us | 360.9 us | 318.8 us |
+
+The dynamic module's FP8/FP4 copies compile to predicated LDGSTS (same issued
+count, 29 % now predicated off = the removed zero-fills for the 1/3 fp8 + 1/3
+fp4 pages); the fp4 static module issues 3 -> 1 per block.  ncu sections on the
+final tree (sm90 q=4): mixed runs at **10.0 warp-cycles per issued instruction
+vs 5.1 (fp4) / 5.2 (fp8)** with the same executed-instruction count as fp4
+(48.1 M vs 48.4 M); the section report attributes 6.3 of those cycles to "waiting
+to be selected to fetch an instruction" (no_instruction: the 17.9 K-instruction
+dynamic kernel jumps between its A16, FP8 and FP4 copy/expand paths every
+iteration).  All three run at 12.5 % occupancy (1 CTA/SM: registers *and* shared
+memory both limit to 1), issue 0.20 (mixed) / 0.39 (fp4) instructions per
+scheduler-cycle with ~2 active warps per scheduler, DRAM at 7-14 %.  Grid 136 =
+`nbSubSeqPerSeq` 1 (`132 / (17 x 8)` rounds to 0) on 132 SMs: one full wave plus
+a 4-CTA second wave, i.e. the q=4 kernels take two CTA-durations.
+
+**Zero-code calibration `XQA_NB_SUB_SEQ` on the final tree (q=4, repeats 3 x
+trials 5, flock'd):**
+
+| mode | n=1 (136 CTAs) | n=2 (272) | n=4 (544) | n=8 (1088) | wave model n=2 / 4 / 8 |
+|---|---|---|---|---|---|
+| transport_a16 | 131.3 | 117.1 (0.892) | **111.7 (0.850)** | 125.9 (0.959) | 0.75 / 0.625 / 0.56 |
+| fp8 | 197.6 | 176.5 (0.893) | **167.9 (0.850)** | 188.6 (0.954) | |
+| fp4 | 240.1 | 230.0 (0.958) | **204.7 (0.852)** | 241.4 (1.005) | |
+| mixed | 420.4 | 382.0 (0.909) | **359.0 (0.854)** | 368.8 (0.877) | |
+
+n=4 gives 0.85x on every q=4 mode (the tail wave is real) but the pure wave
+model over-predicts because each extra CTA carries the P0.8 fixed cost
+(prologue + multi-block merge, 4.8-7 us on sm120); n=8 loses it again.  A host
+default for the sm90 SPEC_DEC shape (n=4 here) is a candidate lever worth ~15 %
+on all q=4 modes; it was not applied because the right n needs the per-CTA
+fixed-cost model, not the wave count alone.  It does not change the mixed/fp4
+ratio (1.75x at n=4): **the Track S residual is the dynamic module's
+instruction-fetch stall, which is a code-size / dispatch problem of the sm90
+SPEC_DEC dynamic build (287 KB of SASS), and the plan's step 3 (route q=4 mixed
+to `mha_sm90.cu`, whose converters are format-uniform per stage) or a
+code-size lever in `mha.cu`'s dynamic path is the next item.**
