@@ -2768,8 +2768,10 @@ __launch_bounds__(128 * ctaWarpGroups)
   if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     ctaStamp(3);
     auto const& r = mixedKvCtaTrace[blockIdx.x % mixedKvCtaTraceSlots];
-    printf("TRACE ctarec %u start %llu firstk %llu last %llu end %llu tiles %u\n", blockIdx.x,
-           r[0], r[1], r[2], r[3], nbCtaTiles);
+    uint32_t smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    printf("TRACE ctarec %u start %llu firstk %llu last %llu end %llu tiles %u smid %u range %u\n",
+           blockIdx.x, r[0], r[1], r[2], r[3], nbCtaTiles, smid, persistentCtaIndex());
   }
 #else
   uint32_t const traceNbTiles = nbIters;
