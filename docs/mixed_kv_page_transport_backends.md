@@ -2473,3 +2473,182 @@ mixed <= 62 sits 2.6 us away with no approved design.  Gate status for the
 50 % rule: sm120 (RTX 5090) passes all six rows; H200 FA3 A16 parity passes,
 compressed parity pending F26 (predicted 293 / 295 / 300); H200 q=1 and q=4
 compressed rows fail.
+### Track F [26] — FA3 compressed prefill: the pair re-ordered around the copy issue, a16 copy-address form, lane-octet scale copies, per-slot dynamic module (2026-09-04, nkcut2 H200, worktree wt/F26, design docs/mixed_kv_speed_round4_fa3_f26.md)
+
+Commits 8ce3521e / 42aa4127 / f1341947 (F26a-c + review fixes, the state the
+verification started from), 4e8afc1c + b067c2c2 (design 3.10 fallback (a) for
+the dynamic module, built and read, see below), 634c9477 (the dynamic arm back
+to the F26c order with the reading recorded; the code equals f1341947 plus a
+comment) on wt/F26.  Verification order as design sections 5 / 6: tests, ptxas,
+SASS gates, trace (hard stop), locked bench, ncu.  Three builds were made
+(f1341947, b067c2c2, 634c9477); the static modules' and the a16 / stock objects
+are instruction-identical across all three (only the `if constexpr (DYNAMIC)`
+arm changed).  Artifacts `nkcut2:/tmp/mixedkv-wtF26-art/` (top level = 634c9477:
+`sf{-1,0,1,2}_mask{0,1}.sass`, `ptxas_*.log`, `counts.log`, `loopsite_*.log`,
+`order_*.log`, `tests.log`, `trace_q1.txt`, `bench_final.txt`, `ncu_{a16,fp8,fp4,mixed}*`,
+`ncu_read.log`; `run1/` = f1341947 gates, `run2/` = the first (wrong) fallback
+placement, `run3/` = b067c2c2).
+
+**Correctness.**  `run_fa3_mixed_page_transport.py`: **118 / 118 bit-exact** on
+f1341947 and on 634c9477 (the F25 104 + the 14 new multi-chunk / extremes cases:
+33-tile ring wrap, 22-tile buffer 1, dynamic-uniform extremes), `.o` mtimes after
+each run's start.  b067c2c2 (fallback (a)): 118 / 118 too.  The first placement
+of the fallback (4e8afc1c) moved `dyn_loads` past `dyn_scales`, which reads the
+bases it sets: 24 / 118, wrong values then a misaligned address - caught by the
+matrix, fixed by splitting the bases from the loads before the second build.
+
+**ptxas -v (gate 5 row 1).**
+
+| module | frame / spill stores / spill loads | regs at launch | verdict |
+|---|---|---|---|
+| fp8 (`static_format_1`) | 0 / 0 / 0, no C7507 | 168 | met |
+| fp4 (`_2`) | 0 / 0 / 0 | 168 | met |
+| a16 (`_0`) | 0 / 0 / 0 | 168 | met |
+| dynamic (`_-1`) @ f1341947 = 634c9477 | **128 B / 408 B / 608 B**; `LDL` 199 / `STL` 177 in the producer region, **51 / 23 in the loop site** (top of pair 6/4, masks + loads 19/5, copy block 24/12, bodies 0) | 168 | **miss** |
+| dynamic @ b067c2c2 (3.10 fallback (a): V' packed-word loads after the commit, bases and `__syncwarp` in place) | **152 B / 456 B / 656 B** | 168 | **miss, no better -> not adopted**; (b) is already this module's form (`f[6]` held, `sw[6]` dead after `dyn_scales`); no further register tuning (design 5 row 1) |
+
+**SASS gates (design 5; `cuobjdump -sass` of `*_paged_sm90_kernel_mask_1`,
+producer region `USETMAXREG.DEALLOC .. EXIT`, loop site = the back-edge body
+with 2 / 12 `VOTE`s; the mask_0 objects the q=1 bench runs carry the same
+producer text at other offsets: loop site 1244 / 1315 / 2455 instructions).**
+
+| gate | fp8 | fp4 | dynamic | accept | verdict |
+|---|---|---|---|---|---|
+| `USETMAXREG` | `DEALLOC 0x88` / `TRY_ALLOC 0xB8` | same | same | as F25; a16 `0x48` / `0xD8` | met |
+| copy block `[first LDS.128, LDGDEPBAR]` | 106 instr: **14 `LDGSTS`** (12 `.BYPASS.128` + 2 `@!P2 .64`) + **14 `IMAD.WIDE.U32 Rd, R, UR, R.64`** (fused, the a16 form), `IADD3` 1 (`sc_cp` stage add, no carry), `IADD3.X` / `IMAD.X` 0, `SEL` 0, fillers 6 | 144 instr: 14 (`.64` payload) + 14 fused, `IADD3` 5 (no carry), fillers 6 | 581 instr: **52 `LDGSTS`** (36 `.128` + 16 `.64`; 26 sites per operand = 6 x (1 + 1 + 2) + 2), 52 `IMAD.WIDE.U32` (the a16 slot copies with a register stride: `R, R, R, R`), carry adds 0, 78 fillers (one group per slot branch) | 14 / 14 / 0 carry / fillers 3 | **met** on the counts and the form (3.2's prescription carried over: `LEA` / `LEA.HI.X` once per base, zero adds per copy); fillers 6 = two `LDGSTS` groups because the `hasK` branch splits the K and V copies; ptxas sank the K row's `LDS.128` / `LDS.64` / page-word `LDS.32` into the `hasK` branch (the source hoists them) |
+| order (3.1) | `@!P0 BRA` x 2 (spins, `BSSY`/`BSYNC` around each) -> `LDGDEPBAR` + `DEPBAR.LE SB0, 0x0` -> 24 `LDS.64` -> `BRA.DIV` + `NOP` (the one `__syncwarp`) -> 12 scale `LDS.32` -> V row `LDS.128` + `LDS.64` + 2 words -> chains interleaved with the copies -> `LDGDEPBAR` -> `BRA.DIV` + `VOTE.ALL` -> arms -> `BRA.DIV` + `VOTE.ALL` -> arms -> 2 `SYNCS.PHASECHK.TRANS64` (test) -> `MEMBAR.ALL.CTA` + `FENCE.VIEW.ASYNC.S` -> 2 `SYNCS.ARRIVE` | same | spins -> `LDGDEPBAR` + `DEPBAR` -> 4 `VOTE.ANY` (masks) -> loads -> `NOP` -> scales -> 4 `LDS.128` -> per-slot copies with 2 + 2 `VOTE.ANY` -> `LDGDEPBAR` -> 2 `VOTE.ALL` -> bodies -> 2 `VOTE.ALL` -> bodies -> 2 `PHASECHK` -> `MEMBAR` + `FENCE` -> 2 `@P SYNCS.ARRIVE` | as 3.1; `BRA.DIV` 0 in the bodies | **met**; notes: the extra `LDGDEPBAR` before the `DEPBAR` is cutlass `cp_async_wait<0>` = `cp.async.wait_all` (an empty group, harmless); `BRA.DIV` 3 (4 dyn + the pre-existing `chunk_store` one) sit at the `__syncwarp` and the votes, none in a body - ptxas' reconvergence checks after the per-thread spins (the design's "expected and not counted" clause); `WARPSYNC` 1 in the chunk store (F25) |
+| scale-row copies (3.3) | per operand one `LDS.32 [R + 0x30870]` page word, one `IMAD.WIDE.U32 .., UR11, R.64`, one `@!P2 LDGSTS.E.LTC128B.64`; payload `LDGSTS` unpredicated | same | 2 `@P LDGSTS.64` per operand (bits of the pending word) | | met (K's word `LDS` is inside the `hasK` branch, before its first `LDGSTS`) |
+| protocol | loop 1266 - arms 954 - 24 landing - 12 scale - 8 rows - 66 chains - 28 copies - 6 fillers - 4 vote / branch - 3 `BRA.DIV` = **~161** (F25 ~143): gather block ~25 (incl. the `SHF.R.S32.HI` / `LEA.HI` chunk index division, inside the once-per-chunk branch), chunk store ~20 (`WARPSYNC`, 3 predicated `STS`, `BAR.SYNC`), spins ~14, per-pair stage bases (`IMAD x 0x6000`, `LOP3` swizzle) ~12, phase / stage `SEL` / `SHF` ~20, `LDGDEPBAR` + `DEPBAR` + `UMOV` ~10, ring / countdown ~10, remainder `IMAD.MOV` / `VIADD` | ~162 | (not separable) | <= 70 | **miss** (over by ~90; the F25 protocol items were replaced, not removed: the ring saves the division only in the per-pair path, the gather keeps it) |
+| bodies (C12) | hot 210 / cold 267, `VOTE.ALL` 2 in the loop and 0 in bodies, `BRA.DIV` 0 in bodies, `IMAD.MOV.U32` 10 in the loop (<= 24 at the K join), `UMOV` 10 (the `BRA.DIV` masks) | 222 / 279 | 12 bodies per operand with 8 `@P HMUL2` + 8 `HMUL2` (`HMUL2` 384 in the loop), `VOTE.ALL` 4 in the loop; the single-operand sites 12 x 16 unpredicated `HMUL2`, `VOTE.ALL` 0 | unchanged | met |
+| hot arm as fall-through | the cold arm is the fall-through, `@P0 BRA` after the vote jumps to the hot arm (both operands) | same | | reported | reported (not a stop) |
+| region | **2543** (F25 2584) | **2582** (2664) | **5519** (5528) | <= 2450 / 2550 / 3600 | **miss** all three; dyn > 4000 with neither of the two named causes: the bodies are shared per format (12 per operand) and the single-operand sites carry no `VOTE.ALL`; the region is the loop site 2303 + the peel's three copy sites (78 `LDGSTS`) + the two single-operand sites' 24 bodies (~1200) + prologue |
+| dyn copy body | | | branched form (`LOP3 P` + `BRA` per slot, `BRA` 33 in the copy block); `FLO` / `BREV` 0; `VOTE.ANY` 2 per operand at the copy site + 2 at the finish site; `BSSY` in the copy block 3 = the `hasK` guard and the A16-only-tile `cpasync_barrier_arrive` paths (`@!P4 SYNCS.ARRIVE.RED` under `NOP`), 0 in the decode bodies | `BSSY` 0 | met except the letter of `BSSY` 0 (the arrive paths, not the slot masks) |
+| a16 module and stock | a16 mask_1 3832 / 3880 **identical to F25's `sf0_mask1.sass`** (and to `5cc416fd` up to the F25 uniform-register permutation: first difference `ULEA UR18, UR8 vs UR7`); mask_0 / mask_2 likewise; mask_3 identical; stock paged kernel byte-identical (4 mask objects) | | | | met |
+
+**Trace** (`MIXED_FA3_TRACE` build in `/tmp/mixedkv-wtF26-trace`, q=1, CTA 0
+items 0/1, w0 / w1 = thread 0 of producer warps 0 / 1, us per pair = item bucket
+/ 44; `trace_q1.txt`; the stamps follow the revision 2 order: `acq` = the two
+spins, `wait` = the `DEPBAR`, `barB` = loads + barrier + chains + rows, `iss` =
+copies to the commit, `expK` / `expV` = vote + body, `fcV` = probes + fence +
+arrives; the traced a16 pair is 2.0 us against 1.28 untraced, so ratios only):
+
+| mode | us/pair (traced) | acq (K / V) | **wait** | barB | iss | expK / expV | fcV | fin | 6.2 gate |
+|---|---|---|---|---|---|---|---|---|---|
+| transport_a16 | 2.02-2.05 | 1.02-1.04 (0.96 / 0.06) | - | 0.04-0.05 | 0.72-0.76 | - | - | 0 | control (F25: identical) |
+| fp8 | 2.4-2.8 | 0.27-0.32 (0.18-0.23 / 0.08-0.13) | **0.023-0.030** | 0.21-0.22 | **0.52-0.59 (w0) / 0.85-0.92 (w1)** | 0.33-0.36 / 0.34-0.39 | 0.04-0.05 | 0.71-0.79 | **`wait` <= 0.05 met (the hard stop passes; F25 0.01-0.02 at a full-pair cover)**; `iss` <= 0.50 **miss**; `fin` <= 1.0 met; `acq` >= 0.25 met; expK + expV 0.67-0.75 vs <= 0.45 **miss** (F25 0.88) |
+| fp4 | 2.5-2.7 | 0.08-0.17 | **0.022-0.032** | 0.20-0.22 | **1.00-1.16** | **0.43-0.44 / 0.38-0.46** | 0.05-0.06 | 0.88-0.97 | `wait` met; `iss` miss; expK == expV within 0.01-0.06 (the F25 0.68 / 0.38 asymmetry is gone; 3.5's mechanism confirmed; marginal against 0.03 on w1) |
+| mixed (dynamic) | 5.2-6.1 (F25 3.7-3.9) | 0.16-0.25 | **0.022-0.028** | **1.18-1.30** | **1.53-2.23** | 0.45-0.77 / 0.44-0.55 | 0.05 | 1.0-1.3 | `wait` met; `iss` <= 0.55 **miss by 3-4x**; `barB` (masks + per-slot loads + scales + rows) 1.2 us = the spill reloads (ncu below) |
+
+**Bench** (`bench_fa3_mixed_page_transport.py --q-lens 1 64 --repeats 1
+--trials 5`, nkcut2 lock, co-tenant resident; us, min / median / max;
+`bench_final.txt`):
+
+| mode | F25 (dd583e36) q=1 / q=64 medians | **F26 (634c9477)** q=1 min / med / max | q=64 min / med / max | design 4 band / accept | verdict |
+|---|---|---|---|---|---|
+| stock_a16 | 300.9 / 310.9 | 300.0 / **300.9** / 300.9 | 309.0 / **309.7** / 310.5 | 297-304 / 307-314 | control holds |
+| transport_a16 | 282.8 / 289.5 | 280.8 / **283.3** / 284.1 | 287.5 / **288.1** / 289.2 | 281-286 / 287-293 | holds (session not offset) |
+| fp8 | 402.8 / 414.9 | 364.0 / **366.6** / 367.3 | 387.1 / **388.0** / 389.5 | centre 297 / 304, band 289-336 / 296-344, accept <= 330 | **reject** (-9.0 % / -6.5 % vs F25; +29 % over transport_a16) |
+| fp4 | 422.2 / 429.7 | 390.8 / **392.4** / 394.5 | 400.2 / **403.4** / 403.9 | 298 / 305, 290-339 / 297-347, <= 330 | **reject** (-7.1 % / -6.1 %) |
+| mixed | 650.0 / 664.4 | 1107.4 / **1111.4** / 1113.5 | 1121.2 / **1153.6** / 1166.1 | ~305 / 313, 295-357 / 303-365, <= 330 | **reject: regression +71 % / +74 %** (> 357: "count model wrong again, re-read the dyn SASS" - done below: the spills) |
+
+**ncu** (q=1, third launch, `--clock-control none`; `f26_run_ncu.sh` metric set +
+pc sampling; per pair = / 23936; the segment table from `f26_ncu_read2.py`
+against the mask_0 SASS; issue cycles per pair = loop-site executed per warp /
+selected share, the design's convention; `ncu_read.log`):
+
+| metric | transport_a16 | **fp8** | fp4 | mixed | 6.3 accept | verdict |
+|---|---|---|---|---|---|---|
+| `gpu__time_duration` | 279.8 us | 362.5 | 389.0 | 1100 | | |
+| producer-region `inst_executed` per pair (per warp) | 671 (168) | **2603 (651)**; F25 2865 (716) | 2804 (701); F25 2959 (740) | **5286 (1321)**; F25 4842 (1211) | 2450 +- 5 % (fp8), 2540 (fp4), 3200 +- 8 % (dyn) | fp8 +6 %, fp4 +10 %: over the band; **dyn +65 %** |
+| loop-site issue cycles per pair (selected share) | 2051 (7.9 %) | **2667 (23.5 %)** | 2876 (23.5 %) | **8178 (15.6 %)** | <= ~2590 (accept), centre 1985, pessimistic 2640 | fp8 at the pessimistic column (+3 % over the accept), fp4 +11 %; dyn 3.6x the centre |
+| producer stall mix (region) | long_sb 32.3, wait 23.3, dispatch 13.8, not_sel 11.1, selected 7.6 | selected 22.5, dispatch 18.9, wait 15.7, short_sb 11.5, not_sel 10.2, long_sb 9.8, no_inst 3.8 | selected 23.1, wait 18.6, dispatch 14.5, short_sb 13.3, long_sb 9.1 | **wait 31.5, long_sb 23.5**, selected 15.4, **no_inst 11.2**, short_sb 7.4, branch_resolving 2.6 | dispatch <= 15, no_inst <= 3 (dyn) | fp8 dispatch miss (18.9); dyn no_inst miss (11.2, F25 10.2) |
+| segment table, fp8 (cycles; design centre / pessimistic) | pre + spins 1096, copy K 356 (**27 / LDGSTS**), mid 151, copy V 417 (**17**), tail 31 | top + spins **367** (120 / 220), `DEPBAR` + 24 landing loads **169** + sync / scales **17** (100 / 200), **copy block 581 = 41 per `LDGSTS`** (850 / 1100; accept 25-40), K vote + arms **810** (395 + 20), V vote + arms **604** (380 + 40), probes + fence + tail 118 (80 / 100) | 342 / 200 + 13 / **787 = 56 per `LDGSTS`** / 795 / 623 / 116 | 359 / **1833** (masks + per-slot loads) + 760 / **3169 = 61 per `LDGSTS`** (long_sb 42 %) / 830 / 1150 / 77 | copy block 25-40 per `LDGSTS` | fp8 copy block just over (41; the block itself is 580 cycles = the design's saving of ~580 vs F25's 1160 realised); the **arm segments are 1414 vs the 775 + 60 budgeted**: the same 210 / 267 bodies at selected 31-35 % with short_sb 15-18 % + dispatch 23-26 % on the instruction after each `STS.128` group (shared-store back-pressure lands in the arms) |
+| first post-`DEPBAR` PC | | `LDS.64 R42, [R20]` 0.96 % of loop samples, long_sb 76 % of them (0.7 % long_sb) | `LDS R45` 1.16 % (long_sb 70 %) | 0.51 % | <= 2 % | met (the landing cover holds, as the trace's `wait` says) |
+| spin branches (`@!P0 BRA` after `TRYWAIT`) | 19.0 % + 12.1 % of loop samples | 1.6 % + 1.1 % | 0.8 % + 0.5 % | 0.1 % + 0.0 % | report | the consumer slack is 2.7 % of the fp8 producer's loop samples (a16 31 %): the producer paces |
+| **consumer K-wait** (`@P0 BRA` at `consumer_wait`, long_sb; share of consumer samples) | 2.6 % | **3.8 %** (F25 10.2) | **6.4 %** (18.0) | **68.5 %** (37.3) | <= 3 % | fp8 / fp4 in the 3-8 % band **with the producer pair > T_c** (2667 x 1.148 = 3060 > 2544): the producer paces (reading rule); dyn: the producer paces by 3x |
+| consumer first-`HGMMA` barrier stall | 3.6 % | 8.0 % | 10.6 % | 2.7 % | | |
+| tensor pipe active | 67.1 % | **51.2 %** | 48.2 % | 17.2 % | within 5 % of 67.1 | miss |
+| `smsp__issue_active` | 44.4 % | 50.6 % | 49.0 % | 24.6 % | | |
+| LSU shared wavefronts per pair (op_ld / op_st / gmma; `op_ldgsts` reads 0 - the `LDGSTS` writes are counted under op_st) | 1118 (85 / 12 / 1001) | **1899 (388 / 696 / 1001)**; F25 1871 (441 / 512) | 1969 (357 / 508 / 1001) | 2062 (294 / 263 / 1001) | 1950-2100, op_st ~520 | total met; fp8 op_st = `STS.128` 92 x 4.00 + payload `LDGSTS` 45 x 4.00 + octet 7.5 x 11.9 = 636 + residual |
+| `LDGSTS` wavefronts per instruction (loop) | `.128` 4.00 | payload `.128` **4.00**; **octet scale `@P .64` 11.93** | payload `.64` **4.00** (256 contiguous B per warp: 2 ideal); octet 11.92 | slot `.128` 4.00 / `@P .128` 1.93, `@P .64` 2.40 / 4.00 | octet ~2 | **miss**: the lane-octet copy reads six pages (six global lines) per instruction = 12 wavefronts, the same 89 wavefronts per pair per CTA as F25's twelve leader-lane `.64` copies at 1.98 - ten fewer instructions, zero fewer wavefronts |
+| `LDGSTS` bank conflicts | 21.6 K | **1.99 M** (F25 231 K) | 4.16 M | 1.80 M | | the octet copies' six-line reads (fp8 +1.76 M = 9 per octet instruction); fp4's `.64` payload at 4.00 wavefronts adds its own |
+| `STS.128` wavefronts per instruction / st conflicts | | 4.00 / 0.99 M | 4.00 / 0.15 M | 4.00 / 0.07 M | <= 4.5 | met on the PC view (F25's 5.41 was the octet-free op_st residual) |
+| consumer `inst_executed` per pair | 4029 | 4620 | 4172 | 6963 | 3301 (F25 convention) | the mask_0 object's consumer differs from the mask_1 one F25 read; not comparable |
+| dyn: top loop PCs | | | | `IMAD R44, R0, 0x8, R2` 5.3 %, `IMAD R50, R0, 0xc00, R2` 4.4 %, `IMAD R54, R3, 0x6000, R0` 2.7 %, `VIADD R5, R7, 0x2c000` 2.5 %, `IMAD R74, R0, 0x6000, R2` 1.7 % - all **long_sb 99-100 % on registers reloaded by `LDL`** (local memory misses L1 under the 200 KB smem carve-out); `LDL R7, [R1+0x8]` itself 0.5 % no_inst | | **the mixed regression is the spill traffic on the copy path** (51 `LDL` per pair per warp, each a long-scoreboard wait), plus no_inst 11 % on the 2455-instruction loop site |
+
+**Verdict against the design's rows:**
+
+- **Gate 5 (structure): met** for the copy block (14 + 14, fused `IMAD.WIDE.U32
+  .., UR, R.64`, zero carry adds - the a16 address form carried over exactly as
+  3.2 prescribed), the order (3.1: spins -> `DEPBAR` -> both operands' loads ->
+  one barrier -> scales -> rows -> copies -> commit -> votes -> arms -> probes
+  -> fence -> arrives), the octet scale copies (one `LDS.32` + one chain + one
+  `@P LDGSTS.64` per operand), the bodies (210 / 267, 222 / 279 unchanged;
+  `VOTE.ALL` 2 / 4 in the loop, none in bodies; `BRA.DIV` 0 in bodies), the
+  dynamic module's per-slot structure (26 sites per operand, 12 bodies per
+  operand, 8 `VOTE.ANY` + 4 `VOTE.ALL`), a16 identical to F25, stock
+  byte-identical, 118 / 118.  **Not met:** the dynamic module's registers
+  (128 B frame, 408 / 608 B spills, 51 `LDL` in the loop; fallback (a) read at
+  152 / 456 / 656 and not adopted), protocol ~161 vs <= 70, region 2543 / 2582 /
+  5519 vs 2450 / 2550 / 3600.
+- **6.2 trace: the hard stop passes** (`wait` 0.02-0.03 us on all three
+  modules: the landing cover of 3.1 holds at the F26 position, no F26b'); `iss`
+  misses (fp8 0.52-0.92, fp4 1.0-1.2, mixed 1.5-2.2 vs 0.50 / 0.50 / 0.55); the
+  fp4 expK / expV asymmetry is gone (0.44 / 0.42).
+- **6.4 bench: reject** on all three compressed modes.  fp8 366.6 / 388.0 and
+  fp4 392.4 / 403.4 improve on F25 by 6-9 % and stay 36-70 us above the target;
+  mixed 1111 / 1154 regresses 1.7x.  Where the model missed, from 6.3: (i) the
+  fp8 producer pair is 2667 issue cycles against the 2590 accept line and the
+  1985 centre: the copy block did what was predicted (581 cycles, 41 per
+  `LDGSTS`, ~580 saved vs F25) and the prep segment is 186 (< 250), but the two
+  arm segments measure 1414 cycles for the unchanged bodies (the design carried
+  F25's 775 forward; the samples put short_sb / dispatch on the instructions
+  after the `STS.128` groups - the store back-pressure the design's C11 budget
+  put elsewhere) and the top-of-pair protocol is 367 (budget 120); (ii) the
+  octet scale copy saves instructions but not wavefronts (11.9 per instruction:
+  six global lines per `LDGSTS.64`), so the 3.9 wavefront budget and the C11
+  pipe share did not move; (iii) the dynamic module spills (design 3.10's one
+  named register risk, realised on this module only), and each `LDL` reload
+  on the copy path is a long-scoreboard miss: the loop-site pair is 8178
+  issue cycles, `wait` 32 % + long_sb 23 % + no_inst 11 %; fallback (a) does not
+  reach the spill (both operands' packed words are not the binding live set -
+  the per-slot copy bodies' bases and masks are).
+- The consumer-bound regime the design predicted for fp8 / fp4 was not
+  reached: K-wait 3.8 / 6.4 % with the producer pair above T_c = the producer
+  paces (the reading rule's second case), tensor pipe 51 / 48 % vs 67.
+
+**Follow-ups, each from a counter above (not built here):**
+
+1. Dynamic module registers: the spills sit on the copy path (per-slot bases,
+   masks, rows), not on the packed words; the priced options are one copy body
+   per format class over a sorted slot list (fewer live bases) or splitting the
+   per-slot branches into two passes; the F26c per-slot form should not ship
+   for mixed (1.7x regression over F25's predicated form).
+2. Octet scale copy: 12 wavefronts per instruction because each lane reads a
+   different page; a row-contiguous *source* (the sealer writing the six pages'
+   scale rows of a tile adjacently) would make it one line - a layout change on
+   the host side, not a kernel change.
+3. The arm segments: 1414 cycles for 420 body instructions at selected 31-35 %
+   with the stalls on the post-`STS.128` instructions; read the `STS.128` PCs'
+   `L1 Wavefronts Shared` vs ideal (4.00 vs 4.00 here) and the MIO queue depth
+   before attributing to bank conflicts; the 12 `STS.128` per body are the C11
+   store wavefronts (48 per operand per warp).
+4. Protocol ~161: the ring did not remove the once-per-chunk gather's division
+   and the per-pair stage-base `IMAD x 0x6000` recomputation (ptxas does not
+   keep the three stage bases live at 136 registers); the tail's `SEL` / `SHF`
+   phase words are ~20.
+
+### FA3 F26a+b merged-tree confirmation (2026-09-04, nkcut2 H200, wt/F26ab @ 17038039 = F26a + F26b + tests; F26c/F26d NOT merged)
+
+118/118 bit-exact.  Locked bench `--repeats 1 --trials 5`, medians (q=1 /
+q=64 us): stock_a16 301.4 / 310.4, transport_a16 282.5 / 289.1, **fp8 366.3 /
+388.8** (F25 402.1 / 414.7), **fp4 392.5 / 400.3** (422.4 / 428.4), **mixed
+635.1 / 645.2** (650.6 / 662.6).  Dynamic module at the F26a order (no per-slot
+bodies): mask_0/1/2 persistent objects STACK 0, mask_3 STACK 160 and the
+non-persistent objects STACK 8/16 exactly as in the F25 build (pre-existing,
+not touched by F26).  F26c's per-slot dynamic bodies (mixed 1111 us, 128 B
+frame, 408/608 B spills) are recorded above as a negative result and stay in
+wt/F26 only.  Target <= 330 remains open on all compressed modes; the F26
+readings name the residual: top-of-pair protocol 367 cycles (budget 120), arm
+segments 1414 (835; post-STS.128 short-scoreboard / dispatch), octet scale
+copies at 11.9 wavefronts per instruction.

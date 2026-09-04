@@ -68,8 +68,8 @@ issued before the copy block and consumed after it (the acquire spin first,
 then `wait_group 0`, then both pending operands' landing loads, one
 `__syncwarp`, both operands' scale loads, the chunk rows, the scale chains,
 the copies); eight fewer `LDGSTS` per pair (the six scale rows of an operand by
-one lane-octet instruction into a row-contiguous slot layout: 36 -> 28 per
-pair, 120 -> ~100 wavefronts); the copy addresses in the a16 module's
+one lane-octet instruction into a row-contiguous slot layout: 24 -> 14 `LDGSTS`
+per warp per pair, see the count-convention note below); the copy addresses in the a16 module's
 construction; the chunk-table row addressed as a 32-row ring; the static
 modules' pending words removed; the acquires probed with a non-blocking
 `test_wait` at the end of the previous pair and spun only if not ready; and
@@ -91,6 +91,26 @@ producer's pair in 6.3 (accept iff <= ~2590 issue cycles).
 | fp8 static | 402.8 / 414.9 | **297 / 304** (consumer-bound, c ~5 %) | 289-336 / 296-344 | met at the centre; the pessimistic column (copy block 1100, half the latencies still exposed) misses by 6 us |
 | fp4 static | 422.2 / 429.7 | **298 / 305** | 290-339 / 297-347 | as fp8 |
 | mixed (dynamic) | 650.0 / 664.4 | **~305 / 313** (at parity: producer pair ~= T_c) | 295-357 / 303-365 | undecided: the centre passes with 15 % of pair margin, the pessimistic column (branches + copy body) misses; 6.3 decides |
+
+**Count-convention correction (F26d review, 2026-09-04; the gates were
+corrected before any SASS was read).**  Where sections 0-4 and 11 say "36
+`LDGSTS` per pair" (F25) and "28 `LDGSTS` / 28 `IMAD.WIDE.U32` per pair"
+(F26), the per-warp per-pair counts the SASS gate reads are **24** (F25: 12
+payload - 6 pages x 2 operands, one `cp16` / `cp8` per thread per page - + 12
+leader-lane `@P .64` scale copies; the F25 results table's "24 `LDGSTS` + 24
+`IMAD.WIDE` + 45 adds = 93") and **14** (F26: 12 payload + 2 lane-octet `@P
+.64` scale).  Section 3.7's class table (12 + 12 payload instructions, 2 x 2
+scale) and 3.9's per-SM 48 + 8 already use these numbers; the a16 module's
+"24 `LDGSTS.128`" is per warp too.  Consequences for the price model of
+section 4: F25's 1160 cycles were for 24 `LDGSTS` (~72 wavefronts: 12 x 4.00
++ 12 x 1.98) = 48 per `LDGSTS`, 16 per wavefront - about twice the a16
+module's 31 / 7.8 - so "the same price per `LDGSTS` whichever address form"
+is not what the F25 samples say; the F26 block of 14 `LDGSTS` (~52
+wavefronts: 12 x 4.00 + 2 x ~2) is **~400-500 cycles at the a16 wavefront
+price and ~830 at F25's**, i.e. the section 4 centre (850) is at the
+pessimistic end of this range and the band does not move against the
+accept.  Gate 5 / 6.3 report the measured value; nothing else in the design
+changes.
 
 **Is <= 330 reachable by F26 alone?**  For fp8 and fp4: yes if the pair lands
 within ~30 % of the centre, i.e. if the copy block costs what the a16 module's
@@ -728,7 +748,19 @@ the copy block): K' packed words 24 + V' packed words 24 + K' / V' scale words
 = ~10) + chunk pages 12 + octet page words 2 + bases (`p8`, `s8` pairs per
 operand 8; `out0/1`, `land8`, `sc_rd`, `sc_cp` 10; expand bases 2 x 5 = 10) +
 strides in UR + counter / phase / ring / loop / countdown ~8 + item constants
-~10 + `gs8` x 2 = **~130**.  This is close to 136 and is the design's one
+~10 + `gs8` x 2 = **~130**.  Counted from the code at the start of the K' body
+(F26d review): item / protocol constants ~44 (K / V bases 2 x 10 GPR with
+the four strides in UR; `sV`, `phV`, `oV`, `chunks_left`, `t`, `okK`, `okV`,
+`kv_tile_idx`, `num_chunks`, `u`, `kv_len`, `kv_head_idx`, `kv_indices_ptr`
+x 2, `cr` x 2, scheduler state ~3, per-pair `pK` / `pV` / `sK` / `sKn` /
+`phKn` / `sVn` / `phVn` / `hasK`) + `PK.pk` 24 + `PK.sw` 6 + `PK.v` 6 +
+`PV.pk` 24 + `PV.sw` 6 + `PV.v` 6 + `PV.ok` + `d0` / `d1` / `sc` x 2 (6,
+rematerialisable) + body temporaries (`sf2`, lo / hi 8, `PRMT` temps ~4) =
+**~135**; across the copy block (rows 12 + `spK` / `spV` 2 + 64-bit sources
+in flight ~8 in place of the body temporaries) ~136-145 before
+rematerialisation - the ~130 above omitted the ~15 protocol / item
+registers.  ptxas is expected at or over the limit: read `ptxas -v` first.
+This is close to 136 and is the design's one
 register risk (revision 1 had ~104 with the V' loads deferred into the K'
 body).  ptxas -v gate: no C7507, `STACK 0`, `LDL` / `STL` 0.  Fallback if the
 gate fails (structural, priced): issue the V' landing loads after the
@@ -744,6 +776,20 @@ the per-slot branched bodies hold one block's decode at a time; the six
 scale words + six `f32(s_j)` + 2 masks + 8 bases (a16 pairs 2 x 2, compressed
 pairs 4 x 2) ~= 30 more than static's constants -> ~120; same gates.
 Consumer 184, untouched.
+
+**Second structural option (written before the build, chosen by the design
+if the first fallback is not enough, not tried ad hoc).**  `PendingStatic`
+holds `sw[6]` (the scale words, needed by the cold arm's `f32(s_j)`) and
+`v[6]` (`f32(s_j) x gs`, the fold test and the hot arm's `sf2`).  Holding
+`f[6] = f32(s_j)` alone (as `PendingDyn` already does) and recomputing `v_j
+= mul_rn_f32_denorm(f_j, gs)` in the hot body costs 6 `FMUL` per operand and
+frees 6 registers per operand (12 per pair: `sw` + `v` 24 -> `f` 12).  Bit-
+exact: `v_j` is the same product `pending_scales` computed; the cold arm
+already recomputes from `f32(s_j)`.  It changes the hot body's count
+(210 -> 216) and is therefore a C12 amendment, to be recorded if chosen.
+Order of application if `ptxas -v` reports C7507 / spills: (a) the V' loads
+after the `LDGDEPBAR` (above); (b) this option; never both without the
+first having been read.
 
 ## 4. Predicted producer time and walls (revision 2: re-derived from the a16 loop-site segments)
 
@@ -848,8 +894,8 @@ SASS).  F26b' (fallback) has its own rows: fp8 <= 318 / <= 326 accept.
 | gate | accept | reject -> action |
 |---|---|---|
 | `USETMAXREG` `DEALLOC 0x88` / `TRY_ALLOC 0xB8`; `ptxas -v` no C7507; `STACK 0`; `LDL`/`STL` 0 | as F25 for fp8, fp4, dyn; a16 `0x48` / `0xD8` | any: the 3.10 fallback (V' landing loads after the `LDGDEPBAR`, before the K' vote) - one structural change, then re-read; no other register tuning |
-| **copy block** `[first LDS.128, LDGDEPBAR]` (static loop site) | 28 `IMAD.WIDE.U32` and 28 `LDGSTS` per pair (24 `.128` / `.64` payload + 2 `@P .64` scale), `@!PT LDS RZ` fillers 3, `SEL` 0; **form reported**: fused (`IMAD.WIDE.U32 Rd, R, UR, R.64`, `IADD3`/`IADD3.X`/`IMAD.X` with carry 0, `MOV` into address pairs 0 - the probe kV's opcode sequence) or 3-instruction chains | the form is a fact of the build (3.2), not a stop: record it and use the matching section 4 column; a `LDGSTS` count != 28 or `SEL` on an address = a code mistake |
-| **order** (3.1, F26b) | in the loop site, in program order: `@!P BRA` x 2 to the spins -> `DEPBAR.LE SB0, 0x0` -> 24 landing `LDS` -> `NOP`/`WARPSYNC` (the one barrier) -> 12 scale `LDS.32` -> 4 `LDS.128` + 2 `LDS.32` -> (chains interleaved) -> copies -> `LDGDEPBAR` -> `VOTE.ALL` -> K arm -> `VOTE.ALL` -> V arm -> 2 `SYNCS.PHASECHK` (test) -> `MEMBAR` + `FENCE` + 2 `SYNCS.ARRIVE` | any `LDS` of the pending pair after the first `LDGSTS`; a `DEPBAR.LE SB0, 0x1`; a `DEPBAR` before the spin branches; a second `NOP` barrier; `BRA.DIV` > 0 -> restructure (the order is the design) |
+| **copy block** `[first LDS.128, LDGDEPBAR]` (static loop site) | **14** `IMAD.WIDE.U32` and **14** `LDGSTS` per warp per pair (12 `.128` / `.64` payload: 6 pages x 2 operands, one copy per thread per page + 2 `@P .64` scale: one lane-octet instruction per operand; the loop site holds them once - the `hasK` branch guards the K block, it does not duplicate it), `@!PT LDS RZ` fillers 3, `SEL` 0; **form reported**: fused (`IMAD.WIDE.U32 Rd, R, UR, R.64`, `IADD3`/`IADD3.X`/`IMAD.X` with carry 0, `MOV` into address pairs 0 - the probe kV's opcode sequence) or 3-instruction chains | the form is a fact of the build (3.2), not a stop: record it and use the matching section 4 column; a `LDGSTS` count != 14 or `SEL` on an address = a code mistake (28 in the loop site would mean the `hasK` branch duplicated the V block; 24 = the octet scale copy did not fold) |
+| **order** (3.1, F26b) | in the loop site, in program order: `@!P BRA` x 2 to the spins -> `DEPBAR.LE SB0, 0x0` -> 24 landing `LDS` -> `NOP`/`WARPSYNC` (the one barrier) -> 12 scale `LDS.32` -> 4 `LDS.128` + 2 `LDS.32` -> (chains interleaved) -> copies -> `LDGDEPBAR` -> `VOTE.ALL` -> K arm -> `VOTE.ALL` -> V arm -> 2 `SYNCS.PHASECHK` (test) -> `MEMBAR` + `FENCE` + 2 `SYNCS.ARRIVE` | any `LDS` of the pending pair after the first `LDGSTS`; a `DEPBAR.LE SB0, 0x1`; a `DEPBAR` before the spin branches; a second `NOP` barrier; `BRA.DIV` > 0 in the bodies -> restructure (the order is the design).  **Expected and not counted against the rule**: `BSSY` / `BSYNC` (or `BRA.DIV`) around the two `producer_acquire` spins - their `if (hasK && !okK)` / `if (!okV)` test per-thread `mbarrier.test_wait` results, which are not warp-uniform (lanes may observe different phase states); the spinning lanes reconverge at the pair's `__syncwarp` / full-mask `__ballot_sync` before any copy is issued, so this is correct.  If a uniform branch is wanted later, `okK = __all_sync(~0u, test_wait(...))` is one `VOTE` per probe - written down, not tuned |
 | scale-row copies (3.3) | per operand exactly one `LDS.32 [R + UR + imm]` of the row's page word (lane-indexed) hoisted before the first `LDGSTS`, one `IMAD.WIDE.U32`, one `@P LDGSTS.E.LTC128B.64`; no `@P` on payload `LDGSTS` in the loop | six `LDGSTS.64` per operand -> the gather did not fold; the `LDS.32` inside the copy block -> fillers 6, hoist it |
 | protocol (3.4) | loop-site count - 24 - 12 - 68 - 420 - (24 or 72) - 4 - 3 <= 70; `SHF.R.S32.HI` / `LEA.HI` division chains 0; `SYNCS.PHASECHK` 2 per pair after the V arm and before the `MEMBAR` | over -> list the opcodes |
 | bodies (C12) | hot 210 / cold 267 (fp8), 222 / 279 (fp4) unchanged; `VOTE.ALL` 2 in the loop site, 0 in bodies; `BRA.DIV` 0; `UMOV` 0 in bodies; `MOV` / `IMAD.MOV` inside a body 0 - **at the K arm join up to 24** are accepted (the V' packed words live across the join, revision 2) and reported | any change to the bodies is a mistake (F26 does not touch them) |
@@ -1040,18 +1086,19 @@ the landing cover: **the trace of 6.2 is a hard stop before any bench.**
   F25's pair order kept (copies -> `LDGDEPBAR` -> `wait_group 1` -> finish).
   The a16 module keeps the F25 loop text verbatim (`if constexpr
   (STATIC_A16)`).  Gate: section 5 copy / protocol / a16 rows; tests 118.
-- **F26b - pair order** (`finish_pending_pair` split into `finish_loads`
-  (`wait_group 0`, both operands' landing loads, `__syncwarp`, scale loads,
-  chains) before the copies and `finish_bodies` (votes, bodies) after them,
-  then the probes, fence, commits; the spins before the `wait_group`; the
-  single-operand sites keep `finish_one`).  The dynamic module keeps F25's
+- **F26b - pair order** (the static finish split into `pending_loads` /
+  `pending_scales` (`wait_group 0`, both operands' landing loads, `__syncwarp`,
+  scale loads, chains) before the copies and `pending_body` (vote, body) after
+  them, then the probes, fence, commits; the spins before the `wait_group`;
+  the single-operand sites run the three phases back to back).  The dynamic module keeps F25's
   finish order in this step (`if constexpr (DYNAMIC)`), F26c moves it.  Gate:
   order row; trace 6.2 (`wait` hard stop).
 - **F26c - dynamic module** (`issue_tile_copies` dynamic arm per slot with
-  ballot masks; the dynamic finish per slot with re-balloted masks in the
-  F26b order; `expand_block_pred<FP8>(..., Pc)` for the dynamic bodies - the
-  static modules keep the compile-time `EXACT`; `expand_format_pages`
-  removed).  Gate: dyn rows; tests incl. the two extremes cases.
+  ballot masks; the dynamic finish (`PendingDyn`, `dyn_masks` / `dyn_loads` /
+  `dyn_scales` / `dyn_body`) per slot with re-balloted masks in the F26b
+  order; `expand_block_pred<FP8>(..., exact)` for the dynamic bodies - the
+  static modules keep the compile-time `EXACT`; `expand_format_pages` and
+  `copy_dynamic_page` removed).  Gate: dyn rows; tests incl. the two extremes cases.
 - **F26d - measurements** in the section 5 / 6 order, beginning with the
   compile-only probe kV / kV2 of 3.2; results appended here and to the
   backends document; dataflow amendments of section 7.
@@ -1281,8 +1328,8 @@ F25's (entries 16 c / 16 c + 8 of every chunk that has a successor).  Group
 accounting: `wait_group 1` after this pair's commit = the previous pair's group
 landed (F25).
 
-**Expected artifacts (gate 5).**  fp8 loop site: 28 `LDGSTS` per pair (24
-`.128` + 2 `@P .64`), 28 `IMAD.WIDE.U32` (form reported), 2 `LDS.32` next to the
+**Expected artifacts (gate 5).**  fp8 loop site: 14 `LDGSTS` per warp per pair (12
+`.128` + 2 `@P .64`), 14 `IMAD.WIDE.U32` (form reported), 2 `LDS.32` next to the
 4 `LDS.128`, 3 fillers, `SHF.R.S32.HI` / `LEA.HI` division chains 0, 2
 `SYNCS.PHASECHK` (test) after the commits; region <= 2450 (fp8) / 2550 (fp4);
 a16 SASS identical to F25's (`read_meta`'s dead `cvta` and the unused `spage`
@@ -1352,3 +1399,162 @@ else.
 `SYNCS.PHASECHK` -> `MEMBAR` + `FENCE` + 2 `SYNCS.ARRIVE`; `BRA.DIV` 0; bodies
 unchanged; up to 24 `MOV` / `IMAD.MOV` at the K arm join (the V' packed words)
 reported; tests 118 / 118; then the 6.2 trace before anything else.
+
+### As written: F26c (dynamic module: per-slot copies and bodies, the F26b order)
+
+File: `sparse_mixed_mainloop.cuh`.  Not built or run here.
+
+**Copies** (`issue_tile_copies`, dynamic arm): `m8u = __ballot_sync(~0, (w7 >>
+lane) & 1) & 0x3F`, `m4u = __ballot_sync(~0, ((w7 >> 8) >> lane) & 1) & 0x3F`
+(two `VOTE.ANY`; the shifts stay < 32 for every lane), then per slot j
+(unrolled) `if (m8u bit j) copy_compressed_page<FP8, FULL>` / `else if (m4u bit
+j) copy_compressed_page<FP4, FULL>` / `else copy_a16_page_dyn<FULL>` (the a16
+module's two 16 B copies without its pointer select: the partial arm passes the
+source unmodified with src-size 16 / 0), then `copy_scale_rows_dyn<FULL>` (two
+predicated `LDGSTS.64` with the lane's `m8` / `m4` bits).  `copy_dynamic_page`
+(F25d's six predicated copies per page) is removed.
+
+**Finish** (`PendingDyn {e, m8u, m4u, pk[6], sw[6], f[6], ok8, ok4}`):
+`dyn_masks(pd, word, lane)` re-ballots the pending word's bits 0..5 / 8..13
+into uniform masks (two `VOTE.ANY` per operand: the word is LDS-derived per
+lane, so without the ballot ptxas would not know the per-slot branches are
+uniform); `dyn_any` = `(m8u | m4u) != 0` replaces F25's `op.pending == 0` test
+in the loop (a uniform branch); `dyn_loads` = `expand_bases` + per slot `if
+(m8u bit j) load_packed<true> / else if (m4u bit j) load_packed<false> / else
+zero`; `dyn_scales` = six `lds32(e.sc + j * 8)`, per page `f_j = f32(s_j)`,
+`gsel_j = in8_j ? gs8 : gs4` (SEL on a float), one `mul_rn_f32_denorm`, one
+`fold_ok`, folded into `ok8` / `ok4` by the format bits (bitwise); `dyn_body<VOTE>`
+= `exact8 = !__all_sync(ok8)`, `exact4 = !__all_sync(ok4)` (VOTE = false: both
+true; f16: both false), `g8 = exact8 ? g8p : gs8`, `g4` likewise (the plain
+globals now live in `OperandBases::{g8p, g4p}`, loaded once per item in
+`make_bases`; the static cold arms keep their per-operand reload), then per
+slot under the same branches `expand_block_pred<FP8>(e, pk[j],
+bf16x2(mul_rn_f32_denorm(f_j, g)), off_j, exact)`.  `expand_block_pred` is
+`expand_block` with the 2^k multiply as eight `exact ? mul : x` selects (the
+`@P HMUL2` form; a constant `exact` folds).  `expand_operand`'s dynamic branch
+runs masks -> `if (any) {loads; __syncwarp; scales; body<VOTE>}` for the two
+single-operand sites (`expand_pending` / `commit_pending` keep their
+`pending == 0` checks there); `expand_format_pages`, `finish_pending_pair` and
+the rolled loops are removed, `produce_pair` carries a `static_assert(!FINISH ||
+!HAS_COMPRESSED)` in their place.
+
+**Loop (dynamic), per pair after the spins**: `cp_async_wait<0>()` ->
+`dyn_masks(DK, K.pending)`, `dyn_masks(DV, V.pending)` -> `if (anyK)
+dyn_loads(DK, pK)`, `if (anyV) dyn_loads(DV, pV)` -> `__syncwarp()` ->
+`dyn_scales` x 2 -> rows, page words, K / V copies (`issue_loop`, which also
+sets `staged` and commits A16-only tiles with `cpasync_barrier_arrive` as F25)
+-> `cp_async_fence()` -> `if (anyK) dyn_body<true>(DK)`, `if (anyV)
+dyn_body<true>(DV)` -> probes -> `fence_view_async_shared()` -> `if (anyK)
+producer_commit(pK)`, `if (anyV) producer_commit(pV)` -> `rotate_pending` x 2.
+Stages come from the counter (`pK`, `pV`), formats from the words; the two
+agree because the dynamic module advances both rings for every tile.
+
+**Bit-exactness.**  Hot slot: `bf16x2(f32(s) * gs)` then `x * sf2` = F25's hot
+arm; exact slot: eight `HMUL2` by 2^k then `bf16x2(f32(s) * g)` with `g` the
+same grid-constant global F25 reloaded = F25's cold arm, term for term (the
+`mul_rn_f32_denorm` product is kept; one `fold_ok` constant serves both
+formats).  The vote is per operand per format as F25's; A16 slots and stale
+slots do not vote.  Copies: the same bytes to the same destinations as F25d's
+predicated form (one of the three forms executes per slot).
+
+**Registers.**  Both operands' six packed words (48) + `f` 12 + masks 4 + rows
+12 + six bases (12) + expand bases 14 + protocol ~12 + constants ~16 ~= 130:
+the same risk as 3.10 for the static modules, the same fallback (V' loads
+after the commit).
+
+**Expected artifacts (gate 5, dyn rows).**  `BSSY` / `BSYNC` 0 in the loop
+site's copy and decode bodies; `FLO` / `BREV` 0; `VOTE.ANY` 2 per operand at
+the copy site and 2 at the finish site; `VOTE.ALL` 4 in the loop site; 12
+bodies per operand in the loop site with 8 `@P HMUL2` + 8 `HMUL2`; the
+single-operand sites' 12 bodies with 16 unpredicated `HMUL2`; `LDGSTS` sites
+26 per operand (per slot 1 + 1 + 2, plus 2 scale) - the two-instruction
+compressed slot blocks predicated or branched, both accepted; region <= 3600;
+tests 118 / 118 including the two dynamic-uniform extremes cases.
+
+### As measured: F26d (2026-09-04, nkcut2 H200; wt/F26 @ 634c9477; full record in docs/mixed_kv_page_transport_backends.md, Track F [26])
+
+**Builds.**  f1341947 (F26a-c as written), b067c2c2 (3.10 fallback (a) on the
+dynamic arm), 634c9477 (the dynamic arm back to the F26c order, the fallback's
+reading recorded in a comment; code = f1341947).  The static modules, the a16
+module and the stock kernel are instruction-identical across the three.  The
+first placement of fallback (a) (4e8afc1c) moved `dyn_loads` past
+`dyn_scales`, which reads the bases `dyn_loads` sets: 24 / 118 (wrong values,
+then a misaligned address) - the matrix caught it; the second placement kept
+`e = expand_bases(pV)` before the barrier and moved only the packed-word loads.
+
+**Tests (6.1): 118 / 118 bit-exact** on f1341947, b067c2c2 and 634c9477 (the
+14 new cases included; `.o` mtimes after each run's start).  The F25-kernel
+baseline of the 14 cases (design 6.1 "run on the F25 kernel first") was not
+run separately in this session: the F26a-c kernel passed them at the first
+build.
+
+**Gate 5.**  ptxas: static modules and a16 0 / 0 / 0, no C7507; **dynamic 128 B
+frame, 408 / 608 B spills, `LDL` 51 / `STL` 23 in the loop site - miss;
+fallback (a) read at 152 / 456 / 656 B (no better), not adopted; (b) is
+already the module's form.**  Copy block: 14 `LDGSTS` + 14 `IMAD.WIDE.U32 Rd,
+R, UR, R.64`, carry adds 0, `SEL` 0 (the fused form: 3.2's prescription
+carried over; the pessimistic column's +100 for 3-instruction chains does not
+apply); fillers 6 (two `LDGSTS` groups, the `hasK` branch splits K / V; the K
+row's `LDS` sunk into the branch by ptxas).  Order as 3.1 (an extra
+`LDGDEPBAR` before the `DEPBAR` from cutlass `cp_async_wait<0>` = `wait_all`;
+`BRA.DIV` 3 at the barrier and the votes, 0 in bodies).  Octet scale copies as
+3.3 (one `LDS.32`, one chain, one `@P LDGSTS.64` per operand).  Protocol **~161
+(miss, <= 70)**.  Bodies unchanged (210 / 267, 222 / 279; `VOTE.ALL` 2 / 4, 0
+in bodies); cold arm is the fall-through.  Region **2543 / 2582 / 5519 (miss;
+<= 2450 / 2550 / 3600)** - dyn > 4000 with neither named cause (bodies shared
+per format, single-operand sites vote-free): the loop site alone is 2303.
+Dynamic copy body: branched per-slot form, 26 sites per operand, `VOTE.ANY` 2 +
+2 per operand, `FLO` / `BREV` 0; `BSSY` 3 in the copy block = the `hasK` guard
+and the A16-only-tile arrive paths.  a16 identical to F25's stream (and to
+`5cc416fd` up to the F25 UR permutation); stock byte-identical.
+
+**6.2 trace (us per pair, traced build; ratios).**  `wait` **0.023-0.030 (fp8)
+/ 0.022-0.032 (fp4) / 0.022-0.028 (mixed): the hard stop passes, F26b' not
+taken.**  fp8 `iss` 0.52-0.59 (w0) / 0.85-0.92 (w1) vs <= 0.50: miss; expK /
+expV 0.33-0.36 / 0.34-0.39 (sum vs <= 0.45: miss); `fin` 0.71-0.79 (<= 1.0
+met); `acq` 0.27-0.32 (>= 0.25 met).  fp4 expK / expV **0.43-0.44 / 0.38-0.46**
+(the F25 0.68 / 0.38 asymmetry is gone; 3.5 confirmed), `iss` 1.0-1.2.  mixed
+`iss` 1.5-2.2 (vs <= 0.55), `barB` 1.2-1.3.
+
+**6.4 bench (locked, 5 trials, min / median / max).**  stock 300.0 / 300.9 /
+300.9 and 309.0 / 309.7 / 310.5; transport_a16 280.8 / 283.3 / 284.1 and 287.5
+/ 288.1 / 289.2 (controls hold).  **fp8 364.0 / 366.6 / 367.3 and 387.1 /
+388.0 / 389.5; fp4 390.8 / 392.4 / 394.5 and 400.2 / 403.4 / 403.9; mixed
+1107.4 / 1111.4 / 1113.5 and 1121.2 / 1153.6 / 1166.1.**  Against section 4:
+fp8 / fp4 above the pessimistic column (336 / 339) -> **reject**; mixed above
+357 -> **reject, the count model wrong again** (below).  Improvement over F25:
+fp8 -9.0 / -6.5 %, fp4 -7.1 / -6.1 %; mixed **+71 / +74 % (regression)**.
+
+**6.3 ncu (q=1, third launch).**  fp8: producer 2603 instr per pair (651 per
+warp; band 2450 +- 5 %: +6 %), loop-site issue pair **2667 cycles (accept
+<= 2590; centre 1985, pessimistic 2640)**; segment table (measured / centre):
+top + spins 367 / 120, `DEPBAR` + landing + scales 186 / 100, **copy block 581
+/ 850 = 41 per `LDGSTS`** (accept 25-40; a16 this session 27 / 17), K vote +
+arms **810 / 415**, V vote + arms **604 / 420**, tail 118 / 80.  First
+post-`DEPBAR` PC 0.96 % (long_sb 0.7 %; <= 2 % met).  Consumer K-wait **3.8 %**
+(F25 10.2; a16 2.6) with the producer pair > T_c: the producer paces (reading
+rule, second case).  Tensor pipe 51.2 % (a16 67.1).  Wavefronts per pair 1899
+(388 / 696 / 1001); **octet `LDGSTS.64` 11.9 wavefronts per instruction** (six
+global lines per instruction; 89 per pair per CTA = F25's twelve leader-lane
+copies), `LDGSTS` bank conflicts 1.99 M (F25 231 K).  fp4: 2804 (701), pair
+2876, copy block 787 = 56 per `LDGSTS` (payload `.64` at 4.00 wavefronts),
+K-wait 6.4 %.  **mixed: 5286 (1321; model 3200 +- 8 %), pair 8178, stall mix
+wait 32 / long_sb 23 / no_inst 11; copy block 3169 with long_sb 42 % on the
+`IMAD`s that consume `LDL` reloads; masks + per-slot loads 1833; K-wait
+68.5 %.**  The regression is the spill traffic on the copy path (section 3.10's
+one named risk, on this module only) plus the instruction cache on a
+2455-instruction loop site.
+
+**Verdict.**  Gate 5 met on structure (copy form, order, octet copies, bodies,
+a16 / stock identity, 118 / 118) and missed on the dynamic module's registers,
+the protocol count and the region counts; 6.2 hard stop met; **6.4 reject on
+all three compressed modes**.  What the design got right: the copy block's
+price (581 vs 1160), the landing cover, the fp4 symmetry, the address form.
+What it got wrong: the arm segments (1414 measured vs 775 + 60 carried
+forward from F25: the same bodies, with the shared-store back-pressure
+sampled on the instructions after each `STS.128` group), the top-of-pair
+protocol (367 vs 120), the octet copy's wavefronts (12 per instruction, not
+~2: the saving was instructions, not pipe time), and the dynamic module's
+registers (the per-slot copy bodies' bases and masks, not the packed words,
+are the binding live set - fallback (a) cannot reach them).  The F26c
+dynamic module should not ship for mixed.
