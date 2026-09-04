@@ -635,8 +635,7 @@ __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t vali
 __device__ void warpGrpOnlineSoftmax(Gemm0Acc& acc, RegColWiseVec const& colMax);
 __device__ RegColWiseVec computeWarpColSum(Gemm0Acc& src);
 __device__ void storeGemm0AccToShm(uint32_t warpRank, uint32_t lane, SharedMem::XBuffer& smemX,
-                                   CtaBarrier& barConsumed, CtaBarrier::ArrivalToken&& consumedToken,
-                                   Gemm0Acc const& acc);
+                                   CtaBarrier& barConsumed, Gemm0Acc const& acc);
 __device__ RegColWiseVec loadShmColWiseVecWithDup(ShmQWiseVec const& smemVec);
 __device__ RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gmemVec, uint32_t bound);
 #else
@@ -1146,17 +1145,6 @@ __launch_bounds__(128 * ctaWarpGroups)
       Acc acc;  // no need to initialize. GMMA allows us to ignore acc initial values.
       gmma::fence();
       static_assert(cacheHeadNbParts == nbQParts);
-      uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
-      auto& xBar = smem.xBar[idxXBuf];
-#if SWAP_AB
-      // Lever [33c]: arrive on xBar.consumed now (this tile's X buffer was last
-      // used two tiles ago and gemm0 cannot complete the phase alone - gemm1's
-      // release of X(t-2) is the other half of the count), and wait only right
-      // before the X store, so the round trip hides behind the K wait, the QK
-      // wgmmas and softmax.  The arrive for tile t+2 follows this tile's wait
-      // in program order, so it cannot run into the next phase.
-      auto xConsumedToken = xBar.consumed.arrive();
-#endif
 #pragma unroll
 #if ENABLE_MIXED_KV_CACHE
       uint32_t const idxKStage = idxIter % SharedMem::nbKBuf;
@@ -1272,10 +1260,11 @@ __launch_bounds__(128 * ctaWarpGroups)
       // map 1 to fp8_max before conversion to fp8
       acc = acc * kE4M3_MAX;
 
+      uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
+      auto& xBar = smem.xBar[idxXBuf];
       // @fixme: for fp16/bf16, try not to transpose acc here, and leave it to the next GEMM.
 #if SWAP_AB
-      storeGemm0AccToShm(warpRank, laneId(), smem.xBuf(idxXBuf), xBar.consumed,
-                         mha::move(xConsumedToken), acc);
+      storeGemm0AccToShm(warpRank, laneId(), smem.xBuf(idxXBuf), xBar.consumed, acc);
       // store colMax and warpColSum
       auto const lane = laneId();
       if (lane < 4) {
@@ -3026,7 +3015,6 @@ __device__ inline RegColWiseVec computeWarpColSum(Gemm0Acc& src) {
 
 __device__ inline void storeGemm0AccToShm(uint32_t warpRank, uint32_t lane,
                                           SharedMem::XBuffer& smemX, CtaBarrier& barConsumed,
-                                          CtaBarrier::ArrivalToken&& consumedToken,
                                           Gemm0Acc const& acc) {
 #if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
   using F16Acc = Array2D<Vec<uint32_t, 2>, Gemm0Acc::rows, Gemm0Acc::cols>;
@@ -3059,7 +3047,7 @@ __device__ inline void storeGemm0AccToShm(uint32_t warpRank, uint32_t lane,
     return f16Acc(accR, accC);
   };
 
-  barConsumed.wait(mha::move(consumedToken));
+  barConsumed.arrive_and_wait();
 #pragma unroll
   for (uint32_t iter = 0; iter < Gemm0Acc::size / 2; iter++) {
     auto const dstAddr = getDstAddr(iter * 2 + idxHalf);
@@ -3099,7 +3087,7 @@ __device__ inline void storeGemm0AccToShm(uint32_t warpRank, uint32_t lane,
       dst = &smemX[dstCol.template divBy<grainsPerXPart>().get()].template at<true>(
           dstRow, dstCol.template mod<grainsPerXPart>().get());
     }
-    barConsumed.wait(mha::move(consumedToken));
+    barConsumed.arrive_and_wait();
     stmatrix<true, F8Acc::size>(dst, reinterpret_cast<Vec<uint32_t, F8Acc::size> const&>(f8Acc));
   } else {
     // we need to use loops
