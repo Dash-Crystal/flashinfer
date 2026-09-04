@@ -771,3 +771,46 @@ unchanged (K 2 A16 / 1 FP8 / 1 FP4 + 1 scale per span-iteration shape), `LDGSTS`
 `[R + imm]`.  Section 4's -590 U (dynamic) / -450..-600 U (static) is this item's budget; if A0
 puts copy + scales below 12 % of `inst_executed`, drop this commit (section 7 item 2).
 
+
+## 9. Results (2026-09-04, nkcut2 H200 + ws-1 RTX 5090; full record in backends.md "Track S step 6")
+
+- **A0 (before the copy item was measured):** expansion 34.0 % (fp8) / 43.6 % (fp4) of
+  `inst_executed`, copy + scales 24.9 % / 20.6 % -> item 3 kept (section 7 item 2 not
+  triggered).  The lineinfo build is byte-identical to production and to the step-5 SASS artifact.
+- **A1:** REG 124-127, STACK 0, LDL / STL 0 on all four sm90 q=4 modules; F2FP 2.5 per span-call
+  (18 per lane-call before), HMUL2 8 per block (16 in the fallback body), STS.128 4 and LDS 3 per
+  span-call, one VOTE per span, one WARPSYNC at the helper entry; LDGSTS count unchanged, `[R+imm]`
+  destinations, IMAD.WIDE only per span; the scale loop's `if (compressed)` is predicated in the
+  hot K body.  Module SASS 4,760 / 3,928 / 4,600 / 4,640.
+- **A2:** `smsp__inst_executed.sum` fp8 42.76 -> 35.99 M, fp4 50.85 -> 36.53 M, mixed 51.47 ->
+  42.44 M (mixed in band, fp8 / fp4 1 M above their bands).  **The issue-rate reading (ii) failed:**
+  issue-active fp8 52.0 -> 43.2 %, fp4 58.1 -> 47.5 %; short_scoreboard fp8 1.32 -> 2.01, fp4
+  0.69 -> 1.64; warp-cycles per issued instruction 6.6 -> 8.1 (fp8).  PC sampling puts the new
+  expansion's stalls on `F2FP.F16.E4M3` (waits for `LDS.U16`), the next span's `LDS.128` (register
+  WAR against the previous span's `STS.128`) and the fold `BRA` (waits for `VOTE.ALL`); the
+  expansion's sample share is unchanged (23 %) at 16 % fewer instructions (fp8), and the samples the
+  copy hoist removed (-1,233 of 9,829) reappear as long-scoreboard waits in the tile control and the
+  page / tag loads.  A first cut with the payload loads inside the fold branch was worse
+  (short_sb 2.39, fp8 117.8 us); the committed loads-first order is 2.01 / 116.7 us.
+- **A3:** 66/66 bit-exact on nkcut2 (default and `XQA_NB_SUB_SEQ=2`) and on ws-1, with the new
+  q=4 `subnormal` / `maxscale` / `tinyglobal` (`|g| = 2^-118`) rows; sm120 SASS byte-identical
+  (7 of 8; the dyn q=1 pair shows step 5's pristine-vs-pristine hashes); sm90 q=1 `mha_sm90` and
+  `mha.cu` modules byte-identical.
+- **A4 (three locked rounds, medians):** a16 86.2 / 86.4 / 86.8; **fp8 116.7 / 116.7 / 116.7
+  (1.024x step 5)**; **fp4 103.6 / 103.3 / 104.0 (0.89x)**; **mixed 110.6 / 110.3 / 109.6
+  (0.95x)**; q=1 control 81.7 / 76.5 / 70.7 / 79.8.  Design bands missed on all three
+  compressed modes; reject rule (> 1.05x) not triggered; targets 94 / 59 / 101 open at 1.24x /
+  1.76x / 1.09x.  ws-1 interleaved rounds equal within 0.9 us.
+
+What the result says about the model: the count budget of section 4 was right to within 1 M
+instructions per mode, and time did not follow it.  Section 4's reading (ii) assumed the
+short-scoreboard stall was the F2FP/HADD2 chain and would leave with it; the sampling shows the
+per-span scale chain + vote and the `STS -> LDS` register reuse take its place, and that the
+kernel's remaining time is landing latency (long scoreboard on the ring and the page/tag loads)
+which no instruction cut addresses at the current pipeline depth.  Follow-ups, in order of what
+the counters support: (1) one fold vote per call (load all spans' scale pairs first, `K: 4 x
+LDS.U16`; the chain runs once per part / V tile instead of per span); (2) alternate the
+packed / output registers between consecutive spans so the next span's `LDS` does not WAR on
+the previous `STS` (two register sets, explicit in the unrolled static bodies); (3) for fp8,
+whose count lever is exhausted, the landing latency itself (ring depth / `kAhead`, which the
+2-CTA smem budget of step 5 forbids at 128 B parts — a step-5-style arithmetic decision first).
