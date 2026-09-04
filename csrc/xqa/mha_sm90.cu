@@ -2336,12 +2336,20 @@ __launch_bounds__(128 * ctaWarpGroups)
             // 3. Last arriver: combine chunks {2c+1 | c0 <= c < c1} and the c1 chunk
             //    (2c1+1 iff CTA c1's range ends with the sequence, else 2c1) (C11).
             //    The i-th non-empty CTA is c0 + i (T >= P) or the owner of sequence
-            //    tile i, floor((Lseq + i) * P / T) (T < P; c(x) is then strictly
-            //    increasing and c(Lend - 1) == c1).
+            //    tile i, c_i = floor((Lseq + i) * P / T) (T < P; c(x) is then strictly
+            //    increasing and c(Lend - 1) == c1).  c_i is stepped without division:
+            //    n_i = (Lseq + i) * P = c_i * T + r_i, n_{i+1} = n_i + P with
+            //    P = qP * T + rP, so c_{i+1} = c_i + qP + [r_i + rP >= T].  The dense
+            //    case is the same recurrence with qP = 1, rP = 0.
             ScratchMem const scratchMem{scratch, 2 * nbCtas, 1};
             uint32_t const xC1End = static_cast<uint32_t>(
                 (uint64_t(c1 + 1) * nbTotalTiles + nbCtas - 1) / nbCtas);
             uint32_t const lastChunk = 2 * c1 + (xC1End == Lend ? 1U : 0U);
+            uint32_t const qP = sparse ? nbCtas / nbTotalTiles : 1U;
+            uint32_t const rP = sparse ? nbCtas % nbTotalTiles : 0U;
+            uint32_t const r0 = sparse ? static_cast<uint32_t>(uint64_t(Lseq) * nbCtas -
+                                                               uint64_t(c0) * nbTotalTiles)
+                                       : 0U;
             uint32_t const hInGrp = lane / 8;
             uint32_t const elem0 = 16 * (lane % 8);
             OutputHead* const outHeads = &output[headGrpSize * (nbKHeads * item.req + item.head)];
@@ -2360,10 +2368,9 @@ __launch_bounds__(128 * ctaWarpGroups)
                 Acc8 acc = Acc8::filled(0.f);
                 float sum = 0.f;
                 float mx = safeInitRowMax;
+                uint32_t c = c0;
+                uint32_t r = r0;
                 for (uint32_t i = 0; i < nbPartials; i++) {
-                  uint32_t const c =
-                      sparse ? static_cast<uint32_t>(uint64_t(Lseq + i) * nbCtas / nbTotalTiles)
-                             : c0 + i;
                   uint32_t const chunk = (c < c1) ? 2 * c + 1 : lastChunk;
                   if (valid) {
                     float2 const sm = __ldcg(reinterpret_cast<float2 const*>(
@@ -2383,6 +2390,12 @@ __launch_bounds__(128 * ctaWarpGroups)
                       sum = sum + pSum * scale;
                       acc = acc + data * (pSum * scale);
                     }
+                  }
+                  c += qP;
+                  r += rP;
+                  if (r >= nbTotalTiles) {
+                    c++;
+                    r -= nbTotalTiles;
                   }
                 }
                 if (valid) {
