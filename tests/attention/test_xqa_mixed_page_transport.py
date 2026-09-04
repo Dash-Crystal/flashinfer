@@ -283,3 +283,70 @@ def test_xqa_native_block_fp8_matches_a16_expansion(q_len):
     )
     assert not torch.isnan(actual).any()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda"))[0] not in (9, 12),
+    reason="mixed-page XQA targets SM90 and SM12x",
+)
+@pytest.mark.parametrize("pages_per_request", [18, 256])
+def test_xqa_mixed_a16_stream_matches_stock_decode(pages_per_request):
+    """Independent numeric check of the mixed-page consumer.
+
+    The bit-exact matrix compares mixed streams against the all-A16 mixed
+    stream, i.e. the same kernel with different page converters; a consumer
+    bug that changes both sides identically would pass it.  This case runs the
+    all-A16 mixed stream (mha_sm90.cu on SM90 at q=1) against the stock bf16
+    XQA decode (mha.cu), which shares none of the mixed kernel's consumer code.
+    The two kernels differ in P precision and reduction order, so the
+    comparison has a tolerance; 256 pages per request cover 64 tiles, the
+    running max/sum update on every tile and the multi-block merge.
+    """
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size = 2
+    page_size = 16
+    num_pages = batch_size * pages_per_request
+    num_kv_heads = 2
+    group_size = 4
+    head_dim = 128
+    shape = (num_pages, page_size, num_kv_heads, head_dim)
+    canonical_k, canonical_v, _, _, transport = _make_transport(
+        shape, dtype, device, "a16"
+    )
+    page_table = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).reshape(batch_size, pages_per_request)
+    seq_lens = torch.full(
+        (batch_size,), pages_per_request * page_size - 3, dtype=torch.int32, device=device
+    )
+    query = torch.randn(
+        batch_size, num_kv_heads * group_size, head_dim, dtype=dtype, device=device
+    )
+    kwargs = dict(
+        block_tables=page_table,
+        seq_lens=seq_lens,
+        max_seq_len=int(seq_lens.max()),
+        bmm1_scale=head_dim**-0.5,
+        q_len_per_req=1,
+        mask=None,
+        enable_pdl=True,
+    )
+    expected = xqa_batch_decode_with_kv_cache(
+        query, (canonical_k, canonical_v),
+        torch.zeros(64 << 20, dtype=torch.uint8, device=device), **kwargs,
+    )
+    actual = xqa_batch_decode_with_kv_cache(
+        query, (canonical_k, canonical_v),
+        torch.zeros(64 << 20, dtype=torch.uint8, device=device),
+        page_transport=transport, page_transport_static_format=0, **kwargs,
+    )
+    assert not torch.isnan(expected).any()
+    assert not torch.isnan(actual).any()
+    err = (actual.float() - expected.float()).abs().max().item()
+    ref = expected.float().abs().max().item()
+    print(f"[a16_vs_stock-{pages_per_request}] max|diff|={err:.3e} max|ref|={ref:.3e}",
+          flush=True)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)

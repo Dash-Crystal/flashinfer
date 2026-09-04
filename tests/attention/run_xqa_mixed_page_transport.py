@@ -1,7 +1,7 @@
 """Plain runner for the XQA mixed-page conformance matrix (no test framework).
 
-Runs the 32 register-expansion cases and the 2 native block-FP8 cases on
-sm90 / sm12x.  Exit code is the number of failing cases.
+Runs the 32 register-expansion cases, the 2 native block-FP8 cases and the
+2 independent-reference cases (mixed A16 stream vs stock decode) on sm90 / sm12x.  Exit code is the number of failing cases.
 """
 
 import importlib.util
@@ -49,6 +49,12 @@ def main() -> int:
     for q_len in (1, 64):
         cases.append((f"[native_fp8-{q_len}]",
                       _mod.test_xqa_native_block_fp8_matches_a16_expansion, (q_len,)))
+    # Independent reference for the mixed consumer (mha_sm90.cu at q=1 vs the
+    # stock mha.cu decode; tolerance-based, see the test docstring).
+    for pages_per_request in (18, 256):
+        cases.append((f"[a16_vs_stock-{pages_per_request}]",
+                      _mod.test_xqa_mixed_a16_stream_matches_stock_decode,
+                      (pages_per_request,)))
     failures = 0
     n = 0
     for i, (name, fn, fn_args) in enumerate(cases):
