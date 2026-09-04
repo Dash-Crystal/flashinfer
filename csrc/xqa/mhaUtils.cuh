@@ -1566,6 +1566,39 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
   return ret;
 }
 
+// [45f] (Track S step 7, sm90 SPEC_DEC compact build): the page-list read does not need the
+// sequence length.  kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage] is in bounds for every
+// idxPage < maxNbPagesPerSeq (the row stride getPage indexes with; a kernel parameter), so the
+// load is predicated on that alone and BAD is selected on idxPage < nbPages after both the list
+// entry and the sequence length have landed: the per-CTA prologue chain seqLen -> list -> (tag ->)
+// copy loses one dependent round trip.  The load is an asm volatile ld.global.nc so the compiler
+// cannot fold the nbPages select back into the load predicate (a plain load whose only consumer
+// is the select may legally be predicated on both conditions).  Values are identical to getPage:
+// idxPage < nbPages <= maxNbPagesPerSeq -> the list entry, else BAD; cacheSeqLen == 0 gives
+// nbPages == 0 and every entry BAD, as today.  Data flow: idxPageBeg + i, maxNbPagesPerSeq,
+// idxReq -> (predicated) LDG -> loaded; nbPages -> SEL.  Control flow: none (predication).
+__device__ inline KVCachePageIndex ldgNcPageIndex(KVCachePageIndex const* p) {
+  KVCachePageIndex v;
+  asm volatile("ld.global.nc.b32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+template <uint32_t nbLoadedPages>
+__device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPageUngated(
+    KVCacheList<true> const& cacheList, uint32_t idxReq, uint32_t idxPageBeg, uint32_t nbPages) {
+  auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
+  Vec<KVCachePageIndex, nbLoadedPages> ret;
+#pragma unroll
+  for (uint32_t i = 0; i < nbLoadedPages; i++) {
+    uint32_t const idxPage = idxPageBeg + i;
+    KVCachePageIndex loaded = kBAD_PAGE_INDEX;
+    if (idxPage < maxNbPagesPerSeq) {
+      loaded = ldgNcPageIndex(&cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]);
+    }
+    ret[i] = (idxPage < nbPages ? loaded : kBAD_PAGE_INDEX);
+  }
+  return ret;
+}
+
 template <uint32_t nbWarps, uint32_t nbLoadedPages>
 __device__ inline void loadPagesForBeamSearchAsync(
     uint32_t idxWarp, Vec<Vec<KVCachePageIndex, nbLoadedPages>, beamWidth>& dst,

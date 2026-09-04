@@ -2409,8 +2409,15 @@ CUBIN_EXPORT __global__
 #if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
       pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
 #endif
+#if MIXED_COMPACT_TILE_LOOPS
+      // [45f]: list load predicated on the kernel parameter maxNbPagesPerSeq, BAD selected on
+      // nbPages afterwards (one dependent round trip less in the CTA prologue; same values).
+      unused(idxBeam);
+      pageIdxNext = getPageUngated<KCachePageIndices::size>(cacheList, idxReq, idxPage, nbPages);
+#else
       pageIdxNext =
           getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+#endif
 #else
       pageIdx =
           getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
@@ -2957,8 +2964,15 @@ CUBIN_EXPORT __global__
 #if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
       pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
 #endif
+#if MIXED_COMPACT_TILE_LOOPS
+      // [45f]: see the K loader.
+      unused(idxBeam);
+      pageIdxNext =
+          getPageUngated<VCachePageIndices::size>(cacheList, idxReq, idxPageBeg, nbPages);
+#else
       pageIdxNext =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+#endif
 #else
       pageIdx =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);

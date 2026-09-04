@@ -617,3 +617,23 @@ warp (`mha.cu:2777`), so the full mask is the true active set.  Expected SASS: 4
 4 `SHFL.IDX` + `WARPSYNC` / `MATCH.ANY` / `REDUX.OR` / `VOTEU.ANY` / `LOP3` / `BRA.DIV` per
 shuffle); `MATCH.ANY` 0 and `BRA.DIV` 0 in the gemm0 tile loop.  Registers: 0.  sm120 / M32:
 the `#else` text is byte-for-byte the stock line.
+
+### 8.3 [45f] — page-list load not gated on the sequence length (commit "[45f]")
+
+Files: `csrc/xqa/mhaUtils.cuh` (`ldgNcPageIndex`: `asm volatile ld.global.nc.b32`;
+`getPageUngated<nbLoadedPages>(cacheList, idxReq, idxPageBeg, nbPages)`), `csrc/xqa/mha.cu` (K
+and V `loadPages`: `#if MIXED_COMPACT_TILE_LOOPS getPageUngated(...) #else getPage(...) #endif`;
+the stock `getPage` is untouched and stays the body of every other build).  Data flow per
+entry i: `idxPage = idxPageBeg + i`; `idxPage < maxNbPagesPerSeq` (kernel parameter) predicates
+the `LDG` of `kvCachePageList[maxNbPagesPerSeq idxReq + idxPage]`; `idxPage < nbPages` selects
+`loaded` or `kBAD_PAGE_INDEX`.  The `asm volatile` keeps the load's predicate free of `nbPages`
+(a plain load whose only use is the select could legally be predicated on both conditions by
+the compiler, which would restore the dependency).  Control flow: predication only.  Values:
+identical to `getPage` for every `idxPage` (`nbPages <= maxNbPagesPerSeq` by construction of the
+page table; `cacheSeqLen == 0` -> `nbPages 0` -> every entry BAD).  Prologue chain: static
+modules `seqLen || list -> copy` (was `seqLen -> list -> copy`; the tag load is gone since
+[45c]); dyn `seqLen || list -> tag -> copy` (was three dependent round trips).  Under
+`SLIDING_WINDOW=1` `idxPageBeg` itself depends on `cacheSeqLen` (still correct, no gain); the
+bench builds have `SLIDING_WINDOW=0`.  Expected SASS: the list `LDG.E.CONSTANT` (`.nc`) no
+longer under a predicate derived from the `seqLenList` load; `SEL` after it; count of `LDG` per
+`loadPages` unchanged (4 K / 2 V; [45d] takes it to 1).  Registers: 0 (one more predicate).
