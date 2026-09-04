@@ -225,6 +225,49 @@ __device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t lane
   return ret;
 }
 
+// [45c] (Track S step 7, sm90 SPEC_DEC compact build): the tile's tags as one register word,
+// byte s = tag of page s, from the lane-distributed tag load (lane s holds the tag of page s;
+// lanes past the tile and BAD pages hold 0 = kA16).  One redux.sync.or over `tag << 8 lane`
+// (sm80+) in place of nbPages SHFL.IDX + PRMTs; the word is warp-uniform by construction
+// (0 <=> every page is A16 <=> no expansion) and stays in a register: the build passes it to the
+// copy and to the expansion instead of staging kFormats / kNeedsExpansion in shared memory.
+// Data flow: laneValue (u8 in a u32, lane s) -> contrib = lane < nbPages ? tag << 8 lane : 0 ->
+// REDUX.OR -> word.  Control flow: convergent (all 32 lanes; called by the whole loader warp).
+template <uint32_t nbPages>
+__device__ inline uint32_t packMixedPageTags(uint32_t laneValue) {
+  static_assert(nbPages <= 4, "four 8-bit tags per word");
+  uint32_t const lane = laneId();
+  uint32_t const contrib = lane < nbPages ? (laneValue << (8u * (lane & 3u))) : 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  return __reduce_or_sync(0xFFFFFFFFu, contrib);
+#else
+  uint32_t word = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < nbPages; ++i) {
+    word |= __shfl_sync(0xFFFFFFFFu, contrib, i);
+  }
+  return word;
+#endif
+}
+
+// The same word from a staged MixedPageFormats (the MIXED_KV_PROBE_C build, whose expansion
+// takes the [45c] word but whose stock copy still stages the struct).
+template <uint32_t nbPages>
+__device__ inline uint32_t mixedPageTagsWord(MixedPageFormats<nbPages> const& formats) {
+  static_assert(nbPages <= 4, "four 8-bit tags per word");
+  uint32_t word = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < nbPages; ++i) {
+    word |= uint32_t(formats.values[i]) << (8u * i);
+  }
+  return word;
+}
+
+// Byte s of the [45c] tag word = the tag of span / page s.
+__device__ inline uint8_t mixedPageTagOfSpan(uint32_t formatWord, uint32_t span) {
+  return static_cast<uint8_t>((formatWord >> (8u * span)) & 0xFFu);
+}
+
 template <uint32_t nbPages>
 __device__ inline bool needsMixedPageExpansion(
     MixedPageFormats<nbPages> const& formats) {
@@ -1034,11 +1077,10 @@ __device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t pa
 //     fold ? body<true> : body<false>   (both straight-line over the lane's two blocks)
 //   __syncwarp  (before the warp's ldmatrix reads)
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, uint32_t dstNbHeads,
-          uint32_t dstNbGrains, uint32_t nbPages, typename _LdGrain>
+          uint32_t dstNbGrains, typename _LdGrain>
 __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
-    Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales,
-    MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset, float fp8GlobalScale,
-    float fp4GlobalScale) {
+    Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales, uint32_t formatWord,
+    uint32_t sourceHeadOffset, float fp8GlobalScale, float fp4GlobalScale) {
   using Tile = Array2D<_LdGrain, dstNbHeads, dstNbGrains>;
   // Every static_assert below is dependent on a template parameter so that a mixed build that
   // never instantiates this helper (fp16 input, other page sizes, sm120) compiles unchanged.
@@ -1145,7 +1187,7 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   };
 
 #if MIXED_PAGE_STATIC_FORMAT == 0
-  unused(formats);
+  unused(formatWord);
   unused(expandSpan);
   unused(sourceHeadOffset);
   unused(a16Format);
@@ -1153,14 +1195,15 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
 #pragma unroll(pageLoopUnroll)
   for (uint32_t span = 0; span < nbSpans; ++span) {
 #if MIXED_PAGE_STATIC_FORMAT > 0
-    unused(formats);
+    unused(formatWord);
     unused(sourceHeadOffset);
     unused(a16Format);
     expandSpan(span, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
+    // [45c]: the span's tag is a byte of the register word (was LDS.U8 [UR] from smem.kFormats).
     uint32_t const localPage = (sourceHeadOffset + span * headsPerSpan) / tokensPerPage;
-    assert(localPage < nbPages);
-    uint8_t const format = selectByIndex(formats.values, localPage);
+    assert(localPage < 4);
+    uint8_t const format = mixedPageTagOfSpan(formatWord, localPage);
     if (format == fp8Format) {
       expandSpan(span, MixedFormatTag<fp8Format>{});
     } else if (format == fp4Format) {
@@ -1219,8 +1262,8 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, PageTransport const& transport,
-    Vec<KVCachePageIndex, nbPages> const& pages, MixedPageFormats<nbPages> const& formats,
-    uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
+    Vec<KVCachePageIndex, nbPages> const& pages, uint32_t formatWord, uint32_t headIdx,
+    uint32_t idxPart, uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
   // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
@@ -1320,10 +1363,11 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
   for (uint32_t span = 0; span < nbSpans; ++span) {
     KVCachePageIndex const page = selectByIndex(pages, span);
 #if MIXED_PAGE_STATIC_FORMAT >= 0
-    unused(formats);
+    unused(formatWord);
     copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
-    uint8_t const format = selectByIndex(formats.values, span);
+    // [45c]: byte span of the register tag word (was a byte of the shuffled struct).
+    uint8_t const format = mixedPageTagOfSpan(formatWord, span);
     if (format == a16Format) {
       copySpan(span, page, MixedFormatTag<a16Format>{});
     } else if (format == fp8Format) {
@@ -1351,7 +1395,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 #if MIXED_PAGE_STATIC_FORMAT >= 0
         pageValid ? MIXED_PAGE_STATIC_FORMAT : a16Format;
 #else
-        pageValid ? selectByIndex(formats.values, localPage) : a16Format;
+        pageValid ? mixedPageTagOfSpan(formatWord, localPage) : a16Format;
 #endif
     bool const compressed = format != a16Format;
     if (compressed) {

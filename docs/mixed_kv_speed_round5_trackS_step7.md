@@ -548,3 +548,59 @@ CSVs and nvdis files): `nkcut2:/tmp/mixedkv-wtS6-a0/{v2-fmt-1,v2-fmt0,v2-fmt1,v2
 
 ## 8. As written (code state of this worktree; one subsection per commit, appended as each lands)
 
+### 8.1 [45c] — flags, formats, tags in registers (commit "[45c]")
+
+Files: `csrc/xqa/mhaUtils.cuh` (`packMixedPageTags<nbPages>`: `redux.sync.or` of `tag << 8 lane`
+over lanes `< nbPages`, shuffle fallback below sm80 / host pass; `mixedPageTagsWord` for the
+probe build; `mixedPageTagOfSpan(word, span)`; `expandMixedPartialHeadsInPlaceBF16Placement` and
+`copyMixedPartialHeadsAsyncHoisted` take `uint32_t formatWord` instead of `MixedPageFormats
+const&` — the dynamic module's per-span format is `(word >> 8 span) & 0xFF`, the static modules
+`unused()` it), `csrc/xqa/mha.cu` (new guards `MIXED_ALL_HOISTED_COPY = MIXED_HOISTED_COPY &&
+MIXED_PAGE_STATIC_FORMAT != 0` and `kMixedStaticNeedsExpansion = MIXED_PAGE_STATIC_FORMAT > 0`
+(static modules only); K and V loaders, expansion sites and buffer-advance sites).  Every
+change in `mha.cu` is `#if MIXED_HOISTED_COPY <new> #else <stock verbatim> #endif`: `unifdef
+-DMIXED_HOISTED_COPY=0 -DMIXED_ALL_HOISTED_COPY=0 -DMIXED_BF16_PLACEMENT_EXPANSION=0
+-DMIXED_COMPACT_TILE_LOOPS=0` of the old and the new `mha.cu` differ only in the new `#define`
+block (the sm120 / sm90 q=1 preprocessed source is unchanged; A3 confirms on the objects).
+
+Data flow, per copy call (K part / V half-tile), by module:
+
+```
+static fp8 / fp4 (MIXED_ALL_HOISTED_COPY, kMixedStaticNeedsExpansion = true):
+  loadPages: pageIdx <- pageIdxNext; pageIdxNext <- getPage(...)      (no tag load: pageTagLane is gone)
+  copy:      copyMixedPartialHeadsAsyncHoisted(..., pageIdx, tagWord = 0 (constexpr), ...)
+  expansion: if constexpr (true) expand...(..., 0u, ...)                 (no flag load, no branch)
+static a16 (kMixedStaticNeedsExpansion = false):
+  loadPages: as above; copy: stock bounds-checked copyPartialHeadsAsync (the only body; isFullTile
+             is constant false under kCompactTileLoops); expansion: if constexpr (false) -> discarded
+dynamic (MIXED_PAGE_STATIC_FORMAT < 0):
+  loadPages: pageIdx <- pageIdxNext; pageTagLane <- mixedPageTagLane(pageIdx) (lane s: tag of page s);
+             pageIdxNext <- getPage(...)
+  copy:      tagWord = packMixedPageTags(pageTagLane)   REDUX.OR: byte s = tag of span s, 0 = all A16
+             kTagWordNext = tagWord  (V: vTagWordNext)
+             copyMixedPartialHeadsAsyncHoisted(..., pageIdx, tagWord, ...)  per-span format = byte span;
+             scale loop: pageValid ? byte localPage : kA16
+  advance:   idxCurrSMemKBuf++ ; kTagWordCurr = kTagWordNext        (prologue site and loop site; V same)
+  expansion: if (kTagWordCurr != 0) expand...(..., kTagWordCurr, ...)  per-span format = byte span
+```
+
+Control flow: no lane-0 `STS.U8` / `STS`, no `__syncwarp()` in the loaders (it served only the
+flag path); the K copy site has one body per module chosen by the preprocessor (`MIXED_ALL_
+HOISTED_COPY`: hoisted; a16: stock); the a16 module's `HeadPtr src` is still built, the
+all-hoisted modules build none.  The two words are named registers copied at the four
+`idxCurrSMemKBuf++` / `idxCurrSMemVBuf++` sites (no `u32[2]` indexed by the `CircIdx`).  Rotation
+trace (K): prologue `loadKTilePart(part 0)` writes buffer 0 and `kTagWordNext = T(tile 0)`;
+`idxCurr++` -> 0, `Curr = T(0)`; loop p=0: `loadKTilePart(part 1)` -> buffer 1, `Next = T(0)`;
+expansion of buffer 0 reads `Curr = T(0)`; `idxCurr++`, `Curr = T(0)`; p=1: `loadKTilePart(tile
+1, part 0)` -> buffer 0, `Next = T(1)`; expansion of buffer 1 reads `Curr = T(0)`; `idxCurr++`,
+`Curr = T(1)`.  `smem.kFormats / vFormats / kNeedsExpansion / vNeedsExpansion` stay declared
+(unread in the guarded build; the compact-register path still names them) so the barrier
+addresses do not move.  `SharedMem` is unchanged (115,456 B).
+
+Expected SASS (A1): static modules — `LDG.E.U8` 0, `SHFL.IDX` for tags 0, `PRMT` of the tag
+broadcast 0, flag `STS.U8` / `LDS.U8` 0, `WARPSYNC` in the loaders 0; the a16 module loses the
+same and its hoisted copy body (dead); dyn — 1 `REDUX` per copy call (2 per tile), `ISETP` on a
+register for the expansion decision, `SHF.R + LOP3` per span for the format (uniform datapath
+if ptxas keeps the REDUX result in a UR), `LDS.U8 [UR]` of `kFormats` 0.  Registers: static -1
+(`pageTagLane`, `pageFormats`, the flag), dyn +1 (`Next/Curr` +2, `pageFormats` -1).  REG <= 128,
+STACK 0, LDL / STL 0.
