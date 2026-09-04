@@ -1193,14 +1193,19 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if ENABLE_MIXED_KV_CACHE
   // Per-role register budget.  setmaxnreg.inc blocks until the CTA's pool has
   // the registers, and the pool is the launch allocation (640 x 48 = 30720),
-  // so the split must balance within it: the IO group releases 24 x 128 =
-  // 3072, the two converter groups (expansion + compressed-page copies, which
-  // spill at 48) take 8 x 256 = 2048, the GEMM groups keep 48.
-  // 128*24 + 2*128*56 + 2*128*48 = 29696 <= 30720.
+  // so the split must balance within it.  ptxas also refuses a .dec below the
+  // role's own register need and then drops EVERY setmaxnreg in the kernel
+  // (C7507 "'setmaxnreg' ignored to maintain minimum register requirements"):
+  // the former 24-register IO budget triggered exactly that, so the converters
+  // ran at 48 and spilled.  IO fits in 40 (ptxas -v: no spill), so the GEMM
+  // groups and the IO group each release 8 x 128 = 1024 (3072 total) and the two
+  // converter groups take 8 x 256 = 2048:
+  // 3*128*40 + 2*128*56 = 29696 <= 30720.  Verify with ptxas -v: no C7507, and
+  // cuobjdump -sass shows two USETMAXREG (DEALLOC 0x28, TRY_ALLOC 0x38).
   static_assert(ctaWarpGroups == 5);
-  if (warpIdx.z == 2) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;\n" ::: "memory");
-  } else if (warpIdx.z >= 3) {
+  if (warpIdx.z <= 2) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+  } else {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 56;\n" ::: "memory");
   }
 #endif
