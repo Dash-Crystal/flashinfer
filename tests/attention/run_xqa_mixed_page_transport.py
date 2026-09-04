@@ -1,9 +1,14 @@
 """Plain runner for the XQA mixed-page conformance matrix (no test framework).
 
+<<<<<<< HEAD
 Runs the 32 register-expansion cases, the 2 native block-FP8 cases and the 18
 tail / value-range cases (short and odd sequence tails, 35-tile CTAs, E4M3
 subnormal payloads and maximal block scales) on sm90 / sm12x.  Exit code is the
 number of failing cases.
+=======
+Runs the 32 register-expansion cases, the 2 native block-FP8 cases and the
+2 independent-reference cases (mixed A16 stream vs stock decode) on sm90 / sm12x.  Exit code is the number of failing cases.
+>>>>>>> wt/A
 """
 
 import importlib.util
@@ -36,16 +41,34 @@ def _run(name, fn, *args):
 
 
 def main() -> int:
-    failures = 0
-    n = 0
+    # Optional `--shard i/n`: run only the cases whose index % n == i, so the
+    # per-module JIT compiles can be spread over several processes.
+    shard_idx, shard_n = 0, 1
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--shard":
+        shard_idx, shard_n = (int(x) for x in args[1].split("/"))
+    cases = []
     for mode in PAGE_MODES:
         for q_len, layout in SPANS:
-            n += 1
-            failures += _run(f"[{mode}-{layout}-{q_len}]",
-                             _mod.test_xqa_mixed_page_transport_matches_register_expansion,
-                             q_len, layout, mode)
+            cases.append((f"[{mode}-{layout}-{q_len}]",
+                          _mod.test_xqa_mixed_page_transport_matches_register_expansion,
+                          (q_len, layout, mode)))
     for q_len in (1, 64):
+        cases.append((f"[native_fp8-{q_len}]",
+                      _mod.test_xqa_native_block_fp8_matches_a16_expansion, (q_len,)))
+    # Independent reference for the mixed consumer (mha_sm90.cu at q=1 vs the
+    # stock mha.cu decode; tolerance-based, see the test docstring).
+    for pages_per_request in (18, 256):
+        cases.append((f"[a16_vs_stock-{pages_per_request}]",
+                      _mod.test_xqa_mixed_a16_stream_matches_stock_decode,
+                      (pages_per_request,)))
+    failures = 0
+    n = 0
+    for i, (name, fn, fn_args) in enumerate(cases):
+        if i % shard_n != shard_idx:
+            continue
         n += 1
+<<<<<<< HEAD
         failures += _run(f"[native_fp8-{q_len}]",
                          _mod.test_xqa_native_block_fp8_matches_a16_expansion, q_len)
     # Tails, 35-tile CTAs and extreme E4M3 value ranges (q=1, the sm90 GMMA host).
@@ -55,6 +78,9 @@ def main() -> int:
             failures += _run(f"[tail-{mode}-{seq_len}-sub{nb_sub_seq}-{regime}]",
                              _mod.test_xqa_mixed_page_transport_tails_and_value_ranges,
                              mode, seq_len, nb_sub_seq, regime)
+=======
+        failures += _run(name, fn, *fn_args)
+>>>>>>> wt/A
     print(f"{n - failures} passed, {failures} failed")
     return failures
 

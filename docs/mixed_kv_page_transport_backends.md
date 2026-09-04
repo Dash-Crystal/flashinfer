@@ -1103,3 +1103,182 @@ unrolled per-tile body (the 64 B parts run 4 copy/expand/MMA rounds per tile)
 or the `mha_sm90.cu` SPEC_DEC route whose smem arithmetic is in the step-3
 section (K3/V2 fits 2 CTAs/SM at 99 KB).  The a16 mode is 1.48x its 67.5 us
 byte floor with 680 CTAs x ~6 us of fixed cost = 15 us of the gap.
+### Phase 1 — sm90 consumer cheap set (track A, H200 nkcut2, 2026-09-04)
+
+Levers [4] [0] [2] [1] [33c] [35] of `docs/mixed_kv_speed_plan.md`, one commit
+each on branch `wt/A` (`csrc/xqa/mha_sm90.cu`, gemm0 / gemm1 warp-group
+bodies only; the barrier-init block and the IO / converter roles are
+untouched, [2] adds one `SharedMem` member).  Every step was verified in
+this order: SASS opcode counts of the two consumer regions
+(`benchmarks/microbench/sass_consumer_regions.py` on `cuobjdump -sass` of
+the fp4 `static_format_2` `mha_sm90` object, `cuobjdump -res-usage` REG:48
+STACK:0 at every step), the 34-case bit-exact matrix plus two new
+independent-reference cases (`tests/attention/run_xqa_mixed_page_transport.py`:
+all-A16 mixed stream on `mha_sm90.cu` vs the stock `mha.cu` decode, tolerance
+one bf16 ulp), the `MIXED_KV_TRACE=1` consumer slots (CTA 0, tiles 2-7
+medians over 26 launches, two rounds, fp4 and transport_a16 production and
+fp4 with `-DMIXED_KV_EXPERIMENT=1` converters skipped), and only then the
+stopwatch (`bench_xqa_mixed_page_transport.py --repeats 5 --trials 5` under
+the GPU lock, base and steps interleaved in one session; VLLM co-tenant at
+100 % SM throughout, nvidia-smi SM clock 1980 MHz, cycles below are clock64
+deltas).
+
+**SASS, consumer regions (fp4 static build; kernel totals in parentheses).**
+
+| step | gemm0: BAR.SYNC / PHASECHK / ARRIVE / ATOMS / DEPBAR | gemm1: BAR.SYNC / PHASECHK / ARRIVE / DEPBAR | kernel instr |
+|---|---|---|---|
+| base | 0 / 6 / 15 / 4 / 1 | 0 / 12 / 16 / 4 | 3336 (BAR.SYNC 5, PHASECHK 91, ARRIVE 48, ATOMS 4, DEPBAR 5) |
+| [4] | 2 / 4 / 13 / 4 / 1 | 2 / 9 / 14 / 4 | 3344 (9, 80, 44, 4, 5) |
+| [0] | 2 / 4 / 13 / 4 / 1 | 2 / 9 / 14 / **1** | 3336 (9, 80, 44, 4, **2**) |
+| [2] | **1** / 3 / 12 / **0** / 1 | 2 / 9 / 13 / 1 | 3352 (8, 77, 43, **0**, 2) |
+| [1] | 1 / 3 / 12 / 0 / 1 | **1** / 7 / 11 / 1 | 3312 (7, 71, 41, 0, 2) |
+| [33c] | 1 / 3 / 12 / 0 / 1 (arrive moved ahead of the K wait, PHASECHK before the STSM) | 1 / 7 / 11 / 1 | 3320 |
+| [35] | identical to [33c] (byte-identical SASS; source −232 lines) | | 3320 |
+
+HGMMA stays 8 + 8 at every step; no register-A (`R`-form) HGMMA anywhere.
+PHASECHK counts include the out-of-line retry loops (two sites per wait).
+
+**Trace, fp4 with converters skipped (`-DMIXED_KV_EXPERIMENT=1`, the consumer
+floor; cycles, two rounds).**  Segments: s1-s0 K ready -> 8 QK HGMMA done;
+s2-s1 colMax exchange + softmax; s3-s2 X store + colMax/colSum STS + release
+fence + xBar.produced arrive; s5-s4 gemm1 wait for X; s6-s5 rescale; s7-s6
+8 PV HGMMA; T_g0 = s3-s0; gemm1 work = s7-s5; cadence = s0(t+1)-s0(t).
+
+| step | s1-s0 | s2-s1 | s3-s2 | s5-s4 | s6-s5 | s7-s6 | T_g0 | gemm1 work | cadence | K-wait |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 669/668 | 686/678 | 484/480 | 696/690 | 456/448 | 638/646 | 1860/1853 | 1094/1092 | 2048/2045 | 190/192 |
+| [4] | 682/682 | 481/479 | 526/527 | 706/710 | 262/254 | 691/698 | 1715/1705 | 956/956 | 1904/1890 | 186/188 |
+| [4][0] | 678/678 | 482/480 | 530/525 | 710/724 | 260/260 | 694/694 | 1708/1722 | 955/958 | 1906/1912 | 186/187 |
+| +[2] | 682/675 | 448/450 | 535/538 | 688/690 | 271/273 | 712/716 | 1691/1688 | 982/993 | 1900/1895 | 196/198 |
+| +[1] | 699/698 | 452/452 | 503/508 | 780/766 | 206/213 | 664/662 | 1672/1670 | 874/872 | 1879/1864 | 189/192 |
+| +[33c] (reverted) | 694/690 | 458/468 | 500/500 | 808/784 | 209/208 | 660/656 | 1680/1672 | 881/876 | 1892/1898 | 202/198 |
+| base, final session | 670/674 | 682/686 | 468/466 | 706/720 | 446/451 | 638/636 | 1848/1836 | 1082/1082 | 2039/2030 | 190/192 |
+| **final tree**, final session | 700/699 | 454/459 | 501/509 | 780/787 | 208/210 | 658/661 | 1676/1683 | 869/868 | **1884/1888** | 190/192 |
+
+13-tile window (`-DMIXED_KV_TRACE_TILES=13`, CTA 0 tiles 1-12): the cadence
+is uniform across the sub-sequence (base 1960-2085 per tile, final 1814-1926;
+tile 4->5 carries the residency probe's global atomic), mean 2055-2058 ->
+1897-1898 cyc (-7.7 %); CTA 0's main loop (s0(t0) -> s7(t12)) 28.4k -> 26.4k
+cyc.
+
+**Trace, fp4 production (cycles).**  Cadence is converter-paced (P0.3): the
+consumer's savings turn into K-wait.
+
+| step | s2-s1 | s3-s2 | s6-s5 | s7-s6 | T_g0 | gemm1 work | cadence | K-wait |
+|---|---|---|---|---|---|---|---|---|
+| base | 872/859 | 600/590 | 572/574 | 748/749 | 2359/2359 | 1326/1331 | 2700/2708 | 269/336 |
+| [4] | 601/604 | 589/609 | 326/326 | 872/874 | 2106/2116 | 1201/1208 | 2636/2663 | 571/522 |
+| [4][0] | 620/598 | 594/598 | 314/324 | 884/880 | 2114/2091 | 1198/1214 | 2632/2644 | 550/549 |
+| +[2] | 462/470 | 486/478 | 324/335 | 840/828 | 1826/1809 | 1168/1156 | 2648/2646 | 812/860 |
+| +[1] | 446/444 | 484/475 | 291/280 | 724/714 | 1804/1757 | 1012/996 | 2659/2683 | 872/873 |
+| +[33c] (reverted) | 443/456 | 548/552 | 304/290 | 724/726 | 1898/1916 | 1031/1020 | 2679/2668 | 775/784 |
+| base, final session | 870/884 | 590/596 | 568/570 | 749/742 | 2341/2372 | 1314/1318 | 2678/2704 | 269/285 |
+| **final tree**, final session | 444/449 | 478/480 | 286/276 | 714/719 | 1792/1794 | 993/1005 | 2655/2714 | 895/928 |
+
+transport_a16 (DRAM-bound, K-wait 400-1000): s2-s1 502/510 -> 291/296, s6-s5
+408/411 -> 189/192, T_g0 1666/1672 -> 1454/1470 at [1]; cadence unchanged
+(2500-2900, set by TMA landing).  Final session (K-wait 2200-2700): s2-s1
+464/468 -> 274/277, s6-s5 411/407 -> 182/180, T_g0 1540/1568 -> 1356/1362,
+cadence 4140-4600 either way.
+
+**Walls (median_us, `--repeats 5 --trials 5`, CUDA graph, GPU lock, two
+interleaved rounds; q=1 unless noted).**
+
+| step | fp4 floor (EXPERIMENT=1) | transport_a16 | fp8 | fp4 | mixed |
+|---|---|---|---|---|---|
+| base | 57.00/57.02 | 82.59/82.87 | 91.47/91.23 | 96.35/96.04 | 115.32/114.34 |
+| [4] | 56.75/56.81 | 82.79/82.50 | 90.80/90.84 | 95.21/95.10 | 114.93/113.38 |
+| [4][0] | 57.01/56.99 | 82.46/82.25 | 91.16/91.05 | 95.06/95.12 | 114.00/114.35 |
+| +[2] | 54.90/54.93 | 82.06/82.33 | 89.15/89.25 | 93.96/94.44 | 111.19/111.01 |
+| +[1] | 55.07/54.94 | 81.70/82.00 | 88.75/88.88 | 92.78/92.72 | 109.56/109.96 |
+| +[33c] (reverted) | 56.45/56.27 | 82.07/82.11 | 89.06/89.16 | 93.84/93.86 | 110.10/109.95 |
+| +[35] (= [33c] code, SASS-identical) | 56.58/56.58 | 82.33/82.30 | 88.74/88.70 | 93.25/93.38 | 110.20/109.16 |
+| base, re-timed in the final session | 57.22/57.50 | 83.03/82.69 | 91.76/91.03 | 96.40/95.87 | 115.73/114.05 |
+| **final tree** ([4][0][2][1][35]; [33c] reverted) | **55.04/55.11** | **82.25/82.02** | **88.78/88.72** | **92.72/92.65** | **109.74/109.41** |
+
+q=4 (SPEC_DEC, `mha.cu`, not touched by this track; a16 / fp8 / fp4 / mixed):
+base 137.1 / 230.6-228.0 / 277.1-274.6 / 934.3-934.6 vs final 136.6-136.5 /
+228.5-226.0 / 276.0-275.0 / 933.8-935.1 (step session); final session base
+136.9/136.0 / 227.3/226.4 / 277.0/277.4 / 930.4/936.1 vs final tree 135.5/134.7 /
+225.8/227.6 / 277.5/275.1 / 935.4/937.5.  The mixed q=4 figure at `--repeats 5`
+is the repeats x time > 1.5 ms co-tenant artifact (kernel ~440 us, P0.1).
+
+**Final tree, verified as a whole (separate session, base re-timed alongside).**
+`cuobjdump -sass` of the final fp4 static `xqa_mha_sm90.cuda.o`: 3312
+instructions, REG:48 STACK:0, instruction stream byte-identical to the [1]-step
+object (`cmp` of the opcode/operand text: 0 differing lines; the [35] deletion
+and the [33c] revert leave the code of step [1]); consumer regions gemm0
+BAR.SYNC 1 / PHASECHK 3 / ARRIVE 12 / ATOMS 0 / DEPBAR 1, gemm1 1 / 7 / 11 / 1,
+HGMMA 8 + 8, no register-A HGMMA.  Correctness 36/36 (34 bit-exact + the two
+independent-reference cases at max |diff| 1.953e-3 / 4.883e-4, the calibration
+values of the unmodified kernel).  One semantic note on [2]: the replaced float
+`atomicMax` (`utils.cuh:305`, signed-int max / unsigned min on the bit pattern)
+and `fmax` agree on every finite value and on -0/+0 (the downstream
+`exp2(x - max)` is identical either way); they differ only when a QK score is
+NaN (the bit-pattern max propagates it as the column max, `fmax` drops it),
+which no valid input produces and the matrix does not exercise.
+
+**Per-lever verdicts.**
+
+- [4] named barriers: accepted.  Both two-RT segments lose ~200 cyc (s2-s1
+  686 -> 480, s6-s5 452 -> 258), i.e. ~100 cyc per mbarrier round trip
+  replaced (between the isolated 65 and the loaded 120-200 of P0.3 (d));
+  consumer floor cadence -7 %.  The plan's "s2-s1 <= 300 + shuffles" was
+  optimistic: the segment also holds the qkScale multiply, the mask test, the
+  three shuffle rounds x 2 values and the 4 exp2 of softmax.
+- [0] single commit / wait for PV: negative on its criterion (s7-s6 <= 250):
+  691/698 -> 694/694 with DEPBAR 4 -> 1 in SASS, i.e. the PV segment is not
+  drain-bound; eight back-to-back m64n8k16 SS HGMMAs cost the same ~690 cyc
+  as four commit/wait pairs (microbenchmark floor 185).  Kept: bit-exact,
+  fewer instructions, no protocol change; the ~85 cyc per HGMMA (also seen in
+  gemm0's 8 QK HGMMAs, 670-700 cyc) is the issue-side item P0.3 flagged
+  (descriptor arithmetic / tensor-pipe sharing between the four resident
+  warp groups), not the wait.
+- [2] one barrier per tile: accepted on SASS (ATOMS 4 -> 0, gemm0 sync sites
+  2 -> 1 per tile), s2-s1 480 -> 449 (-30: the bar.sync and the two
+  ATOMS.MAX/MIN pairs it replaced, minus three extra LDS); the criterion
+  "s2-s1 <= 250" is not met for the reason above.  The wall moved here:
+  floor 56.8-57.0 -> 54.9 us, production fp4 95.1 -> 94.0-94.4, mixed
+  114.0-114.9 -> 111.0-111.2.
+- [1] register-resident colMax/colSum: accepted on SASS (gemm1 sync sites
+  per tile 2 -> 0, one bar.sync left before finalize; REG 48 STACK 0),
+  s6-s5 271 -> 206-213, gemm1 work 982-993 -> 872-874; the criterion
+  "s6-s5 <= 100" is not met - the remaining ~210 cyc is the dependent LDS ->
+  compare -> ballot -> exp -> shuffle -> FMUL chain plus 4 LDS + adds and the
+  stamp itself.  Production: fp4 92.7-92.8, fp8 88.8-88.9, mixed 109.6-110.0,
+  a16 81.7-82.0.
+- [33c] split xBar.consumed arrive/wait: rejected and reverted (see the
+  revert commit): s3-s2 unchanged in the floor (503-508 -> 500), +70 in
+  production, floor wall +1.4 us, production fp4 +1.1 us.  The consumed
+  phase is complete long before the store (P0.3), so nothing was hidden.
+- [35] RS loaders deleted: SASS byte-identical (diff 0 lines), source -232
+  lines; closes [18] (below).
+
+**Where Phase 1 leaves the sm90 consumer.**  Floor cadence 2046 -> 1870 cyc
+(-8.5 %, tiles 2-7) with T_g0 1856 -> 1671 and gemm1 work 1093 -> 873; the
+floor wall moved 57.0 -> 55.0 us (-3.5 %), less than 39 x 0.09 us because the
+wall carries ~18 us of per-wave fill/drain/tail (P0.3 (b), P0.5) that the
+per-tile chain does not touch - that is [8]'s territory.  Production moved
+more than the plan's "0 +-2 us": fp4 96.0-96.4 -> 92.7-92.8 (-3.4 us), fp8
+91.2-91.5 -> 88.8-88.9 (-2.6), mixed 114.3-115.3 -> 109.6-110.0 (-4.9), a16
+82.6-82.9 -> 81.7-82.0 (-0.8), at an unchanged converter-paced cadence
+(2700 -> 2660-2680): the consumer now idles ~870 cyc per tile in K-wait
+instead of spinning on mbarriers and shared-memory atomics, which frees issue
+slots for the co-resident converter groups (P0.3's fast/slow pair asymmetry
+is the likely beneficiary).  The consumer chain that remains (T_g0 ~1670:
+QK HGMMA 690, colMax+softmax 450, X store + release + arrive 505; K-wait
+190) is issue/latency-bound with one bar.sync and one mbarrier arrive/wait
+per tile per group; the next consumer items are the HGMMA issue cost (P0.3's
+candidate lever) and the X-store release path, both outside this cheap set.
+
+**RS-decode in the GEMM groups: negative result (plan [35], closes [18]).**
+The register-A wgmma route (`loadMixedKTileFragment` / `loadMixedVTileFragment`,
+per-format A16 / E4M3 / E2M1 fragment decoders that were never instantiated)
+is deleted.  Arithmetic: decoding one m64n8k16 A fragment per k-step costs
+35-50 SASS per lane (nibble/byte extraction, `cvt`, block-scale multiply,
+shuffles for the FP8 pair layout) against a 10-20 cycle wgmma; at 4 cyc/instr
+that is +1.2-1.4 us per group per tile, 2-3x more at the 10.8-13.3 cyc/instr
+the converters actually achieve (P0.4), on the gemm0 chain that P0.3 shows is
+the binding consumer role.  The converter warp groups keep the expansion
+(`expandPackedStage`); the SASS of the sm90 TU is byte-identical before and
+after the deletion, confirming the loaders were dead code.

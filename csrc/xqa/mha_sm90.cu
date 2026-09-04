@@ -106,6 +106,9 @@ constexpr uint32_t nbIOThrds = warp_size * nbIOWarps;
 #ifndef MIXED_KV_TRACE
 #define MIXED_KV_TRACE 0
 #endif
+#ifndef MIXED_KV_TRACE_TILES
+#define MIXED_KV_TRACE_TILES 8
+#endif
 // Stage depths in whole 64-token tiles; two of each keeps two CTAs per SM.
 #ifndef MIXED_KV_KDEPTH
 #define MIXED_KV_KDEPTH 3
@@ -152,6 +155,16 @@ constexpr uint32_t ctaWarpGroups = ENABLE_MIXED_KV_CACHE ? 5 : 3;
 constexpr uint32_t multiBlockMinNbTilesPerCta = 1;  // 3; // @fixme: need tuning
 constexpr uint32_t multiBlockMinNbTiles = multiBlockMinNbTilesPerCta * 2;
 constexpr uint32_t nbWarps = gemm0NbWarps + gemm1NbWarps + nbIOWarps + nbConvertWarps;
+
+// Hardware named barriers for the intra-warp-group syncs of the two GEMM warp
+// groups.  bar.sync id,128 replaces the mbarrier arrive + try_wait round trip
+// of the per-tile colMax / rescale exchanges; ids 1/2 are unused (the converter
+// groups sync with __syncwarp) and 0 is __syncthreads.  bar.sync orders shared
+// memory like membar.cta, so the exchanges it protects need no extra fence.
+constexpr uint32_t gemm0NamedBarId = 3;
+constexpr uint32_t gemm1NamedBarId = 4;
+__device__ inline void gemm0WarpGrpSync() { namedBarSync(gemm0NamedBarId, gemm0NbThrds); }
+__device__ inline void gemm1WarpGrpSync() { namedBarSync(gemm1NamedBarId, gemm1NbThrds); }
 
 constexpr uint32_t cacheHeadPartBytes = mha::min(paddedCacheHeadBytes, 128U);
 constexpr uint32_t cacheHeadNbParts =
@@ -285,11 +298,22 @@ struct alignas(128) SharedMem {
   ShmQWiseVec xRowSum[nbXBuf];
 #endif
 
-  ShmQWiseVec gemm0CurrentSeqMax;
-  // col sum and max for the current gemm1 acc. Use shared memory to save some registers. register
-  // storage will be 8x duplicate for swapAB and 4x duplicate for non-swapAB.
+  ShmQWiseVec gemm0CurrentSeqMax;  // !SWAP_AB running row max (SWAP_AB keeps it in registers)
+  // col sum and max for the current gemm1 acc.  !SWAP_AB: updated in shared
+  // memory every tile.  SWAP_AB: the running values live in registers (one
+  // float per lane, identical in all gemm1 warps) and are written here once,
+  // before finalize / the multi-block save.
   ShmQWiseVec gemm1AccColMax;
   ShmQWiseVec gemm1AccColSum;
+#if SWAP_AB
+  // gemm0 colMax exchange: each warp publishes its tile-local column max into
+  // its own slot of the tile's parity; after one bar.sync every warp reads the
+  // four slots and folds them into a register-resident running max.  Slot
+  // parity p is rewritten at tile t+2, after the sync of tile t+1 that every
+  // warp passes only once it has read slot p at tile t: no WAR hazard, so no
+  // second sync and no shared-memory atomics.
+  ShmQWiseVec gemm0WarpColMax[2][gemm0NbWarps];
+#endif
 
   static constexpr uint32_t nbPagesPerTile =
       gemm0CtaTileNbTokens >= tokensPerPage ? exactDiv(gemm0CtaTileNbTokens, tokensPerPage) : 1;
@@ -335,7 +359,10 @@ struct alignas(128) SharedMem {
   alignas(16) TileScales kScales[nbScaleTiles];
   alignas(16) TileScales vScales[nbScaleTiles];
 #if MIXED_KV_TRACE
-  static constexpr uint32_t nbTraceTiles = 8;
+  // Number of leading tiles of CTA 0 whose per-role stamps are recorded
+  // (-DMIXED_KV_TRACE_TILES=n; 13 covers a whole sub-sequence at the bench's
+  // default split, +128 B of shared memory per extra tile).
+  static constexpr uint32_t nbTraceTiles = MIXED_KV_TRACE_TILES;
   long long trace[nbTraceTiles][16];
   // SM residency probe: this CTA's %smid and the number of CTAs of this kernel
   // resident on that SM when tile 4's slot 0 stamp is taken (includes self).
@@ -702,7 +729,9 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
 
 #if SWAP_AB
-__device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
+__device__ RegColWiseVec computeWarpGrpColMax_sync(uint32_t warpRank,
+                                                   ShmQWiseVec (&warpColMaxSlots)[gemm0NbWarps],
+                                                   RegColWiseVec& runningColMax,
                                                    Gemm0Acc const& src);
 __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t validRowBeg,
                                  uint32_t validRowEnd);
@@ -728,238 +757,13 @@ __device__ void storeShmRowWiseVec(uint32_t warpRank, ShmQWiseVec& smemVec,
 using RegMatAFrag = Array2D<Array2D<uint32_t, 2, 1>, 1, 2>;
 constexpr uint32_t gemm1NbGmmaInstK = exactDiv(gemm1CtaTileNbTokens, gmma::instK<MathElem>);
 
-#if ENABLE_MIXED_KV_CACHE
-template <flashinfer::KVPageFormat format>
-__device__ inline RegMatAFrag loadMixedKTileFragment(
-    SharedMem::KBuffer const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart, uint8_t const* scales,
-    float fp8GlobalScale, float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-  static_assert(tokensPerPage == 16);
-  static_assert(format == KVPageFormat::kA16 ||
-                format == KVPageFormat::kBlockScaledFP8 ||
-                format == KVPageFormat::kBlockScaledFP4);
-  constexpr uint32_t blocksPerPart = exactDiv(cacheHeadPartBytes, 2 * grainBytes);
-  constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
-  uint32_t const laneInQuad = laneId() & 3U;
-  uint32_t const tokenInHalf = laneId() >> 2;
-  uint32_t const elemInBlock = laneInQuad * 2;
-  uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
-  uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
-  uint32_t const scaleOffset = scaleBlock - scaleGroup;
-  uint32_t const pageToken = pageInTile * tokensPerPage;
-
-  RegMatAFrag fragment;
-  if constexpr (format == KVPageFormat::kA16) {
-    uint32_t const matrix = laneId() / 8;
-    uint32_t const sourceK = matrix % 2;
-    uint32_t const sourceM = matrix / 2;
-    auto const* source = &tile.template at<true>(
-        pageToken + 8 * sourceM + laneId() % 8,
-        blockInPart * 2 + sourceK);
-    auto const data = ldmatrix<false, 4>(source);
-    return reinterpret_cast<RegMatAFrag const&>(data);
-  }
-  if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-    auto const packed = ldmatrix<false, 2>(&tile.template at<true>(
-        pageToken + laneId() % tokensPerPage, blockInPart));
-#pragma unroll
-    for (uint32_t n = 0; n < 2; ++n) {
-      uint32_t const token = n * 8 + tokenInHalf;
-      uint8_t const scaleBits =
-          scales[(pageToken + token) * scaleLoadBytes + scaleOffset];
-      uint32_t const quadBase = laneId() & ~3U;
-      uint32_t const pairLane = laneInQuad >> 1;
-      uint32_t const halfShift = (laneInQuad & 1U) * 16U;
-      uint32_t const lowWord =
-          __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane);
-      uint32_t const highWord =
-          __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane + 2);
-      uint16_t const low = static_cast<uint16_t>(lowWord >> halfShift);
-      uint16_t const high = static_cast<uint16_t>(highWord >> halfShift);
-      fragment(0, n)(0, 0) = scaleA16x2<InputElem>(
-          convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
-      fragment(0, n)(1, 0) = scaleA16x2<InputElem>(
-          convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
-    }
-    return fragment;
-  }
-#pragma unroll
-  for (uint32_t n = 0; n < 2; ++n) {
-    uint32_t const token = n * 8 + tokenInHalf;
-    auto const* packed = reinterpret_cast<uint8_t const*>(
-        &tile.template at<true>(pageToken + token, blockInPart));
-    uint8_t const scaleBits =
-        scales[(pageToken + token) * scaleLoadBytes + scaleOffset];
-    uint8_t const low = packed[elemInBlock / 2];
-    uint8_t const high = packed[4 + elemInBlock / 2];
-    fragment(0, n)(0, 0) = scaleA16x2<InputElem>(
-        convertE2M1x2ToA16<InputElem>(low), scaleBits, fp4GlobalScale);
-    fragment(0, n)(1, 0) = scaleA16x2<InputElem>(
-        convertE2M1x2ToA16<InputElem>(high), scaleBits, fp4GlobalScale);
-  }
-  return fragment;
-}
-
-__device__ inline RegMatAFrag loadMixedKTileFragment(
-    SharedMem::KBuffer const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart,
-    MixedPageFormats<SharedMem::nbPagesPerTile> const& formats,
-    uint8_t const* scales, float fp8GlobalScale, float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-#if MIXED_PAGE_STATIC_FORMAT == 0
-  unused(formats);
-  return loadMixedKTileFragment<KVPageFormat::kA16>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 1
-  unused(formats);
-  return loadMixedKTileFragment<KVPageFormat::kBlockScaledFP8>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 2
-  unused(formats);
-  return loadMixedKTileFragment<KVPageFormat::kBlockScaledFP4>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#else
-  uint8_t const format = formats.values[pageInTile];
-  if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-    return loadMixedKTileFragment<KVPageFormat::kA16>(
-        tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-        fp4GlobalScale);
-  }
-  if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
-    return loadMixedKTileFragment<KVPageFormat::kBlockScaledFP8>(
-        tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-        fp4GlobalScale);
-  }
-  assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
-  return loadMixedKTileFragment<KVPageFormat::kBlockScaledFP4>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#endif
-}
-
-template <flashinfer::KVPageFormat format>
-__device__ inline RegMatAFrag loadMixedVTileFragment(
-    SharedMem::VBuffer::Elem const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart, uint8_t const* scales,
-    float fp8GlobalScale, float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-  static_assert(tokensPerPage == 16);
-  static_assert(format == KVPageFormat::kA16 ||
-                format == KVPageFormat::kBlockScaledFP8 ||
-                format == KVPageFormat::kBlockScaledFP4);
-  constexpr uint32_t blocksPerPart =
-      exactDiv(SharedMem::VBuffer::Elem::rowBytes, 2 * grainBytes);
-  constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
-  uint32_t const laneInQuad = laneId() & 3U;
-  uint32_t const headInHalf = laneId() >> 2;
-  uint32_t const token0 = laneInQuad * 2;
-  uint32_t const token1 = token0 + 1;
-  uint32_t const token8 = token0 + 8;
-  uint32_t const token9 = token1 + 8;
-  uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
-  uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
-  uint32_t const scaleOffset = scaleBlock - scaleGroup;
-  uint32_t const pageToken = pageInTile * tokensPerPage;
-
-  auto const loadPair = [&](uint32_t head, uint32_t firstToken,
-                            uint32_t secondToken) -> uint32_t {
-    if constexpr (format == KVPageFormat::kA16) {
-      uint32_t const grain = head / (grainBytes / sizeof(InputElem));
-      uint32_t const byte =
-          (head % (grainBytes / sizeof(InputElem))) * sizeof(InputElem);
-      auto const* first = reinterpret_cast<uint8_t const*>(
-                              &tile.template at<true>(pageToken + firstToken, grain)) +
-                          byte;
-      auto const* second = reinterpret_cast<uint8_t const*>(
-                               &tile.template at<true>(pageToken + secondToken, grain)) +
-                           byte;
-      uint16_t const low = *reinterpret_cast<uint16_t const*>(first);
-      uint16_t const high = *reinterpret_cast<uint16_t const*>(second);
-      return uint32_t(low) | (uint32_t(high) << 16);
-    }
-
-    uint32_t const grain = head / 16;
-    uint32_t const elem = head % 16;
-    auto const* first = reinterpret_cast<uint8_t const*>(
-        &tile.template at<true>(pageToken + firstToken, grain));
-    auto const* second = reinterpret_cast<uint8_t const*>(
-        &tile.template at<true>(pageToken + secondToken, grain));
-    uint32_t packedA16;
-    if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-      uint16_t const fp8x2 =
-          uint16_t(first[elem]) | (uint16_t(second[elem]) << 8);
-      packedA16 = convertE4M3x2ToA16<InputElem>(fp8x2);
-    } else {
-      uint8_t const shift = static_cast<uint8_t>((elem & 1U) * 4U);
-      uint8_t const fp4x2 = static_cast<uint8_t>(
-          ((first[elem / 2] >> shift) & 0xfU) |
-          (((second[elem / 2] >> shift) & 0xfU) << 4));
-      packedA16 = convertE2M1x2ToA16<InputElem>(fp4x2);
-    }
-    uint8_t const scale0 =
-        scales[(pageToken + firstToken) * scaleLoadBytes + scaleOffset];
-    uint8_t const scale1 =
-        scales[(pageToken + secondToken) * scaleLoadBytes + scaleOffset];
-    float const globalScale = format == KVPageFormat::kBlockScaledFP8
-                                  ? fp8GlobalScale
-                                  : fp4GlobalScale;
-    return scaleA16x2Pair<InputElem>(packedA16, scale0, scale1, globalScale);
-  };
-
-  RegMatAFrag fragment;
-#pragma unroll
-  for (uint32_t n = 0; n < 2; ++n) {
-    uint32_t const head = blockInPart * 16 + n * 8 + headInHalf;
-    fragment(0, n)(0, 0) = loadPair(head, token0, token1);
-    fragment(0, n)(1, 0) = loadPair(head, token8, token9);
-  }
-  return fragment;
-}
-
-__device__ inline RegMatAFrag loadMixedVTileFragment(
-    SharedMem::VBuffer::Elem const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart,
-    MixedPageFormats<SharedMem::nbPagesPerTile> const& formats,
-    uint8_t const* scales, float fp8GlobalScale, float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-#if MIXED_PAGE_STATIC_FORMAT == 0
-  unused(formats);
-  return loadMixedVTileFragment<KVPageFormat::kA16>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 1
-  unused(formats);
-  return loadMixedVTileFragment<KVPageFormat::kBlockScaledFP8>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 2
-  unused(formats);
-  return loadMixedVTileFragment<KVPageFormat::kBlockScaledFP4>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#else
-  uint8_t const format = formats.values[pageInTile];
-  if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-    return loadMixedVTileFragment<KVPageFormat::kA16>(
-        tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-        fp4GlobalScale);
-  }
-  if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
-    return loadMixedVTileFragment<KVPageFormat::kBlockScaledFP8>(
-        tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-        fp4GlobalScale);
-  }
-  assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
-  return loadMixedVTileFragment<KVPageFormat::kBlockScaledFP4>(
-      tile, pageInTile, blockInPart, idxPart, scales, fp8GlobalScale,
-      fp4GlobalScale);
-#endif
-}
-#endif
+// Register-A (RS) wgmma operand loaders for mixed pages were removed (plan
+// lever [35], closing [18]): decoding E4M3/E2M1 K/V fragments into registers
+// per k-step costs 35-50 SASS per step against a 10-20 cycle m64n8k16 wgmma,
+// i.e. +1.2-1.4 us per group per tile at 4 cyc/instr and 2-3x that at the
+// measured 10.8-13.3, on the binding gemm0 chain.  Expansion stays in the
+// converter warp groups (expandPackedStage); see
+// docs/mixed_kv_page_transport_backends.md, "RS-decode in the GEMM groups".
 
 #if SWAP_AB
 constexpr uint32_t gemm1NbGmmaInstM = exactDiv(headElems, gmma::instM);
@@ -967,11 +771,25 @@ __device__ Vec<RegMatAFrag, gemm1NbGmmaInstM> loadVTileTransposed(uint32_t warpR
                                                                   SharedMem::VBuffer const& smemV,
                                                                   uint32_t idxGmmaInstK);
 using Gemm1Acc = GmmaAcc<headElems, ctaNbQHeads>;
-__device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec const& shmXColMax,
-                                                 ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
-                                                 ShmQWiseVec& shmAccColMax, Gemm1Acc& acc,
-                                                 ShmQWiseVec& shmAccColSum,
-                                                 CtaBarrier& gemm1WarpGrpBar);
+// One column-wise float per lane without duplication: lane l <-> column l,
+// lanes >= ctaNbQHeads hold 0 (the layout of loadShmColWiseVecNoDup).
+using RegColWiseVecNoDup = Vec<float, divUp(ShmQWiseVec::size, warp_size)>;
+__device__ RegColWiseVecNoDup loadShmColWiseVecNoDup(ShmQWiseVec const& shmVec);
+__device__ void storeShmColWiseVecNoDup(ShmQWiseVec& shmVec, RegColWiseVecNoDup const& src);
+__device__ inline RegColWiseVecNoDup initRegColWiseVecNoDup(float v) {
+  RegColWiseVecNoDup ret;
+#pragma unroll
+  for (uint32_t i = 0; i < ret.size; i++) {
+    uint32_t const idx = i * warp_size + laneId();
+    bool const inBound = ((ShmQWiseVec::size % warp_size == 0) || (idx < ShmQWiseVec::size));
+    ret[i] = inBound ? v : 0.f;
+  }
+  return ret;
+}
+__device__ void rescaleGemm1AccForNewColMax(ShmQWiseVec const& shmXColMax,
+                                            ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
+                                            RegColWiseVecNoDup& accColMax, Gemm1Acc& acc,
+                                            RegColWiseVecNoDup& accColSum);
 template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(
     uint32_t threadRank, uint32_t warpRank, DstHead* dst, SharedMem::OutSwizzleBuf& swizzleBuf,
@@ -1405,11 +1223,17 @@ __launch_bounds__(128 * ctaWarpGroups)
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     uint32_t const warpRank = warpIdx.x;
 
+#if SWAP_AB
+    // Running column max across the tiles of this CTA; every warp holds an
+    // identical copy (all fold the same four per-warp slots in the same order).
+    auto runningColMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
+#else
     // init once per sequence. It also works as global colMax across iterations.
     if (threadIdx.x < ctaNbQHeads) {
       smem.gemm0CurrentSeqMax[threadIdx.x] = safeInitRowMax;
     }
     smem.gemm0WarpGrpBar.arrive_and_wait();
+#endif
 
     smem.qBar.produced.arrive_and_wait();
 #if DBG_PRINT
@@ -1524,8 +1348,8 @@ __launch_bounds__(128 * ctaWarpGroups)
 #endif
       // update colMax in shared mem and get a register copy
 #if SWAP_AB
-      RegColWiseVec const colMax =
-          computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
+      RegColWiseVec const colMax = computeWarpGrpColMax_sync(
+          warpRank, smem.gemm0WarpColMax[idxIter % 2], runningColMax, acc);
       warpGrpOnlineSoftmax(acc, colMax);
       TRACE_STAMP(2, idxIter, warpRank == 0);
 #else
@@ -1593,12 +1417,22 @@ __launch_bounds__(128 * ctaWarpGroups)
       unused(b.consumed.arrive());
     }
 
+#if SWAP_AB
+    // Running column max / sum of the accumulator, register-resident (lever
+    // [1]): every warp holds the same copy and updates it from the same
+    // xColMax / xColSum values in the same order, so the per-tile exchange
+    // through smem.gemm1AccColMax/Sum and its two group syncs are gone; the
+    // smem copies are written once before finalize.
+    auto accColMax = initRegColWiseVecNoDup(safeInitRowMax);
+    auto accColSum = initRegColWiseVecNoDup(0.f);
+#else
     if (threadIdx.x < smem.gemm1AccColMax.size) {
       auto const idx = threadIdx.x;
       smem.gemm1AccColMax[idx] = safeInitRowMax;
       smem.gemm1AccColSum[idx] = 0;
     }
     smem.gemm1WarpGrpBar.arrive_and_wait();
+#endif
 
     uint32_t const warpRank = warpIdx.x;
 
@@ -1690,9 +1524,8 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if SWAP_AB
       // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc
       // instead.
-      rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
-                                       smem.gemm1AccColMax, acc, smem.gemm1AccColSum,
-                                       smem.gemm1WarpGrpBar);
+      rescaleGemm1AccForNewColMax(smem.xColMax[idxXBuf], smem.xColSum[idxXBuf], accColMax, acc,
+                                  accColSum);
       TRACE_STAMP(6, idxIter, warpRank == 0);
 #else
       rescaleGemm1AccForNewRowMax_sync(warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf],
@@ -1713,6 +1546,11 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if SWAP_AB
 //@fixme: to reduce code size, we can disable unroll and use double-buffer for LDSM in
 // loadVTileTransposed.
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
+      // The rescale above wrote the accumulator registers with non-wgmma
+      // instructions: fence them once before this tile's first PV wgmma.
+      gmma::fence();
+#endif
 #pragma unroll
       for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++) {
 #if CACHE_ELEM_ENUM == 2
@@ -1785,12 +1623,20 @@ __launch_bounds__(128 * ctaWarpGroups)
               reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
 #endif
         }
+#if CACHE_ELEM_ENUM == 2
+        // Register-A fragments must stay live until the wgmma completes: commit
+        // and drain per k-step.
         gmma::commit_group();
-        //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until
-        // finish of
-        // gmma.
         gmma::wait_group<0>();
+#endif
       }
+#if CACHE_ELEM_ENUM == 0 || CACHE_ELEM_ENUM == 5
+      // All gemm1NbGmmaInstK x gemm1NbGmmaInstM PV wgmmas read shared memory
+      // only, so they stay in flight together: one commit and one drain per
+      // tile instead of one per k-step.
+      gmma::commit_group();
+      gmma::wait_group<0>();
+#endif
 #else
       auto const descVTBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VTBuffer::rowBytes * 8,
                                                 gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
@@ -1824,8 +1670,19 @@ __launch_bounds__(128 * ctaWarpGroups)
       gmma::wait_group<0>();
 #endif
       if (idxIter == nbIters - 1) {
+#if SWAP_AB
+        // Publish the register-resident running max / sum once for the
+        // multi-block save and finalizeAndWriteOut_sync (every warp holds the
+        // same values: one warp stores, the group syncs).
+        if (warpRank == gmmaWarpsPerGrp - 1) {
+          storeShmColWiseVecNoDup(smem.gemm1AccColMax, accColMax);
+          storeShmColWiseVecNoDup(smem.gemm1AccColSum, accColSum);
+        }
+        gemm1WarpGrpSync();
+#else
         // gmma::wait_group should have already synchronized threads, so this may be unnecessary.
         smem.gemm1WarpGrpBar.arrive_and_wait();
+#endif
         if (isMultiBlockMode) {
           ScratchMem const scratchMem{scratch, maxNbSubSeq * nbKHeads * batchSize, nbInputSeqSplit};
           uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
@@ -3272,10 +3129,13 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 }
 #endif  // SPEC_DEC
 
-// smemColMax is persistent across multiple iterations
-__device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar,
-                                                          ShmQWiseVec& smemColMax,
-                                                          Gemm0Acc const& src) {
+// Tile-local column max reduced across the warp group and folded into the
+// register-resident running max (see SharedMem::gemm0WarpColMax).  Returns the
+// running max including this tile; bit-identical to the former shared-memory
+// atomicMax chain (fmax over the same set of values in any order).
+__device__ inline RegColWiseVec computeWarpGrpColMax_sync(
+    uint32_t warpRank, ShmQWiseVec (&warpColMaxSlots)[gemm0NbWarps],
+    RegColWiseVec& runningColMax, Gemm0Acc const& src) {
   auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
   for (uint32_t n = 0; n < src.cols; n++) {
@@ -3308,23 +3168,27 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar
     for (uint32_t n = 0; n < src.cols; n++) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; j++) {
-        atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+        warpColMaxSlots[warpRank][8 * n + 2 * lane + j] = colMax[n][j];
       }
     }
   }
-  warpGrpBar.arrive_and_wait();
+  gemm0WarpGrpSync();
   uint32_t const idxInQuad = lane % 4;
 
 #pragma unroll
   for (uint32_t n = 0; n < src.cols; n++) {
 #pragma unroll
     for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++) {
-      assert(colMax[n][j] <= smemColMax[8 * n + 2 * idxInQuad + j]);
-      colMax[n][j] = smemColMax[8 * n + 2 * idxInQuad + j];
+      float m = runningColMax[n][j];
+#pragma unroll
+      for (uint32_t w = 0; w < gemm0NbWarps; w++) {
+        m = fmax(m, warpColMaxSlots[w][8 * n + 2 * idxInQuad + j]);
+      }
+      assert(colMax[n][j] <= m);
+      runningColMax[n][j] = m;
     }
   }
-  warpGrpBar.arrive_and_wait();
-  return colMax;
+  return runningColMax;
 }
 
 __device__ inline RegColWiseVec loadShmColWiseVecWithDup(ShmQWiseVec const& smemVec) {
@@ -3809,9 +3673,8 @@ __device__ inline void transposeVTile(uint32_t warpRank, uint32_t lane, SharedMe
 #endif
 
 #if SWAP_AB
-__device__ inline Vec<float, divUp(ShmQWiseVec::size, warp_size)> loadShmColWiseVecNoDup(
-    ShmQWiseVec const& shmVec) {
-  Vec<float, divUp(ShmQWiseVec::size, warp_size)> ret;
+__device__ inline RegColWiseVecNoDup loadShmColWiseVecNoDup(ShmQWiseVec const& shmVec) {
+  RegColWiseVecNoDup ret;
 #pragma unroll
   for (uint32_t i = 0; i < divUp(ShmQWiseVec::size, warp_size); i++) {
     uint32_t const idx = i * warp_size + laneId();
@@ -3821,8 +3684,8 @@ __device__ inline Vec<float, divUp(ShmQWiseVec::size, warp_size)> loadShmColWise
   return ret;
 }
 
-__device__ inline void storeShmColWiseVecNoDup(
-    ShmQWiseVec& shmVec, Vec<float, divUp(ShmQWiseVec::size, warp_size)> const& src) {
+__device__ inline void storeShmColWiseVecNoDup(ShmQWiseVec& shmVec,
+                                               RegColWiseVecNoDup const& src) {
 #pragma unroll
   for (uint32_t i = 0; i < divUp(ShmQWiseVec::size, warp_size); i++) {
     uint32_t const idx = i * warp_size + laneId();
@@ -3875,15 +3738,15 @@ __device__ inline void storeShmRowWiseVecNoDup(
 #endif
 
 #if SWAP_AB
-__device__ inline void rescaleGemm1AccForNewColMax_sync(
-    uint32_t warpRank, ShmQWiseVec const& shmXColMax, ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
-    ShmQWiseVec& shmAccColMax, Gemm1Acc& acc, ShmQWiseVec& shmAccColSum,
-    CtaBarrier& gemm1WarpGrpBar) {
-  auto accColSum = loadShmColWiseVecNoDup(shmAccColSum);
-
+// Rescales acc for the running column max published by gemm0 in shmXColMax
+// (read under xBar.produced acquire) and updates the register-resident running
+// max / sum.  Every warp runs the identical update on the same inputs in the
+// same order, so no group sync is needed; per column the arithmetic is that of
+// the former shared-memory version (scale, then add the four warp sums).
+__device__ inline void rescaleGemm1AccForNewColMax(
+    ShmQWiseVec const& shmXColMax, ShmQWiseVec const (&shmXColSum)[gemm0NbWarps],
+    RegColWiseVecNoDup& accColMax, Gemm1Acc& acc, RegColWiseVecNoDup& accColSum) {
   auto const xColMax = loadShmColWiseVecNoDup(shmXColMax);
-  auto const accColMax = loadShmColWiseVecNoDup(shmAccColMax);
-  auto token = gemm1WarpGrpBar.arrive();
   auto const needRescaleVec = (accColMax < xColMax);
   UniformNeedRescaleMask rescaleMask;
   bool anyNeedRescale = false;
@@ -3926,22 +3789,13 @@ __device__ inline void rescaleGemm1AccForNewColMax_sync(
     }
     accColSum = accColSum * scaleVec;
   }
-  gemm1WarpGrpBar.wait(mha::move(token));
-
-  // @fixme: with atomic, we can let the first warp reaching here to do the update, instead of
-  // always warp 3.
-  uint32_t const warpRankForUpdate = gmmaWarpsPerGrp - 1;
-  if (warpRank == warpRankForUpdate) {
-    if (anyNeedRescale) {
-      storeShmColWiseVecNoDup(shmAccColMax, xColMax);
-    }
-#pragma unroll
-    for (uint32_t i = 0; i < gemm0NbWarps; i++) {
-      accColSum = accColSum + loadShmColWiseVecNoDup(shmXColSum[i]);
-    }
-    storeShmColWiseVecNoDup(shmAccColSum, accColSum);
+  if (anyNeedRescale) {
+    accColMax = xColMax;
   }
-  gemm1WarpGrpBar.arrive_and_wait();
+#pragma unroll
+  for (uint32_t i = 0; i < gemm0NbWarps; i++) {
+    accColSum = accColSum + loadShmColWiseVecNoDup(shmXColSum[i]);
+  }
 }
 #else
 __device__ inline void rescaleGemm1AccForNewRowMax_sync(uint32_t warpRank,
