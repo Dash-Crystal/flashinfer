@@ -1064,3 +1064,62 @@ immediates are `0x48 / 0xD8` from `PRODUCER_REGS / CONSUMER_REGS = 72 / 216`;
 fp8 / fp4 / dynamic `USETMAXREG 0x88 / 0xB8`, `ptxas -v` no C7507, `STACK 0`
 (fp8, fp4; the dynamic module's F24 32 B frame may persist until F25d).
 `BAR.SYNC` counts back to [23]'s: `kProducerWG` 128, `kQueryEmpty` 384.
+
+### As written: F25b (bodies: loads-first, one barrier per operand, hoisted vote, E2M1 placement)
+
+Files: `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh`,
+`tests/attention/run_fa3_mixed_page_transport.py`.  Not built or run here.
+
+**Data flow (static modules, `expand_operand<VOTE>`).**  In program order:
+(1) `pk[j] = load_packed<FP8>(e, static_page(j).off)` for the six pages (two
+`LDS.64` fp8 / two `LDS.32` fp4 each, this thread's own landings); (2)
+`__syncwarp()`; (3) `sw[j] = lds32(e.sc + j * SCALE_PAGE_BYTES)`, `v[j] =
+scale_product<FP8>(b, sw[j], t)` = `mul.rn.f32(f32(s_j), gs)`; (4) bf16 with
+`VOTE`: `ok = AND_j fold_ok(v[j])` (`|v| < kFp8FoldMax`, the one constant for
+both formats), `__all_sync` -> `expand_static_arm<FP8, false>` (hot: `sf2_j =
+a16x2(v[j])`) or `expand_static_arm<FP8, true>` (cold: `g = global_plain<FP8>`
+once, `sf2_j = a16x2(f32(s_j) * g)`, `expand_block<FP8, true>` multiplies the
+placed halves by `kTwoPow120Bf16x2` / `kTwoPow126Bf16x2` first); bf16 without
+`VOTE`: the cold arm only; f16: the hot arm with the plain scale, no vote.
+`expand_block<FP8, EXACT>(e, p, sf2, off)` is `static`, has no vote, no
+barrier and no branch: decode (4 x `e4m3x4_to_a16` or 2 x `e2m1x8_to_a16`),
+[`EXACT`: 8 `HMUL2` by 2^k], 8 `HMUL2` by `sf2`, 2 `STS.128 [d + imm]`.
+
+**E2M1 placement (bf16).**  `e2m1x8_to_a16<bf16>(src, out)`: `w4 = src << 4`;
+`out[k] = (prmt(w4, src, sel_k) << 2) & 0x81C081C0` with `sel_k` = `0xC480,
+0xD591, 0xE6A2, 0xF7B3` (selector nibbles low to high: `w4.byte_k`, sign-rep
+of `w4.byte_k`, `src.byte_k`, sign-rep of `src.byte_k`); the half `s | 000000
+ee | m 000000` is the E2M1 value x 2^-126 (code 001 -> the bf16 subnormal
+2^-127).  13 instructions per 8 nibbles.  The f16 arm keeps CUTLASS's LUT.
+`make_bases`: `gs4 = |g| >= 2^-117 ? g * 2^126 : +inf` (`kFp4Fold`,
+`kFp8FoldMinGlobal`, `kFp8FoldSentinelBits`); f16: `gs4 = g`.  Constants
+`kFp4Fold = 0x1p126f`, `kFp4FoldMax = 3.9921875 * 2^126` (== `kFp8FoldMax`),
+`kTwoPow126Bf16x2 = 0x7E807E80`.  Landing, copy forms, `expand_bases`,
+`load_packed`: unchanged (fp4 blocks stay 8 B `cp.async` into half `b & 1` of
+chunk `(b/2 + 4 (r & 1)) ^ (r & 7)`).
+
+**Control flow.**  `finish_pending_pair` loses the pair-level `__syncwarp`
+after `cp_async_wait` (the barrier is inside each operand: (2) above);
+`expand_pending` calls `expand_operand<true>` at every site in this step (the
+single-operand `VOTE = false` sites arrive with F25c's protocol change).  The
+dynamic module keeps F24c's format-outer one-page-ahead loops with an interim
+per-block vote (`expand_block_voted<FP8>`: `scale_product`, `__all_sync`,
+`__syncwarp`, `expand_block<FP8, hot|cold>`) and one `__syncwarp` at the top of
+its `expand_operand` arm so that the first pages' scale-slot loads follow a
+warp barrier; F25d replaces this arm.
+
+**Tests.**  `_extreme_transport(..., gs)` sets the FP4 global scales to `gs` as
+well and `dec4` models `A16(x * A16(float(s) * g))`; `_run_extremes` runs
+`("fp8", "fp4", "mixed") x (1, 64) x (1, 0.5, 1.1 x 2^-118)` = 18 cases (was
+12; the fp4 static module is `static_format = 2`).  Matrix: 64 + 2 + 6 + 4 + 18
+= 94.
+
+**Expected artifacts (6.1 body rows).**  fp8 loop-site operand body: 12
+`LDS.64`, `WARPSYNC` (or none) after them, 6 `LDS.32`, 6 `F2FP.F16.E4M3`, 6
+`HADD2.F32`, 6 `FMUL` (no `.FTZ`), 6 `FSETP`, `PLOP3` tree, one `VOTE.ALL`, one
+`BRA`; hot arm 6 x {`F2FP.BF16.PACK_AB`, 8 `PRMT`, 8 `SHF`/`IMAD.SHL`, 8 `LOP3`,
+8 `HMUL2.BF16`, 2 `STS.128 [R+imm]`}; cold arm the same with 8 more `HMUL2`
+per block and one `LDC`/`LDG` of the global scale; `BRA.DIV` 0, `UMOV` 0 in the
+bodies.  fp4 body: 12 `LDS.32` + 6 `LDS.32`, 26 integer ops per block
+(`SHL`, 4 x {`PRMT`, `SHL`, `LOP3`} x 2), `HMUL2` 8 hot / 16 cold, no `PRMT`
+LUT constants (`0xC0800000`, `0x3F3F3F00` gone from the bf16 module).
