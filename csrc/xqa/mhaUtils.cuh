@@ -1014,11 +1014,12 @@ __device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t pa
 //   x & 3, so the lane holds four u32 addresses a_j = tileBase + byteOffset(tok, 4h + j), each
 //   used as [a_j + 2048 * span]; the scale pair is bytes 2h, 2h+1 of the row's word:
 //   [scales + 4 * tok + 2h + 64 * span].
-//   Per span: LDS.U16 -> fp32 s_0, s_1 (exact) -> f_i = s_i * g * 2^k -> warp vote ->
+//   Per span: LDS.U16 [scales], LDS.128 / LDS.64 [a_0], LDS.128 / LDS.64 [a_2] (all loads issued
+//   first) -> fp32 s_0, s_1 (exact) -> f_i = s_i * g * 2^k -> warp vote ->
 //   [fold] sf2_i = bf16x2(f_i) | [fallback] sf2_i = bf16x2(s_i * g);
-//   block 2h:   LDS.128 / LDS.64 [a_0] -> placement decode -> (fallback: x 2^k) -> x sf2_0 ->
+//   block 2h:   placement decode of [a_0] -> (fallback: x 2^k) -> x sf2_0 ->
 //               STS.128 [a_0], STS.128 [a_1]
-//   block 2h+1: LDS.128 / LDS.64 [a_2] -> ... x sf2_1 -> STS.128 [a_2], STS.128 [a_3]
+//   block 2h+1: ... of [a_2] -> x sf2_1 -> STS.128 [a_2], STS.128 [a_3]
 //   A lane writes only grains it alone reads (its sources a_0, a_2 are among its outputs), so no
 //   barrier is needed between its loads and stores.  Bank behaviour: an 8-lane LDS/STS phase is
 //   8 consecutive rows at one logical grain -> 8 distinct physical grains, conflict-free; the
@@ -1096,7 +1097,22 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     bool const foldOk = fabsf(g) >= 0x1p-117f;     // every s * g fp32-normal
     uint32_t const tileOff = span * spanTileBytes;
     uint32_t const scaleOff = span * spanScaleBytes;
+    // All shared loads of the span first (the lds* helpers are asm volatile: source order is
+    // issue order): the scale pair and both packed blocks are in flight while the scale chain
+    // and the vote run, and the fold branch bodies only compute and store.  The first cut
+    // loaded the payload inside the fold branch, after the vote: every span then exposed the
+    // LDS latency twice in series (LDS.U16 -> cvt -> FMUL -> vote -> LDS.128 -> decode) and ncu
+    // measured short_scoreboard 1.32 -> 2.39 (fp8) with the instruction count down 16 %.
+    // mha_sm90.cu's expandPackedStage has the same loads-first order.
     uint32_t const s01 = ldsU16(scaleAddr + scaleOff);  // scales of blocks 2h (lo), 2h+1 (hi)
+    LdGrain packed[blocksPerLane];  // FP8: 16 B per block; FP4: 8 B in [i][0], [i][1]
+    if constexpr (isFP8) {
+      packed[0] = ldsGrain(addr0 + tileOff);
+      packed[1] = ldsGrain(addr2 + tileOff);
+    } else {
+      ldsB64(addr0 + tileOff, packed[0][0], packed[0][1]);
+      ldsB64(addr2 + tileOff, packed[1][0], packed[1][1]);
+    }
     float r0, r1;
     e4m3x2ScalesToFloat(s01, r0, r1);
     float const f0 = r0 * gFold;
@@ -1107,22 +1123,19 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
       constexpr bool kFold = decltype(foldTag)::value;
       uint32_t const sf2_0 = kFold ? bf16x2Broadcast(f0) : bf16x2Broadcast(r0 * g);
       uint32_t const sf2_1 = kFold ? bf16x2Broadcast(f1) : bf16x2Broadcast(r1 * g);
-      // One block: grain a holds the packed block; outputs go to grains a, b (logical 2b, 2b+1).
-      auto const block = [&](uint32_t a, uint32_t b, uint32_t sf2) {
+      // One block: packed[i] came from grain a; outputs go to grains a, b (logical 2b, 2b+1).
+      auto const block = [&](LdGrain const& p, uint32_t a, uint32_t b, uint32_t sf2) {
         LdGrain out[2];
         if constexpr (isFP8) {
-          LdGrain const packed = ldsGrain(a);
-          expandE4M3Block16BF16Placed<kFold>(packed, sf2, out);
+          expandE4M3Block16BF16Placed<kFold>(p, sf2, out);
         } else {
-          uint32_t lo, hi;
-          ldsB64(a, lo, hi);
-          expandE2M1Block16BF16Placed<kFold>(lo, hi, sf2, out);
+          expandE2M1Block16BF16Placed<kFold>(p[0], p[1], sf2, out);
         }
         stsGrain(a, out[0]);
         stsGrain(b, out[1]);
       };
-      block(addr0 + tileOff, addr1 + tileOff, sf2_0);  // block 2h   (logical grains 4h, 4h+1)
-      block(addr2 + tileOff, addr3 + tileOff, sf2_1);  // block 2h+1 (logical grains 4h+2, 4h+3)
+      block(packed[0], addr0 + tileOff, addr1 + tileOff, sf2_0);  // block 2h   (grains 4h, 4h+1)
+      block(packed[1], addr2 + tileOff, addr3 + tileOff, sf2_1);  // block 2h+1 (grains 4h+2, 4h+3)
     };
     if (fold) {
       body(MixedFoldTag<true>{});
