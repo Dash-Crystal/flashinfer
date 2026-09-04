@@ -41,8 +41,12 @@ register as soon as it is loaded, exposing the L2 round trip there) and register
 (2.3 %, part of the fill).  The lever is the per-warp dependency depth of both roles' tile bodies
 — register-only items under the existing [44] guards, no SharedMem change.**
 
-**Revision 2 (judge blockers, before code).**  Five blockers were raised against rev 1 and are
-answered in place: (1) [45b] in the dynamic module would have paired spans of different formats
+**Revision 2 (judge blockers, before code).**  Rev 2 is the design of record: the build / accept
+gate is the gap-free table of section 5 (fp8 99-105 predicted, the <= 94 target NOT reached by
+this step; fp4 88-93; mixed 92-97; a16 80-82), and A0 (the `XQA_NB_SUB_SEQ=1` ncu run on the
+pristine tip) is a precondition of A4 timing.  Any brief that still quotes rev 1's fp8 91-99 /
+"target <= 94 marginal" is superseded by this section.  Five blockers were raised against rev 1
+and are answered in place: (1) [45b] in the dynamic module would have paired spans of different formats
 inside one format branch — [45b] is now static-modules-only (section 3.2); (2) the "gemm0 paces,
 gemm1 has 20 % slack" reading was wrong — the produced-wait samples are the pipeline fill, two
 barrier sites were mislabelled, and the wall is now budgeted as min(gemm0 cut, gemm1 cut) with a
@@ -330,7 +334,14 @@ is not uniform-provable either.  Cost: +6 `SHFL` per K copy call (+12 issue slot
 ~50 cycles), +3 per V call; today's 4 `SHFL` + 3 `PRMT` of the tag broadcast are gone ([45c]).
 Applies to the `MIXED_ALL_HOISTED_COPY` modules (fp8 / fp4 / dyn); the a16 module keeps the
 `Vec` form (its stock copy's `HeadPtr` indexes the vector).  The prefetch distance is unchanged
-(indices two tiles ahead, tags one tile ahead): the `R2UR` was never a distance problem.  (b) is
+(indices two tiles ahead, tags one tile ahead): the `R2UR` was never a distance problem.
+Register accounting (review correction): step 6's `R2UR` evidence says the `Vec` stages WERE in
+uniform registers, which do not count against the 128 vector-register cap, so the honest vector
+delta is **+2** (`pageLane`, `pageLaneNext`; `pageTagLane` existed already), plus possibly +2 if
+ptxas hoists the per-lane 64-bit `kvCachePageList + 4 (maxNbPagesPerSeq idxReq + lane)` address
+out of the tile loop, and the copy's per-span `IMAD.WIDE` chain now runs in the vector datapath
+(same count, vector registers instead of URs).  A REG 126 -> 128 reading after the [45d] commit
+is this item's, not [45a]'s / [45b]'s.  (b) is
 not addressed: the address-register WAR is the LDGSTS batch draining; the design prices it at 0
 and gates only that the `LDGSTS` count is unchanged.  Budget: the `R2UR` sites (173 samples fp8
 gemm0, ~150 gemm1; 312 mixed) at a latency realisation (section 3.7).  A1 gates: `R2UR` fed by
@@ -385,9 +396,9 @@ op in the same warp.  Cycles per tile at 4.31 cycles per sample, fp8 module.
 | [45b] block-pipelined spans (static) | STS -> LDS WAR (MIO queue) | -220 (51) | **-70..-110** | -550 (127) | -160..-270 | +4 FP8 / +2 FP4 |
 | [45c] flag in registers | LDS.U8 behind the LDGSTS batch (MIO queue) | -490 (114) | -150..-250 | -540 (125) | -160..-270 | +1 (dyn), -1 (static) |
 | [45c] tags: dead work / REDUX | deterministic removal (90 `PRMT <- SHFL` + ~24 instructions per tile) | -390 - 100 | -350..-440 | -650 (151) - 100 | -520..-680 | 0 |
-| [45d] lane-distributed pages | R2UR at load (latency); +6 SHFL per K call | -750 (173) + 50 | **-320..-470** | -650 (~150) + 50 | -270..-400 | -6 (K), -2 (V) |
+| [45d] lane-distributed pages | R2UR at load (latency); +6 SHFL per K call | -750 (173) + 50 | **-320..-470** | -650 (~150) + 50 | -270..-400 | +2 (..+4) vector: the `Vec` stages were URs (see 3.4) |
 | [45e] rowSum mask | deterministic removal | -480 (111) | **-380..-430** | 0 | 0 | 0 |
-| **sum** | | -2,760 | **-1,460..-1,970 = -8.7..-11.8 % of 16,700** | -2,800 | **-1,290..-1,870 = -7.9..-11.4 % of 16,340** | net -2..+4 over 124-127 |
+| **sum** | | -2,760 | **-1,460..-1,970 = -8.7..-11.8 % of 16,700** | -2,800 | **-1,290..-1,870 = -7.9..-11.4 % of 16,340** | net +4..+8 over 124-127 (static: -1 -1 +2..4 +4; dyn: +1 +2..4) |
 | [45f] prologue | one round trip per CTA lifetime | | -1..-2 % of the wall, all modes | | | 0 |
 | (b) address-register WAR | LDGSTS batch drain | 1,440 | **0** | ~820 | 0 | |
 
@@ -420,11 +431,13 @@ fragments + loop state + the expansion's 18-22), against the 124 (dyn) / 127 (a1
 | [45c] | -1 (`pageTagLane`, `pageFormats` word and the flag register go) | +1 (`kTagWordCurr/Next` +2, `pageFormats` -1) | by construction: nothing new is live across the part body except the two words |
 | [45e] | 0 | 0 | one SHFL replaces a convergence sequence |
 | [45f] | 0 | 0 | same values, one more predicate |
-| [45d] | -6 K side, -2 V side (a `Vec<int,4>` x 2 -> two scalars) if they were vector registers; 0 if ptxas held them in URs | same | fewer live values, none added |
+| [45d] | **+2 vector** (`pageLane`, `pageLaneNext`; the replaced `Vec<int,4>` stages were URs per the step-6 `R2UR`, i.e. outside the 128 cap), +2 more if the per-lane list address is hoisted; the per-span `IMAD.WIDE` chain moves UR -> vector (count unchanged) | same (+2..+4) | the lane value must live in a vector register - that is the point of the item |
 | [45a] | -1 | 0 (pre-vote temporaries die before the loop; the body re-reads the word) | `s01[4]` replaces `s01, r0, r1, f0, f1` |
 | [45b] | +4 (FP8) / +2 (FP4) | 0 (not applied) | second payload set |
 
-Net -4..+4 over 126: [45b] is the only item that can cross 128, and it is last.  Fallbacks if a
+Net +4..+8 over 126 (static; dyn +3..+5 over 124): [45d] and [45b] are the two items that can
+cross 128 - [45d] by +2..+4 (a 126 -> 128 reading after its commit is expected and is its own),
+[45b] by +4 / +2 on top; both are gated, [45b] last.  Fallbacks if a
 commit breaks the gate: [45b] -> `MIXED_EXPANSION_PIPELINED_SPANS 0` (single set; drop the item);
 [45a] -> keep the per-span vote in the dyn module only (static modules keep the call vote);
 [45c] -> keep the format word in smem for the dyn module; [45d] -> none needed (it frees).  Nothing
@@ -448,7 +461,11 @@ is traded for registers: 2 CTAs/SM is the step-4 lever and outranks every item h
   at the flag offsets (`+0x1b030`, `+0x1b038` today) 0; `STS.U8` / `STS` flag and format stores
   0; `LDG.E.U8` tag loads 0 (static) / 1 per `loadPages` (dyn); `LDGSTS` static counts unchanged
   (47 / 47 / 55 / 65); `LDS.128` / `LDS.64` 2 and `STS.128` 4 per span-call unchanged; the static
-  fold body's `LDS` of span s+1 precede the `STS` of span s ([45b]); `DEPBAR.LE SB0, 0x1` 3 per
+  fold body's `LDS` of span s+1 precede the `STS` of span s ([45b]) **and, for every `LDS.128` /
+  `LDS.64` in the two static fold bodies, no destination register is a source of an `STS.128`
+  within the preceding ~10 instructions (the STS -> LDS register WAR [45b] exists to remove;
+  ptxas is free to recycle the just-stored `out` registers, section 8.6) - if any is,
+  `MIXED_EXPANSION_PIPELINED_SPANS 0` is taken**; `DEPBAR.LE SB0, 0x1` 3 per
   module unchanged; REG <= 128, STACK 0, LDL 0, STL 0; hot loops gemm0 part <= 1,200 SASS
   (1,114), gemm1 V <= 800 (726), dyn total hot <= 2,800.
 - **A2 (ncu one launch, `--launch-skip 1 --launch-count 1`, the step-6 metric list plus
@@ -547,6 +564,18 @@ CSVs and nvdis files): `nkcut2:/tmp/mixedkv-wtS6-a0/{v2-fmt-1,v2-fmt0,v2-fmt1,v2
 `{v2-fp8,v2-fp4,v2-mixed,new-transport_a16}.source.csv`, `buckets.py`, `stalls.py`.
 
 ## 8. As written (code state of this worktree; one subsection per commit, appended as each lands)
+
+### 8.0 Stock-view identity of the shared files (checked at review, before any remote build)
+
+`unifdef -k -DMIXED_HOISTED_COPY=0 -DMIXED_ALL_HOISTED_COPY=0 -DMIXED_BF16_PLACEMENT_EXPANSION=0
+-DMIXED_COMPACT_TILE_LOOPS=0 -DMIXED_PAGE_STATIC_FORMAT={-1,0,1,2}` of `d9a317e4`'s and the
+[45b] tip's `csrc/xqa/mha.cu`: the non-directive code lines are identical for all four formats
+(only `#if` spellings differ), so the sm120 and sm90 q=1 preprocessed kernels are unchanged.  The
+`mhaUtils.cuh` edits are confined to the two [44] templates (instantiated only under
+`MIXED_BF16_PLACEMENT_EXPANSION`) plus new never-called inline / template helpers; the removed
+`foldScalePairFinite` has no other user; `mha_sm90.cu` includes `mhaUtils.cuh` but instantiates
+none of the changed templates.  The ws-1 SASS byte-compare (A3) stays the binding gate (expect the
+known ptxas variation on the dyn q=1 pair only).
 
 ### 8.1 [45c] — flags, formats, tags in registers (commit "[45c]")
 
@@ -669,8 +698,11 @@ before).  Control flow: unchanged; the copy's per-span branch (dyn) is on the ta
 page.  `SHFL.IDX` per copy call: K 4 + 2 = 6, V 2 + 1 = 3 (the tag broadcast's 4 `SHFL` + 3 `PRMT`
 are gone since [45c]).  Expected SASS: `LDG` in `loadPages` 1 (+1 tag, dyn) per call instead of
 4 + 1 (K) / 2 + 1 (V); `R2UR` fed by the page-index `LDG` 0; `LDGSTS` count unchanged.
-Registers: K -6, V -2 per stage pair if the vectors were vector registers (0 if ptxas held them in
-URs, which the `R2UR` suggests); +0 otherwise.
+Registers (corrected in review): **+2 vector** (`pageLane`, `pageLaneNext`) - the replaced `Vec`
+stages were uniform registers (the step-6 `R2UR` is the proof), which never counted against the
+128 cap - plus up to +2 if ptxas hoists the per-lane 64-bit list address; the per-span address
+`IMAD.WIDE`s move from the uniform to the vector datapath (same count).  A 126 -> 128 reading
+after this commit is attributed here.
 
 ### 8.5 [45a] — one fold vote per call (commit "[45a]")
 
@@ -715,7 +747,10 @@ r0, r1, f0, f1` (5) + payload (8): **-1 register**; the dyn pre-vote temporaries
 loop.  Expected SASS (A1): `VOTE.ALL` in the expansion 2 per module (K call, V call; fp8 module
 had 6), `F2FP.F16.E4M3` in the static K body 4 before the vote + 1 per span in each fold body,
 one `BRA` on the vote per call; `LDS.U16` per K call 4 (static) / 8 (dyn: pre-vote + body);
-`LDS.128` / `LDS.64` 2 and `STS.128` 4 per span unchanged; no LDL / STL.
+`LDS.128` / `LDS.64` 2 and `STS.128` 4 per span unchanged; no LDL / STL.  The static `s01[nbSpans]`
+(and [45b]'s `packed[2][2]`) are register arrays only while `#pragma unroll` fully unrolls the
+span loops (nbSpans 4 / 2); a failure to unroll would put them in local memory - the LDL / STL 0
++ STACK 0 check after this commit and after [45b] is what catches it, and is not skipped.
 
 ### 8.6 [45b] — block-pipelined spans, two register sets, static modules only (commit "[45b]")
 
@@ -735,11 +770,20 @@ spans<fold>, span s (unrolled), set = s % 2, nxt = (s + 1) % 2:
   decode packed[set][1] -> STS.128 [addr2 + 2048 s], [addr3 + 2048 s]
 ```
 
-Why the WAR disappears structurally: the `LDS` that fills a register is issued before the `STS`
-that could otherwise recycle that register's previous contents (span s's `out` registers do not
-exist yet when span s+1's loads are issued), so ptxas has no reason to place an `LDS` destination
-on a register a draining `STS` still reads; each `LDS` then lands under the ~24 instructions of
-the previous block's decode.  Shared-memory ordering: spans are 2,048 B apart, so a load of span
+Why the WAR should disappear, and where the argument is incomplete (review): the `LDS` that
+fills `packed[nxt][0]` is issued before block(set, 0)'s `out` registers exist, and the `LDS` into
+`packed[nxt][1]` before block(set, 1)'s, so neither can land on the registers of the `STS` pair it
+interleaves with, and each `LDS` lands under the ~24 instructions of the following decode.  But
+the `LDS` into `packed[nxt][1]` is issued *right after* block(set, 0)'s two `STS.128`, and the
+`LDS` into `packed[nxt][0]` follows the previous span's block-1 `STS.128` pair after only
+`scalePair` (~7 instructions); the `out` registers of those STSs are dead at exactly that point,
+so the allocator is free to put the `LDS` destination on them - the very STS -> LDS WAR the item
+claims to remove.  The structure removes the reason to *prefer* those registers, not the
+possibility.  Hence the A1 gate above: read each fold body's `LDS` destinations against the
+sources of the `STS.128`s in the preceding ~10 instructions; if any collides, the item is
+`MIXED_EXPANSION_PIPELINED_SPANS 0` (single set, [45a] body) rather than +4 registers for
+nothing.  (Issuing both of span s+1's loads before block(set, 0) would not change this: the
+first of them still follows the previous span's last `STS` pair; it only adds 4 live registers.)  Shared-memory ordering: spans are 2,048 B apart, so a load of span
 s+1 never aliases a store of span s; within a span both blocks are loaded (one in the previous
 iteration, one now) before the span's first store, as in [44].  Peak live set: `packed[set][1]`
 + `packed[nxt][0]` + `packed[nxt][1]` (12 FP8 / 6 FP4) + `out` (8) + `sf2` (2) = 22 / 16 vs

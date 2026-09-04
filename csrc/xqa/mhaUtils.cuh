@@ -1252,8 +1252,16 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   // reads, so no barrier sits between its loads and stores.
   //   [45b] (MIXED_EXPANSION_PIPELINED_SPANS): per span s - sf2 pair from the kept scale word;
   //   LDS span s+1 block 2h into the other set; decode + STS span s block 2h; LDS span s+1
-  //   block 2h+1; decode + STS span s block 2h+1.  Every LDS is issued before the STS that could
-  //   otherwise recycle its destination register, and lands under ~24 decode instructions.
+  //   block 2h+1; decode + STS span s block 2h+1.  Each LDS lands under ~24 decode instructions
+  //   and is issued before the STS of the block it interleaves with, so THAT block's out registers
+  //   cannot be its destination.  The argument is incomplete for the block just stored: the LDS
+  //   into packed[nxt][1] follows block(set, 0)'s STS.128 pair directly, and the LDS into
+  //   packed[nxt][0] follows the previous span's block-1 STS.128 pair after only scalePair; the
+  //   out registers of those STSs are dead there and ptxas may place the LDS destination on them
+  //   (the STS -> LDS register WAR this item exists to remove).  Gate (A1, read in SASS): no
+  //   LDS.128 / LDS.64 destination in either fold body is a source of an STS.128 within the
+  //   preceding ~10 instructions; if it is, MIXED_EXPANSION_PIPELINED_SPANS 0 (single set) is
+  //   taken rather than paying the registers for nothing.
   //   Peak live: 3 blocks (12 FP8 / 6 FP4) + out (8) + sf2 (2).
   //   Fallback (0): span s > 0 loads both of its blocks first, then decodes and stores them.
   auto const spans = [&](auto foldTag) {
@@ -1654,7 +1662,10 @@ struct KVCacheList<true> {
   PageTransport transport;
 #endif
   KVCachePageIndex const*
-      kvCachePageList;  // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
+      kvCachePageList;  // shape: KVCachePageIndex[batchSize][maxNbPagesPerSeq] (Layout 1: one
+                        // row per request shared by K and V; what getPage / getPageUngated /
+                        // getPageLaneUngated index).  loadPagesForBeamSearchAsync still spells the
+                        // Layout-0 [batchSize][beamWidth][2][maxNbPagesPerSeq] form.
   SeqLenDataType const* seqLenList;  // shape: [batchSize][beamWidth] (for compatibility)
   uint32_t maxNbPagesPerSeq;
 };
@@ -1710,9 +1721,14 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
 // sequence length.  kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage] is in bounds for every
 // idxPage < maxNbPagesPerSeq (the row stride getPage indexes with; a kernel parameter), so the
 // load is predicated on that alone and BAD is selected on idxPage < nbPages after both the list
-// entry and the sequence length have landed: the per-CTA prologue chain seqLen -> list -> (tag ->)
-// copy loses one dependent round trip.  The load is an asm volatile ld.global.nc so the compiler
-// cannot fold the nbPages select back into the load predicate (a plain load whose only consumer
+// entry and the sequence length have landed.  LAYOUT DEPENDENCE: the ungated read is in bounds
+// only under Layout 1 (kvCachePageList[batchSize][maxNbPagesPerSeq], one row per request, K and
+// V sharing it; maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage) = page_table.shape[-1],
+// flashinfer/xqa.py), which is the layout the stock getPage above already assumes (it ignores
+// isK / idxBeam).  Reintroducing Layout 0 ([batchSize][beamWidth][2][maxNbPagesPerSeq], the
+// loadPagesForBeamSearchAsync form below) changes the row base and stride: revisit this read
+// (and getPage) with it.  Chain: the per-CTA prologue seqLen -> list -> (tag ->) copy loses one
+// dependent round trip.  The load is an asm volatile ld.global.nc so the compiler cannot fold the nbPages select back into the load predicate (a plain load whose only consumer
 // is the select may legally be predicated on both conditions).  Values are identical to getPage:
 // idxPage < nbPages <= maxNbPagesPerSeq -> the list entry, else BAD; cacheSeqLen == 0 gives
 // nbPages == 0 and every entry BAD, as today.  Data flow: idxPageBeg + i, maxNbPagesPerSeq,
