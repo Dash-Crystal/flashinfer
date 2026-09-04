@@ -1410,6 +1410,70 @@ struct SparseMixedCollectiveMainloop {
     }
   }
 
+  // [26] The static modules' pending operand in three phases, so that a loop
+  // pair can be ordered  wait_group 0 -> both operands' landing loads -> one
+  // __syncwarp -> both operands' scale loads and chains -> (rows, copies) ->
+  // K' vote + body -> V' vote + body  (design 3.1), with every load's latency
+  // hidden under the copy block.  The single-operand sites run the three phases
+  // back to back (expand_operand below): the same instructions as F25's.
+  //   pending_loads : e = expand_bases(stage); pk[j] = this thread's own landed
+  //                   words of the six pages (2 LDS.64 fp8 / 2 LDS.32 fp4 each);
+  //   pending_scales: sw[j] = the row's scale word of page j (LDS.32 at sc + j*8,
+  //                   readable after the pair's __syncwarp: every lane of the
+  //                   warp is past its own wait, A9), v[j] = f32(s_j) * gs, ok =
+  //                   AND_j fold_ok(v[j]) (bitwise: PLOP3 chain, no branch);
+  //   pending_body  : VOTE.ALL(ok) -> hot arm (sf2 = bf16x2(v_j)) or cold arm
+  //                   (2^k undone, sf2 = bf16x2(f32(s_j) * g)); six block bodies.
+  // Register arrays are indexed by unrolled constants only (C2).
+  struct PendingStatic {
+    ExpandBases e;
+    Packed pk[PAGES_PER_THREAD];
+    uint32_t sw[PAGES_PER_THREAD];
+    float v[PAGES_PER_THREAD];
+    bool ok;
+  };
+  template <bool FP8>
+  CUTLASS_DEVICE static void pending_loads(PendingStatic& ps, OperandBases const& b, int stage,
+                                           uint32_t t) {
+    ps.e = expand_bases(b, uint32_t(stage), t);
+#pragma unroll
+    for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) ps.pk[j] = load_packed<FP8>(ps.e, static_page(j).off);
+  }
+  template <bool FP8>
+  CUTLASS_DEVICE static void pending_scales(PendingStatic& ps, OperandBases const& b, uint32_t t) {
+#pragma unroll
+    for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) {
+      ps.sw[j] = mixed_detail::lds32(ps.e.sc + static_page(j).sc_off);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) ps.v[j] = scale_product<FP8>(b, ps.sw[j], t);
+    if constexpr (FOLDS) {
+      bool ok = fold_ok(ps.v[0]);
+#pragma unroll
+      // Bitwise: `&&` short-circuits and ptxas emitted BSSY / @P BRA / BSYNC
+      // around the remaining FSETPs ([25e]); `&` keeps the chain as PLOP3s.
+      for (uint32_t j = 1; j < PAGES_PER_THREAD; ++j) ok = ok & fold_ok(ps.v[j]);
+      ps.ok = ok;
+    } else {
+      ps.ok = true;
+    }
+  }
+  template <bool FP8, bool VOTE>
+  CUTLASS_DEVICE void pending_body(Params const& prm, bool isK, PendingStatic const& ps,
+                                   OperandBases const& b, uint32_t t) const {
+    if constexpr (FOLDS && VOTE) {
+      if (__all_sync(0xFFFFFFFFu, ps.ok)) {
+        expand_static_arm<FP8, false>(prm, isK, ps.e, b, ps.pk, ps.sw, ps.v, t);
+      } else {
+        expand_static_arm<FP8, true>(prm, isK, ps.e, b, ps.pk, ps.sw, ps.v, t);
+      }
+    } else if constexpr (FOLDS) {
+      expand_static_arm<FP8, true>(prm, isK, ps.e, b, ps.pk, ps.sw, ps.v, t);
+    } else {
+      expand_static_arm<FP8, false>(prm, isK, ps.e, b, ps.pk, ps.sw, ps.v, t);
+    }
+  }
+
   // One operand's pending tile.  `tv` is the tile's pending word.
   //
   // Static modules ([25], A9 / C12).  Data flow, in program order:
@@ -1435,38 +1499,17 @@ struct SparseMixedCollectiveMainloop {
   template <bool VOTE>
   CUTLASS_DEVICE void expand_operand(Params const& prm, bool isK, OperandBases const& b,
                                      uint32_t tv, int stage, uint32_t t) const {
-    ExpandBases const e = expand_bases(b, uint32_t(stage), t);
     if constexpr (!DYNAMIC) {
       (void)tv;  // the static modules' pending word carries only the stage
-      constexpr bool FP8 = STATIC_FP8;
-      constexpr uint32_t N = PAGES_PER_THREAD;
-      Packed pk[N];
-#pragma unroll
-      for (uint32_t j = 0; j < N; ++j) pk[j] = load_packed<FP8>(e, static_page(j).off);
+      // [26] The three phases back to back (the single-operand sites; the loop
+      // interleaves the two operands' phases around the copies).
+      PendingStatic ps;
+      pending_loads<STATIC_FP8>(ps, b, stage, t);
       __syncwarp();
-      uint32_t sw[N];
-#pragma unroll
-      for (uint32_t j = 0; j < N; ++j) sw[j] = mixed_detail::lds32(e.sc + static_page(j).sc_off);
-      float v[N];
-#pragma unroll
-      for (uint32_t j = 0; j < N; ++j) v[j] = scale_product<FP8>(b, sw[j], t);
-      if constexpr (FOLDS && VOTE) {
-        bool ok = fold_ok(v[0]);
-#pragma unroll
-        // Bitwise: `&&` short-circuits and ptxas emitted BSSY / @P BRA / BSYNC
-        // around the remaining FSETPs ([25e]); `&` keeps the chain as PLOP3s.
-        for (uint32_t j = 1; j < N; ++j) ok = ok & fold_ok(v[j]);
-        if (__all_sync(0xFFFFFFFFu, ok)) {
-          expand_static_arm<FP8, false>(prm, isK, e, b, pk, sw, v, t);
-        } else {
-          expand_static_arm<FP8, true>(prm, isK, e, b, pk, sw, v, t);
-        }
-      } else if constexpr (FOLDS) {
-        expand_static_arm<FP8, true>(prm, isK, e, b, pk, sw, v, t);
-      } else {
-        expand_static_arm<FP8, false>(prm, isK, e, b, pk, sw, v, t);
-      }
+      pending_scales<STATIC_FP8>(ps, b, t);
+      pending_body<STATIC_FP8, VOTE>(prm, isK, ps, b, t);
     } else {
+      ExpandBases const e = expand_bases(b, uint32_t(stage), t);
       // [25d] Dynamic module (C10 / C17).  Data flow: (1) __syncwarp - every
       // lane is past its cp.async.wait_group, so lane 0's landed scale slots of
       // all six pages are readable by the row's lanes from here on (A9); (2) the
@@ -1955,8 +1998,8 @@ struct SparseMixedCollectiveMainloop {
       // read_meta by entry, PARTIAL V, no finish).
       pair_step(kv_tile_idx, FullTag{}, PartialTag{});
 
-      // ---- [26] the loop over full pairs (design 3.1 / 3.4; F26a keeps F25's
-      // order within the pair, F26b re-orders it) ----
+      // ---- [26] the loop over full pairs (design 3.1 / 3.4; the static modules
+      // in the F26b order, the dynamic module in F25's until F26c) ----
       // Data flow per pair (V tile t at chunk-table entry eV = kv_tile_idx - t, K
       // tile t-1 at entry eV + 1):
       //   (1) spins on the previous pair's two probes (taken only when a probe said
@@ -1967,8 +2010,11 @@ struct SparseMixedCollectiveMainloop {
       //   (3) K copies into stage sK = sV + 1 mod 3, V copies into sV, one commit
       //       group;
       //   (4) the pending pair's finish: K' in stage sV, V' in stage sV - 1 mod 3
-      //       (the stages this pair's copies do not touch; cp.async.wait_group 1 =
-      //       the previous pair's group; the dynamic module uses its pending words);
+      //       (the stages this pair's copies do not touch); static modules: the
+      //       wait (wait_group 0), the landing and scale loads and the chains
+      //       precede the copies and the votes / bodies follow them (the (2)-(4)
+      //       order below); the dynamic module: wait_group 1 after the commit and
+      //       its pending words;
       //   (5) two non-blocking mbarrier.test_wait probes on the next pair's stages
       //       (empty barriers sK', sV' = (sV + 2, sV + 1) mod 3), their results
       //       carried to (1) of the next pair; issued after this pair's commits, so
@@ -2005,32 +2051,6 @@ struct SparseMixedCollectiveMainloop {
             op.pipeline->producer_commit(PipelineState(int(stage), 0, 0),
                                          cutlass::arch::cpasync_barrier_arrive);
           }
-        }
-      };
-      auto finish_loop = [&](int pK, int pV) {
-        if constexpr (DYNAMIC) {
-          finish_pending_pair();  // F25: wait_group 1, per-operand pending tests (A16-only tiles)
-          rotate_pending(K);
-          rotate_pending(V);
-        } else {
-          cutlass::arch::cp_async_wait<1>();
-#ifdef MIXED_FA3_TRACE
-          if (ft.on) ft.t[0] = ft.t[1] = mixed_detail::globaltimer_ns();
-#endif
-          expand_operand<true>(mainloop_params, true, K.bases, 0u, pK, uint32_t(thread_idx));
-#ifdef MIXED_FA3_TRACE
-          if (ft.on) ft.t[2] = ft.t[3] = mixed_detail::globaltimer_ns();
-#endif
-          expand_operand<true>(mainloop_params, false, V.bases, 0u, pV, uint32_t(thread_idx));
-#ifdef MIXED_FA3_TRACE
-          if (ft.on) ft.t[4] = mixed_detail::globaltimer_ns();
-#endif
-          cutlass::arch::fence_view_async_shared();  // D5, once per pair
-          pipeline_k.producer_commit(PipelineState(pK, 0, 0));
-          pipeline_v.producer_commit(PipelineState(pV, 0, 0));
-#ifdef MIXED_FA3_TRACE
-          if (ft.on) ft.t[5] = mixed_detail::globaltimer_ns();
-#endif
         }
       };
 
@@ -2083,51 +2103,125 @@ struct SparseMixedCollectiveMainloop {
 #ifdef MIXED_FA3_TRACE
         if (trace) tr1 = tr3 = mixed_detail::globaltimer_ns();
 #endif
-        // (2) chunk rows by ring offset and the octet page words (every LDS
-        // before the first LDGSTS).  The K row is read unconditionally (a table
-        // row, unused by the last pair).
-        uint32_t const rowV = meta_base + oV;
-        uint32_t const rowK = meta_base + ((oV + META_ROW_BYTES) & META_RING_MASK);
-        TileRegs const mK = read_meta_row(rowK);
-        TileRegs const mV = read_meta_row(rowV);
-        uint32_t const spK = scale_page_word(mK, thread_idx);
-        uint32_t const spV = scale_page_word(mV, thread_idx);
-        // (3) copies
-        if (hasK) issue_loop(K, mK, spK, uint32_t(sK));
-        issue_loop(V, mV, spV, uint32_t(sV));
-        cutlass::arch::cp_async_fence();  // this pair's copies form one commit group
-#ifdef MIXED_FA3_TRACE
-        if (trace) {
-          tr4 = mixed_detail::globaltimer_ns();
-          ft.t[0] = ft.t[1] = ft.t[2] = ft.t[3] = ft.t[4] = ft.t[5] = tr4;
-        }
-#endif
-        // (4) finish the pending pair
-        finish_loop(pK, pV);
-        // (5) probes for the next pair's stages: V's next stage is this pair's sK.
-        int const sVn = sK;
+        // (2) the pending pair's stages sit in different buffers from this pair's
+        // copies (K' = sV, V' = sV - 1 vs sK, sV), so their loads can precede the
+        // copies without a hazard; the probes for the next pair follow the bodies.
+        int const sVn = sK;  // the next pair's V stage is this pair's K stage
         uint32_t const phVn = phK;
         int const sKn = sVn == NUM_STAGES - 1 ? 0 : sVn + 1;
         uint32_t const phKn = sVn == NUM_STAGES - 1 ? (phVn ^ 1u) : phVn;
-        okK = shared_storage.pipeline_k.empty_barrier_[sKn].test_wait(phKn);
-        okV = shared_storage.pipeline_v.empty_barrier_[sVn].test_wait(phVn);
+        if constexpr (DYNAMIC) {
+          // F26a order (F26c re-orders the dynamic module): rows -> copies ->
+          // commit -> wait_group 1 -> finish (pending words) -> probes.
+          uint32_t const rowV = meta_base + oV;
+          uint32_t const rowK = meta_base + ((oV + META_ROW_BYTES) & META_RING_MASK);
+          TileRegs const mK = read_meta_row(rowK);
+          TileRegs const mV = read_meta_row(rowV);
+          uint32_t const spK = scale_page_word(mK, thread_idx);
+          uint32_t const spV = scale_page_word(mV, thread_idx);
+          if (hasK) issue_loop(K, mK, spK, uint32_t(sK));
+          issue_loop(V, mV, spV, uint32_t(sV));
+          cutlass::arch::cp_async_fence();  // this pair's copies form one commit group
+#ifdef MIXED_FA3_TRACE
+          if (trace) {
+            tr4 = mixed_detail::globaltimer_ns();
+            ft.t[0] = ft.t[1] = ft.t[2] = ft.t[3] = ft.t[4] = ft.t[5] = tr4;
+          }
+#endif
+          finish_pending_pair();  // F25: wait_group 1, per-operand pending tests (A16-only tiles)
+          rotate_pending(K);
+          rotate_pending(V);
+          okK = shared_storage.pipeline_k.empty_barrier_[sKn].test_wait(phKn);
+          okV = shared_storage.pipeline_v.empty_barrier_[sVn].test_wait(phVn);
+#ifdef MIXED_FA3_TRACE
+          if (trace) {
+            tr5 = mixed_detail::globaltimer_ns();
+            if (tr_n == 0) tr_first_t0 = tr0; else tr_gap += tr0 - tr_prev_end - tr_chunk;
+            tr_chunk = 0;
+            tr_acq += tr1 - tr0; tr_iss += tr4 - tr3;
+            tr_fin += tr5 - tr4; tr_prev_end = tr5; ++tr_n;
+            tr_acqK += tr0b - tr0; tr_acqV += tr1 - tr0b;
+            tr_wait += ft.t[0] - tr4; tr_barB += ft.t[1] - ft.t[0]; tr_expK += ft.t[2] - ft.t[1];
+            tr_fcK += ft.t[3] - ft.t[2]; tr_expV += ft.t[4] - ft.t[3]; tr_fcV += ft.t[5] - ft.t[4];
+            tr_oth += tr5 - ft.t[5];
+          }
+#endif
+        } else {
+          // [26b] Static modules, the design 3.1 order.  Data flow:
+          //   cp.async.wait_group 0        this thread's copies of the pending pair (K' in sV, V' in
+          //                                sV - 1; committed one pair ago) have landed - cover = the
+          //                                previous pair's bodies + tail + this pair's spins (3.1);
+          //   K' and V' landing loads      own words (2 LDS per page per operand);
+          //   __syncwarp                   the pair's one barrier: every lane past its wait, so the
+          //                                six landed scale slots of both operands are readable by
+          //                                the row and every lane's loads precede every lane's stores;
+          //   K' and V' scale words / chains (LDS.32 x 12; PRMT, F2FP, HADD2, FMUL, FSETP, PLOP3);
+          //   chunk rows + page words      4 LDS.128 + 2 LDS.32 (every LDS before the first LDGSTS);
+          //   K copies, V copies, commit   the copy block hides the loads' and chains' latencies;
+          //   K' vote + body, V' vote + body   (STS.128 to the pending stages);
+          //   probes, fence, arrives.
+          // Control flow: the hasK branch around the K copies, the two uniform
+          // vote branches (hot / cold arms), nothing else; no barrier after a vote.
+          cutlass::arch::cp_async_wait<0>();
+#ifdef MIXED_FA3_TRACE
+          uint64_t trw = 0, trl = 0, trk = 0, trv = 0;
+          if (trace) trw = mixed_detail::globaltimer_ns();
+#endif
+          uint32_t const u = static_cast<uint32_t>(thread_idx);
+          PendingStatic PK, PV;
+          pending_loads<STATIC_FP8>(PK, K.bases, pK, u);
+          pending_loads<STATIC_FP8>(PV, V.bases, pV, u);
+          __syncwarp();
+          pending_scales<STATIC_FP8>(PK, K.bases, u);
+          pending_scales<STATIC_FP8>(PV, V.bases, u);
+          uint32_t const rowV = meta_base + oV;
+          uint32_t const rowK = meta_base + ((oV + META_ROW_BYTES) & META_RING_MASK);
+          TileRegs const mK = read_meta_row(rowK);
+          TileRegs const mV = read_meta_row(rowV);
+          uint32_t const spK = scale_page_word(mK, thread_idx);
+          uint32_t const spV = scale_page_word(mV, thread_idx);
+#ifdef MIXED_FA3_TRACE
+          if (trace) trl = mixed_detail::globaltimer_ns();
+#endif
+          if (hasK) issue_loop(K, mK, spK, uint32_t(sK));
+          issue_loop(V, mV, spV, uint32_t(sV));
+          cutlass::arch::cp_async_fence();  // this pair's copies form one commit group
+#ifdef MIXED_FA3_TRACE
+          if (trace) tr4 = mixed_detail::globaltimer_ns();
+#endif
+          pending_body<STATIC_FP8, true>(mainloop_params, true, PK, K.bases, u);
+#ifdef MIXED_FA3_TRACE
+          if (trace) trk = mixed_detail::globaltimer_ns();
+#endif
+          pending_body<STATIC_FP8, true>(mainloop_params, false, PV, V.bases, u);
+#ifdef MIXED_FA3_TRACE
+          if (trace) trv = mixed_detail::globaltimer_ns();
+#endif
+          okK = shared_storage.pipeline_k.empty_barrier_[sKn].test_wait(phKn);
+          okV = shared_storage.pipeline_v.empty_barrier_[sVn].test_wait(phVn);
+          cutlass::arch::fence_view_async_shared();  // D5, once per pair
+          pipeline_k.producer_commit(PipelineState(pK, 0, 0));
+          pipeline_v.producer_commit(PipelineState(pV, 0, 0));
+#ifdef MIXED_FA3_TRACE
+          if (trace) {
+            // Buckets (6.2): acq = spins, wait = DEPBAR, barB = loads + barrier +
+            // chains + rows, iss = copies, expK / expV = vote + body, fcV = probes
+            // + fence + arrives; fin = bodies + fcV.
+            tr5 = mixed_detail::globaltimer_ns();
+            if (tr_n == 0) tr_first_t0 = tr0; else tr_gap += tr0 - tr_prev_end - tr_chunk;
+            tr_chunk = 0;
+            tr_acq += tr1 - tr0; tr_acqK += tr0b - tr0; tr_acqV += tr1 - tr0b;
+            tr_wait += trw - tr1; tr_barB += trl - trw; tr_iss += tr4 - trl;
+            tr_expK += trk - tr4; tr_expV += trv - trk; tr_fcV += tr5 - trv;
+            tr_fin += tr5 - tr4; tr_prev_end = tr5; ++tr_n;
+            (void)tr3;
+          }
+#endif
+        }
         // (6) advance
         sV = sVn;
         phV = phVn;
         oV = (oV + META_ROW_BYTES) & META_RING_MASK;
-#ifdef MIXED_FA3_TRACE
-        if (trace) {
-          tr5 = mixed_detail::globaltimer_ns();
-          if (tr_n == 0) tr_first_t0 = tr0; else tr_gap += tr0 - tr_prev_end - tr_chunk;
-          tr_chunk = 0;
-          tr_acq += tr1 - tr0; tr_iss += tr4 - tr3;
-          tr_fin += tr5 - tr4; tr_prev_end = tr5; ++tr_n;
-          tr_acqK += tr0b - tr0; tr_acqV += tr1 - tr0b;
-          tr_wait += ft.t[0] - tr4; tr_barB += ft.t[1] - ft.t[0]; tr_expK += ft.t[2] - ft.t[1];
-          tr_fcK += ft.t[3] - ft.t[2]; tr_expV += ft.t[4] - ft.t[3]; tr_fcV += ft.t[5] - ft.t[4];
-          tr_oth += tr5 - ft.t[5];
-        }
-#endif
       }
       // Both rings are level again: each advanced num_kv_tiles times this item.
       smem_pipe_write_v = PipelineState(sV, phV, smem_pipe_write_v.count() + uint32_t(n_loop_pairs));

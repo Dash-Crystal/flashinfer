@@ -1287,3 +1287,68 @@ landed (F25).
 `SYNCS.PHASECHK` (test) after the commits; region <= 2450 (fp8) / 2550 (fp4);
 a16 SASS identical to F25's (`read_meta`'s dead `cvta` and the unused `spage`
 parameter must not survive: any a16 change fails the gate); tests 118 / 118.
+
+### As written: F26b (pair order, static modules)
+
+File: `sparse_mixed_mainloop.cuh`.  Not built or run here.
+
+**Phases.**  `expand_operand`'s static branch is split into `PendingStatic {e,
+pk[6], sw[6], v[6], ok}` and three phase functions: `pending_loads<FP8>(ps, b,
+stage, t)` (= `expand_bases` + six `load_packed`), `pending_scales<FP8>(ps, b,
+t)` (six `lds32(e.sc + j * 8)`, six `scale_product`, `ok = &_j fold_ok(v_j)`
+bitwise) and `pending_body<FP8, VOTE>(prm, isK, ps, b, t)` (`__all_sync(ok)` ->
+`expand_static_arm<FP8, false / true>`; `VOTE = false` -> the exact arm alone).
+`expand_operand<VOTE>` (the two single-operand sites) runs them back to back
+with the `__syncwarp` between loads and scales - F25's instruction stream.
+
+**Loop (static modules), per pair after the spins** (`if constexpr (DYNAMIC)`
+keeps the F26a body: rows -> copies -> commit -> `finish_pending_pair` ->
+probes):
+`cp_async_wait<0>()` -> `pending_loads(PK, K.bases, pK)`, `pending_loads(PV,
+V.bases, pV)` -> `__syncwarp()` -> `pending_scales(PK)`, `pending_scales(PV)` ->
+`read_meta_row(rowK)`, `read_meta_row(rowV)`, both `scale_page_word`s -> K
+copies (`hasK`), V copies, `cp_async_fence()` -> `pending_body<.., true>(K')`,
+`pending_body<.., true>(V')` -> the two `test_wait` probes -> `fence_view_
+async_shared()` -> `producer_commit(pK)`, `producer_commit(pV)`.  One
+`__syncwarp` per pair, before any store of either operand and after every
+lane's `wait_group 0`; the K' / V' landing loads and scale words are all issued
+before the pair's first `LDGSTS`; no barrier follows a vote (the F24 `BRA.DIV`
+placement is absent by construction).  The static modules' `finish_pending_
+pair` lambda is unused (kept for the dynamic module).
+
+**Hazards (A7 / A9, restated for the order).**  Stages: this pair writes K
+stage `sK = sV + 1` and V stage `sV`; the pending pair is read from K stage
+`sV` and V stage `sV - 1` - disjoint buffers, so issuing the pending loads
+before the copies adds no RAW / WAR.  Landing loads of both operands precede
+the barrier, all stores follow it: every lane's loads of a page precede any
+lane's stores of it (A7) for both operands with one barrier.  Scale slots: lane
+b's copies of the pending stages landed at its own `wait_group 0`, the barrier
+orders them before the row's reads (A9).  The slot this pair's octet copy
+overwrites (K stage `sK`) was last read two pairs ago by every thread; the
+acquire of `sK` (consumer release after all 128 arrivals of that finish) orders
+those reads before these writes - F25's WAR argument, unchanged.  Group
+accounting: `wait_group 0` at the top of pair t waits for pair t-1's group
+only (this pair's is not yet committed) - the set F25's `wait_group 1` after
+the copies waited.
+
+**Landing cover as written.**  `LDGDEPBAR` of pair t-1 -> (K' body, V' body,
+probes, fence, arrives, loop tail, spins of pair t) -> `DEPBAR.LE SB0, 0x0`:
+the cover of 3.1 (~1600 cycles at parity); gate 6.2 `wait` is the stamp `trw -
+tr1`.  Trace buckets (the print format is unchanged; the meaning of the
+fields for the static modules is): `acq` = spins, `wait` = the `DEPBAR`,
+`barB` = loads + barrier + chains + rows, `iss` = copies to the commit, `expK`
+/ `expV` = vote + body, `fcV` = probes + fence + arrives, `fin` = bodies +
+`fcV`; `fcK`, `oth` are 0.
+
+**Registers.**  Live across the copy block: `PK.pk` 24 + `PV.pk` 24 + `sw` 12 +
+`v` 12 + `ok` 2 + rows 12 + page words 2 + bases and protocol (~50) ~= 130
+(3.10).  `ptxas -v` decides; the documented fallback moves `pending_loads(PV)`
+to after the `cp_async_fence()` (before the K' body, straight-line), nothing
+else.
+
+**Expected artifacts.**  Order row of gate 5: `@!P BRA` x 2 -> `DEPBAR.LE SB0,
+0x0` -> 24 `LDS` -> `NOP` / `WARPSYNC` -> 12 `LDS.32` -> 4 `LDS.128` + 2 `LDS.32`
+-> copies -> `LDGDEPBAR` -> `VOTE.ALL` -> arm -> `VOTE.ALL` -> arm -> 2
+`SYNCS.PHASECHK` -> `MEMBAR` + `FENCE` + 2 `SYNCS.ARRIVE`; `BRA.DIV` 0; bodies
+unchanged; up to 24 `MOV` / `IMAD.MOV` at the K arm join (the V' packed words)
+reported; tests 118 / 118; then the 6.2 trace before anything else.
