@@ -887,11 +887,12 @@ the landing cover: **the trace of 6.2 is a hard stop before any bench.**
   - both for fp8, fp4 and mixed (the dynamic module's masks through buffer 1
     and the wrap), q_len 1 and 64 (causal: with CTA_Q = 128 and qo_len 64 the
     tile count is unchanged) = 12 cases, B = 2, H = 2, tail page partial;
-  - `dynamic-uniform-extremes` fp8 and fp4 with `g = 0.5` (q = 1): six pages
-    of one format per tile through the dynamic module with the extremes
-    payload / scale set, so the 448-scale blocks fail the per-operand vote
-    while the others pass - the per-slot `@Pc` predicated exact form (3.6) is
-    taken by whole operands on both formats = 2 cases.
+  - `dynamic-uniform-extremes` fp8 with `g = 1` and fp4 with `g = 0.5` (q =
+    1): six pages of one format per tile through the dynamic module with the
+    extremes payload / scale set, so the 448-scale blocks (fp8: and 256) fail
+    the per-operand vote while the others pass - the per-slot `@Pc`
+    predicated exact form (3.6) is taken by whole operands on both formats =
+    2 cases.
   **The 14 cases are run on the F25 kernel first** (the tests commit precedes
   F26a; the F25 tip must pass 118 / 118): that is the baseline of the tests
   themselves, so that a ring / countdown / octet bug in F26a cannot pass as
@@ -1164,4 +1165,37 @@ throughout.
 
 ## 12. As written (filled per step; tests, F26a-c in this worktree, F26d not run)
 
-(filled by each step's commit)
+### As written: tests (`tests/attention/run_fa3_mixed_page_transport.py`)
+
+Not run in this worktree (no GPU; review by reading).  Two helpers and 14
+cases appended to `main()` after the F25 matrix (exit code = failures; the
+plain runner, no test framework):
+
+- `_run_multi_chunk(mode, q_len, pages_per_req, kv_len, tiles)`: B = 2 items
+  x H = 2 KV heads, one request per item of `pages_per_req` pages and `kv_len`
+  tokens (partial tail page; both facts asserted in the helper: `(kv_len +
+  95) // 96 == tiles`, `(pages_per_req - 1) x 16 < kv_len <= pages_per_req x
+  16`), static fp8 / fp4 module or the dynamic module on the `mixed` cycle
+  (page formats 0, 1, 2 repeating, so every tile carries 2 / 2 / 2), against
+  the a16 module on the expanded reference, `torch.equal`.  Cases: (193 pages,
+  3085 tokens, 33 tiles) and (130 pages, 2075 tokens, 22 tiles) x {fp8, fp4,
+  mixed} x {q = 1, q = 64 causal} = 12.  In tiles (CTA_KV = 96, chunk = 16
+  tiles, ring = 32 rows): 33 tiles = entries 0..32 -> chunk 0 (rows 0-15),
+  chunk 1 (rows 16-31 = buffer 1), entry 32 -> row 0 (the wrap; the pair with
+  V at entry 31 reads its K row at row 0), gathers at entries 0 / 16, stores +
+  `BAR.SYNC` at 8 / 24, countdown 0 at 32; 22 tiles = entries 0..21 -> buffer 1
+  rows 16-21 without a wrap, one gather / store, countdown 0 at 16.  For q =
+  64 the causal tile count is unchanged (CTA_Q = 128 >= qo_len).
+- `_run_dynamic_uniform(mode, q_len, extremes_gs=None)`: the F25 helper with an
+  optional extremes transport (`_extreme_transport(..., gs)`); cases (fp8, g =
+  1) and (fp4, g = 0.5) at q = 1, 18 pages (3 tiles), so that within one
+  operand some warps' votes fail (448 / 256 scales at g = 1 for fp8; 448 x 0.5
+  for fp4) and others pass while every slot of every tile runs that format's
+  body: the per-slot predicated exact form of F26c is exercised on whole
+  operands of both formats; on the F25 kernel it exercises the rolled cold
+  loop the same way.
+
+Total 118 cases (104 + 14).  **Order of running on nkcut2 (F26d): this commit
+first, against the F25 kernel it ships with (expected 118 / 118: the F25
+`entry / 16`, `entry % 16` addressing is the reference for the ring), then
+F26a, F26b, F26c.**
