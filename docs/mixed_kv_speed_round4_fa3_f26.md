@@ -1199,3 +1199,91 @@ Total 118 cases (104 + 14).  **Order of running on nkcut2 (F26d): this commit
 first, against the F25 kernel it ships with (expected 118 / 118: the F25
 `entry / 16`, `entry % 16` addressing is the reference for the ring), then
 F26a, F26b, F26c.**
+
+### As written: F26a (copies and protocol; F25's order within the pair kept)
+
+File: `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh` only
+(`kernel_traits.cuh`, `prefill_sm90.cuh`, the shared Hopper files and the host
+Python untouched; `Params` unchanged).  Not built or run in this worktree
+(review by reading; the remote gates are F26d's).
+
+**Copy address form (3.2).**  `OperandBases::{p8, s8, p4, s4}` are `uint8_t
+const*`; `compressed_base(ptr, strides, head, row, blk_off)` casts the span
+pointer to `DTypeKV const*` and adds `int64_t(head) * (hs >> 1) + int64_t(row) *
+(ts >> 1) + (blk_off >> 1)` elements - the `make_bases` a16 line shape - then
+casts back; `page_src(base, page, ps)` is `base + uint64_t(page) * uint64_t(ps)`
+(the `copy_a16_page` line).  The two asm `mad.wide.u32` helpers are gone.  The
+host adds an explicit even-stride check for the four token / head strides
+(`to_underlying_arguments`).  What the SASS should show if the a16 mechanism
+carries over: `LEA` / `LEA.HI.X` once per base in the item prologue and
+`IMAD.WIDE.U32 Rd, Rpage, UR, Rbase.64` + `LDGSTS` per copy in the loop; gate 5
+reports the form either way.
+
+**Scale slots and the lane-octet copy (3.3).**  `SCALE_SLOT_BYTES = 8`,
+`SCALE_ROW_STRIDE = 48`; `make_bases` sets `sc_rd = sc_base + r * 48 + 4 (k >>
+2)` (word of page 0; page j at `+ j * 8`, the `PagePos::sc_off` immediates of
+both `static_page` and `dynamic_page`) and `sc_cp = sc_base + r * 48 + k * 8`
+(the slot lane k copies).  `copy_compressed_page` and `copy_dynamic_page` copy
+payload only; `copy_scale_rows<FP8, FULL>(b, spage, stage, valid, t)` issues
+`cp8_pred(sc_cp + stage * SCALE_STAGE, page_src(s8 / s4, spage, sts), k < 6, n)`
+with `n = 8` (FULL) or `16 k + r < valid ? 8 : 0` (partial arm, D4);
+`copy_scale_rows_dyn<FULL>` issues two such copies with the lane's `m8` / `m4`
+bits of `w7` as predicates.  `spage = scale_page_word(m, t)` = `lds32(m.row + 4
+k)` is read by the caller (`issue_operand` for the two per-item calls; the loop
+reads both operands' words right after the four `LDS.128`) so that the pair's
+`LDS` all precede its first `LDGSTS`; `TileRegs` gained the row's smem address
+(`row`, set by `read_meta` and `read_meta_row`).  `SCALE_STAGE_BYTES` and the
+shared storage are unchanged (768 of 3072 B per stage used).
+
+**Protocol (3.4).**  `read_meta_row(row_smem)` (two `lds128`), `META_ROW_BYTES
+= 32`, `META_RING_MASK = 0x3FF`, `META_J_MASK = 0x1E0`.  `load()` keeps the F25
+text for K(last) alone, `finish_one(K)`, Q, `barrier_O.wait`, the peel
+(`pair_step(kv_tile_idx, Full, Partial)`: blocking acquires, entry-0 gather,
+`read_meta` by entry, PARTIAL V) and - for the a16 module only, under `if
+constexpr (STATIC_A16)` - the whole F25 loop and drain, byte-identical.  The
+compressed modules run a new loop (`t = kv_tile_idx - 1 .. swa_begin`): state
+`(sV, phV)` from `smem_pipe_write_v` after the peel, `oV = 32` (entry 1),
+`chunks_left = num_chunks - 1`, `okK = okV = false`; per pair: `jrow = oV &
+0x1E0`; `jrow == 0` -> `--chunks_left`, gather chunk `num_chunks - chunks_left`
+if `chunks_left > 0`; `jrow == 0x100 && chunks_left > 0` -> store + group
+barrier; `sK = sV + 1 mod 3`, `phK = phV ^ (sV == 2)`, `pK = sV`, `pV = sV - 1
+mod 3`; `if (hasK && !okK) producer_acquire(PipelineState(sK, phK, 0))`, `if
+(!okV) producer_acquire(...)`; `rowV = meta_base + oV`, `rowK = meta_base + ((oV
++ 32) & 0x3FF)`, both rows and both page words read, K copies (if `hasK`) and V
+copies (`issue_loop`: `issue_tile_copies<true>`; the dynamic module also sets
+`staged` / commits A16-only tiles as F25), `cp_async_fence`; `finish_loop(pK,
+pV)`: static = `wait_group 1`, `expand_operand<true>` for K' then V' by stage,
+fence, `producer_commit(PipelineState(pK / pV, 0, 0))` (no pending words);
+dynamic = F25's `finish_pending_pair` + `rotate_pending`; then `okK =
+pipeline_k.empty_barrier_[sK + 1 mod 3].test_wait(phase)`, `okV =
+pipeline_v.empty_barrier_[sK].test_wait(phK)` (non-blocking
+`mbarrier.test_wait`; the next pair's V stage is this pair's `sK`); `sV = sK`,
+`phV = phK`, `oV = (oV + 32) & 0x3FF`.  After the loop both `PipelineState`s are
+written back equal (`index sV`, `phase phV`, count advanced by the loop's pair
+count - both rings advanced `num_kv_tiles` times per item); the drain is
+`finish_one_stage(V, sV - 1 mod 3)` (static) or `finish_one(V)` (dynamic).
+The trace stamps of `MIXED_FA3_TRACE` are kept at the same points (acq = the
+two spins, iss = rows + copies, fin = the finish, plus the gather / store
+buckets).
+
+**Bit-exactness argument.**  Copy sources: `span + head * hs + row * ts +
+blk_off + page * ps` in bytes, identical to F25's by construction (the halving
+is exact by the alignment checks).  Scale slots: lane k copies page k's row r to
+`r * 48 + k * 8`; reader (r, kk) of page j reads `r * 48 + j * 8 + 4 (kk >> 2)`
+- the same word F25 read at `j * 512 + r * 8 + 4 (kk >> 2)`; partial rows past
+`valid` zero-filled as before (src-size 0).  Stages: the K stage of every loop
+pair equals what F25's `++state` would have produced (K advanced at K(last), the
+peel and every `hasK` pair; V at the peel and every pair), the pending stages
+are the previous pair's, the empty-barrier phases are the same the
+`PipelineState` would carry.  Chunk table: entry e's row is row `e & 31`
+(`TileMeta` 32 B, `meta[2][16]` contiguous); the gather / store cadence is
+F25's (entries 16 c / 16 c + 8 of every chunk that has a successor).  Group
+accounting: `wait_group 1` after this pair's commit = the previous pair's group
+landed (F25).
+
+**Expected artifacts (gate 5).**  fp8 loop site: 28 `LDGSTS` per pair (24
+`.128` + 2 `@P .64`), 28 `IMAD.WIDE.U32` (form reported), 2 `LDS.32` next to the
+4 `LDS.128`, 3 fillers, `SHF.R.S32.HI` / `LEA.HI` division chains 0, 2
+`SYNCS.PHASECHK` (test) after the commits; region <= 2450 (fp8) / 2550 (fp4);
+a16 SASS identical to F25's (`read_meta`'s dead `cvta` and the unused `spage`
+parameter must not survive: any a16 change fails the gate); tests 118 / 118.
