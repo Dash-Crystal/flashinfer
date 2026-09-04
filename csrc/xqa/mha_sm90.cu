@@ -121,6 +121,10 @@ constexpr uint32_t nbIOThrds = warp_size * nbIOWarps;
 #endif
 constexpr uint32_t mixedLoadWarpsPerOperand = 1;
 constexpr uint32_t convertWarpsPerOperand = gmmaWarpsPerGrp;
+// Under a static compressed format no page of the stream is A16 (slots past the
+// sequence end are zero-filled by the converters), so the load warps issue no
+// TMA and take no part in the stage's `produced` barrier.
+constexpr bool mixedLoaderTma = !(MIXED_PAGE_STATIC_FORMAT == 1 || MIXED_PAGE_STATIC_FORMAT == 2);
 #if ENABLE_MIXED_KV_CACHE
 // Page-format tag recorded in shared memory for tile slots past the end of the
 // sequence: the loader issues nothing for them and the converters zero-fill.
@@ -292,8 +296,6 @@ struct alignas(128) SharedMem {
   Vec<KVCachePageIndex, nbPagesPerTile> pages[2];  // one for K and one for V
 #if ENABLE_MIXED_KV_CACHE
   MixedPageFormats<nbPagesPerTile> pageFormats[2];
-  MixedPageFormats<nbPagesPerTile> kFormats[nbKBuf];
-  MixedPageFormats<nbPagesPerTile> vFormats[nbVBuf];
   // Compressed pages are delivered by TMA into dense per-page slots (one
   // 16-token slot per page, sized for the E4M3 part row; E2M1 uses the first
   // half of each row).  Converter warps expand them into k[]/vBuf(); A16 pages
@@ -344,10 +346,12 @@ struct alignas(128) SharedMem {
   CtaBarrierPair kBar[nbKBuf];
   CtaBarrierPair vBar[nbVBuf];
 #if ENABLE_MIXED_KV_CACHE
-  CtaBarrier kLoadReady[nbKBuf];
-  CtaBarrier vLoadReady[nbVBuf];
-  CtaBarrier kPagesReady;
-  CtaBarrier vPagesReady;
+  // One per metadata chunk per operand (count = the load warp): the loader
+  // arrives after each fill of the chunk, the converter warps wait once per
+  // chunk (at the first tile whose metadata lives in it) before reading page
+  // indices and tags from it.  Fill f of a chunk completes phase f.
+  CtaBarrier kMetaReady[nbMetaChunks];
+  CtaBarrier vMetaReady[nbMetaChunks];
 #endif
 #if !SWAP_AB
   CtaBarrierPair vtBar[nbVBuf];
@@ -406,10 +410,10 @@ struct F16QToF8Converter {
 
 #if ENABLE_MIXED_KV_CACHE
 template <typename PartBuf>
-__device__ __forceinline__ void expandPackedStage(
-    PartBuf* parts, SharedMem::TileScales const& scales,
-    MixedPageFormats<SharedMem::nbPagesPerTile> const& formats, float fp8GlobalScale,
-    float fp4GlobalScale, uint32_t idxWarp, uint32_t namedBarrierId);
+__device__ __forceinline__ void expandPackedStage(PartBuf* parts,
+                                                  SharedMem::TileScales const& scales,
+                                                  uint8_t tag, float fp8GlobalScale,
+                                                  float fp4GlobalScale, uint32_t idxWarp);
 #endif
 
 struct KVTilePartLoader {
@@ -496,7 +500,7 @@ struct KVTilePartLoader {
 #if ENABLE_MIXED_KV_CACHE
 __device__ __forceinline__ KVTilePartLoader::PagePrefetch readMixedTileMeta(
     SharedMem const& smem, uint32_t operand, uint32_t idxIter);
-__device__ __forceinline__ void issueCompressedPageCopies(
+__device__ __forceinline__ uint32_t issueCompressedPageCopies(
     KVCacheList<usePagedKVCache> const& cacheList, bool isK, uint32_t idxHeadGrp,
     SharedMem const& smem, uint32_t operand, uint32_t idxIter, SharedMem::PackedTile& dstPacked,
     SharedMem::TileScales& dstScales, uint32_t idxWarp);
@@ -1202,30 +1206,32 @@ __launch_bounds__(128 * ctaWarpGroups)
   constexpr uint32_t nbXBarWarps = SharedMem::nbXBuf;
   constexpr uint32_t nbBuffers = nbKBarWarps + nbVBarWarps + nbXBarWarps;
   static_assert(nbBuffers < nbWarps);
+  // Mixed build: a stage's `produced` phase completes when the GEMM group has
+  // arrived (arrive_and_wait), every converter lane has arrived after its
+  // in-place expansion, and - in builds where the load warp issues A16 TMA -
+  // the load warp has arrived (expect_tx + 32) and the TMA bytes have landed.
+  // One wait in the GEMM group therefore covers TMA landing and expansion.
+  constexpr uint32_t mixedProducedExtra =
+      ENABLE_MIXED_KV_CACHE
+          ? convertWarpsPerOperand * warp_size +
+                (mixedLoaderTma ? mixedLoadWarpsPerOperand * warp_size : 0)
+          : 0;
   if (wid < nbKBarWarps) {
     if (warpElectSync()) {
       smem.kBar[wid].initialize(
-          gemm0NbThrds + (ENABLE_MIXED_KV_CACHE ? convertWarpsPerOperand * warp_size : 0),
+          gemm0NbThrds + mixedProducedExtra,
           gemm0NbThrds +
               (ENABLE_MIXED_KV_CACHE ? mixedLoadWarpsPerOperand * warp_size
                                      : warp_size));
-#if ENABLE_MIXED_KV_CACHE
-      init(&smem.kLoadReady[wid],
-           (convertWarpsPerOperand + mixedLoadWarpsPerOperand) * warp_size + 1);
-#endif
     }
   } else if (wid < nbKBarWarps + nbVBarWarps) {
     uint32_t const i = wid - nbKBarWarps;
     if (warpElectSync()) {
       smem.vBar[i].initialize(
-          gemm1NbThrds + (ENABLE_MIXED_KV_CACHE ? convertWarpsPerOperand * warp_size : 0),
+          gemm1NbThrds + mixedProducedExtra,
           gemm1NbThrds +
               (ENABLE_MIXED_KV_CACHE ? mixedLoadWarpsPerOperand * warp_size
                                      : warp_size));
-#if ENABLE_MIXED_KV_CACHE
-      init(&smem.vLoadReady[i],
-           (convertWarpsPerOperand + mixedLoadWarpsPerOperand) * warp_size + 1);
-#endif
 #if !SWAP_AB
       smem.vtBar[i].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
 #endif
@@ -1241,8 +1247,11 @@ __launch_bounds__(128 * ctaWarpGroups)
       init(&smem.gemm0WarpGrpBar, gemm0NbThrds);
       init(&smem.gemm1WarpGrpBar, gemm1NbThrds);
 #if ENABLE_MIXED_KV_CACHE
-      init(&smem.kPagesReady, mixedLoadWarpsPerOperand * warp_size);
-      init(&smem.vPagesReady, mixedLoadWarpsPerOperand * warp_size);
+#pragma unroll
+      for (uint32_t c = 0; c < SharedMem::nbMetaChunks; c++) {
+        init(&smem.kMetaReady[c], mixedLoadWarpsPerOperand * warp_size);
+        init(&smem.vMetaReady[c], mixedLoadWarpsPerOperand * warp_size);
+      }
 #endif
     }
   }
@@ -1867,51 +1876,64 @@ __launch_bounds__(128 * ctaWarpGroups)
       // stage.  Page metadata comes from a shared-memory chunk refilled once
       // per metaChunkTiles tiles, so nothing here waits on DRAM per tile.
       constexpr uint32_t kMeta = 0;
+      // Each chunk fill is published to the converter warps through the
+      // chunk's ready barrier (release by the whole warp's arrive).
       kTilePartLoader.fillTileMeta(smem, kMeta, 0, nbIters, idxKTileInit, nbSubSeq);
+      unused(smem.kMetaReady[0].arrive());
       if (nbIters > SharedMem::metaChunkTiles) {
         kTilePartLoader.fillTileMeta(smem, kMeta, SharedMem::metaChunkTiles, nbIters,
                                      idxKTileInit, nbSubSeq);
+        unused(smem.kMetaReady[1].arrive());
       }
-      // The first two metadata chunks are complete: the converter warps may read
-      // page lists from here on (they copy the compressed pages themselves).
-      unused(smem.kPagesReady.arrive());
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxKTile = idxKTileInit + idxIter * nbSubSeq;
         uint32_t const idxKStage = idxIter % SharedMem::nbKBuf;
-        kTilePartLoader.publishPages(kTilePartLoader.readTileMeta(smem, kMeta, idxIter), idxKTile);
+        if constexpr (mixedLoaderTma) {
+          kTilePartLoader.publishPages(kTilePartLoader.readTileMeta(smem, kMeta, idxIter),
+                                       idxKTile);
+        }
+        // The stage is free (gemm0 released tile idxIter - nbKBuf).  This wait
+        // also orders the metadata chunk refill below after every converter
+        // read of the chunk's previous contents (converters read tile t's
+        // entry before producing tile t - kAhead, which gemm0 consumed).
         smem.kBar[idxKStage].consumed.arrive_and_wait();
 #if MIXED_KV_TRACE < 3
         TRACE_STAMP(8, idxIter, true);
 #endif
-        if (warpElectSync()) {
-          smem.kFormats[idxKStage] = kTilePartLoader.formats;
-          uint32_t txBytes = 0;
+        if constexpr (mixedLoaderTma) {
+          if (warpElectSync()) {
+            uint32_t txBytes = 0;
 #pragma unroll
-          for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-            txBytes += kTilePartLoader.packedPartTxBytes(idxPart);
-          }
-          arrive_tx(smem.kLoadReady[idxKStage], txBytes);
+            for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
+              txBytes += kTilePartLoader.packedPartTxBytes(idxPart);
+            }
+            // The A16 rows' transaction bytes and the load warp's 32 arrivals go
+            // straight onto the stage's produced barrier; the expect_tx precedes
+            // the boxes so the phase cannot complete before the bytes land.
+            arrive_tx(smem.kBar[idxKStage].produced, txBytes,
+                      mixedLoadWarpsPerOperand * warp_size);
 #pragma unroll
-          for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-            kTilePartLoader.issuePackedPartLoad(
-                smem.k[idxKStage * cacheHeadNbParts + idxPart],
-                reinterpret_cast<SharedMem::PackedTile&>(
-                    smem.k[idxKStage * cacheHeadNbParts + cacheHeadNbParts - 1]),
-                idxPart, tensorMapFP8K, tensorMapFP4K, smem.kLoadReady[idxKStage]);
+            for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
+              kTilePartLoader.issuePackedPartLoad(
+                  smem.k[idxKStage * cacheHeadNbParts + idxPart],
+                  reinterpret_cast<SharedMem::PackedTile&>(
+                      smem.k[idxKStage * cacheHeadNbParts + cacheHeadNbParts - 1]),
+                  idxPart, tensorMapFP8K, tensorMapFP4K, smem.kBar[idxKStage].produced);
+            }
           }
+          __syncwarp();
         }
-        __syncwarp();
         {
           // Metadata chunk for tiles [ahead, ahead + 16) is filled two tiles
-          // before its first use; the converters read tile t+1's entry after
-          // this iteration's kLoadReady arrive, which orders the fill.
+          // before its first use and published on the chunk's ready barrier.
           uint32_t const ahead = idxIter + 2;
           if (ahead < nbIters && ahead % SharedMem::metaChunkTiles == 0 &&
               ahead >= 2 * SharedMem::metaChunkTiles) {
             kTilePartLoader.fillTileMeta(smem, kMeta, ahead, nbIters, idxKTileInit, nbSubSeq);
+            unused(smem.kMetaReady[(ahead / SharedMem::metaChunkTiles) % SharedMem::nbMetaChunks]
+                       .arrive());
           }
         }
-        unused(smem.kLoadReady[idxKStage].arrive());
 #if MIXED_KV_TRACE < 3
         TRACE_STAMP(9, idxIter, true);
 #endif
@@ -1991,44 +2013,50 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if ENABLE_MIXED_KV_CACHE
       constexpr uint32_t vMeta = 1;
       vTileLoader.fillTileMeta(smem, vMeta, 0, nbIters, idxVTileInit, nbSubSeq);
+      unused(smem.vMetaReady[0].arrive());
       if (nbIters > SharedMem::metaChunkTiles) {
         vTileLoader.fillTileMeta(smem, vMeta, SharedMem::metaChunkTiles, nbIters, idxVTileInit,
                                  nbSubSeq);
+        unused(smem.vMetaReady[1].arrive());
       }
-      unused(smem.vPagesReady.arrive());
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
         uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
-        vTileLoader.publishPages(vTileLoader.readTileMeta(smem, vMeta, idxIter), idxVTile);
+        if constexpr (mixedLoaderTma) {
+          vTileLoader.publishPages(vTileLoader.readTileMeta(smem, vMeta, idxIter), idxVTile);
+        }
         smem.vBar[idxVBuf].consumed.arrive_and_wait();
 #if MIXED_KV_TRACE < 2
         TRACE_STAMP(10, idxIter, true);
 #endif
-        if (warpElectSync()) {
-          smem.vFormats[idxVBuf] = vTileLoader.formats;
-          uint32_t txBytes = 0;
+        if constexpr (mixedLoaderTma) {
+          if (warpElectSync()) {
+            uint32_t txBytes = 0;
 #pragma unroll
-          for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-            txBytes += vTileLoader.packedPartTxBytes(idxPart);
-          }
-          arrive_tx(smem.vLoadReady[idxVBuf], txBytes);
+            for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
+              txBytes += vTileLoader.packedPartTxBytes(idxPart);
+            }
+            arrive_tx(smem.vBar[idxVBuf].produced, txBytes, mixedLoadWarpsPerOperand * warp_size);
 #pragma unroll
-          for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
-            vTileLoader.issuePackedPartLoad(
-                smem.vBuf(idxVBuf)[idxPart],
-                reinterpret_cast<SharedMem::PackedTile&>(smem.vBuf(idxVBuf)[cacheHeadNbParts - 1]),
-                idxPart, tensorMapFP8V, tensorMapFP4V, smem.vLoadReady[idxVBuf]);
+            for (uint32_t idxPart = 0; idxPart < cacheHeadNbParts; idxPart++) {
+              vTileLoader.issuePackedPartLoad(
+                  smem.vBuf(idxVBuf)[idxPart],
+                  reinterpret_cast<SharedMem::PackedTile&>(
+                      smem.vBuf(idxVBuf)[cacheHeadNbParts - 1]),
+                  idxPart, tensorMapFP8V, tensorMapFP4V, smem.vBar[idxVBuf].produced);
+            }
           }
+          __syncwarp();
         }
-        __syncwarp();
         {
           uint32_t const ahead = idxIter + 2;
           if (ahead < nbIters && ahead % SharedMem::metaChunkTiles == 0 &&
               ahead >= 2 * SharedMem::metaChunkTiles) {
             vTileLoader.fillTileMeta(smem, vMeta, ahead, nbIters, idxVTileInit, nbSubSeq);
+            unused(smem.vMetaReady[(ahead / SharedMem::metaChunkTiles) % SharedMem::nbMetaChunks]
+                       .arrive());
           }
         }
-        unused(smem.vLoadReady[idxVBuf].arrive());
 #if MIXED_KV_TRACE < 2
         TRACE_STAMP(11, idxIter, true);
 #endif
@@ -2103,20 +2131,31 @@ __launch_bounds__(128 * ctaWarpGroups)
     // one being expanded); landing latency under a saturated memory system is
     // ~2 us, more than one consumer tile, so two ahead with three stages.
     constexpr uint32_t kAhead = SharedMem::nbKBuf - 1;
-    auto issueKCopies = [&](uint32_t t) {
+    // This warp's page tag for tiles t .. t+kAhead-1, one byte each (byte 0 =
+    // tile t): read from the metadata chunk when the tile's copies are issued,
+    // consumed kAhead tiles later by the expansion.  No per-tile rendezvous
+    // with the load warp: the A16 rows it fetches by TMA land in other pages'
+    // rows and are tracked by the stage's produced barrier directly.
+    uint32_t kTags = 0;
+    auto issueKCopies = [&](uint32_t t) -> uint32_t {
       uint32_t const stage = t % SharedMem::nbKBuf;
+      if (t % SharedMem::metaChunkTiles == 0) {
+        // First tile of a metadata chunk: wait for the loader's fill of it
+        // (fill f of the chunk completes phase f).
+        smem.kMetaReady[(t / SharedMem::metaChunkTiles) % SharedMem::nbMetaChunks].wait_parity(
+            toParity<1>(t / (SharedMem::metaChunkTiles * SharedMem::nbMetaChunks)));
+      }
       // Wait (do not arrive) for gemm0's release of this stage's previous tile:
       // the (t / nbKBuf)-th completion of consumed[stage].
       smem.kBar[stage].consumed.wait_parity(toParity<SharedMem::nbKBuf>(t));
-      issueCompressedPageCopies(
+      return issueCompressedPageCopies(
           cacheList, /*isK=*/true, idxHeadGrp, smem, kMeta, t,
           reinterpret_cast<SharedMem::PackedTile&>(smem.k[stage * cacheHeadNbParts + cacheHeadNbParts - 1]),
           smem.kScales[t % SharedMem::nbScaleTiles], warpIdx.x);
     };
-    smem.kPagesReady.wait_parity(false);  // metadata chunks published by the loader
 #pragma unroll
     for (uint32_t t = 0; t < kAhead; ++t) {
-      if (t < nbIters) issueKCopies(t);
+      if (t < nbIters) kTags |= issueKCopies(t) << (8 * t);
       ldgsts::commitGroup();
     }
     for (uint32_t idxIter = 0; idxIter < nbIters; ++idxIter) {
@@ -2126,18 +2165,23 @@ __launch_bounds__(128 * ctaWarpGroups)
 #if MIXED_KV_TRACE >= 2
       TRACE_STAMP(11, idxIter, warpIdx.x == 0);  // K converter: tile idxIter landed
 #endif
-      smem.kLoadReady[idxKStage].arrive_and_wait();  // A16 rows landed, kFormats published
-      TRACE_STAMP(12, idxIter, warpIdx.x == 0);
+      TRACE_STAMP(12, idxIter, warpIdx.x == 0);  // K converter: ready (no rendezvous)
       expandPackedStage(&smem.k[idxKStage * cacheHeadNbParts],
-                        smem.kScales[idxIter % SharedMem::nbScaleTiles], smem.kFormats[idxKStage],
-                        fp8KGlobalScale, fp4KGlobalScale, warpIdx.x, /*namedBarrierId=*/1);
+                        smem.kScales[idxIter % SharedMem::nbScaleTiles],
+                        static_cast<uint8_t>(kTags & 0xFFU), fp8KGlobalScale, fp4KGlobalScale,
+                        warpIdx.x);
       TRACE_STAMP(13, idxIter, warpIdx.x == 0);
       asm volatile("fence.proxy.async.shared::cta;\n");
       unused(smem.kBar[idxKStage].produced.arrive());
 #if MIXED_KV_TRACE >= 3
       TRACE_STAMP(8, idxIter, warpIdx.x == 0);  // K converter: fenced + produced
 #endif
-      if (idxIter + kAhead < nbIters) issueKCopies(idxIter + kAhead);
+      // Rotate: byte 0 <- tile idxIter+1; the tag of tile idxIter+kAhead, read
+      // while issuing its copies, goes into byte kAhead-1.
+      kTags >>= 8;
+      if (idxIter + kAhead < nbIters) {
+        kTags |= issueKCopies(idxIter + kAhead) << (8 * (kAhead - 1));
+      }
 #if MIXED_KV_TRACE >= 3
       TRACE_STAMP(9, idxIter, warpIdx.x == 0);  // K converter: copies for t+2 issued (before commit)
 #endif
@@ -2158,33 +2202,39 @@ __launch_bounds__(128 * ctaWarpGroups)
              .v_global_scale;
     constexpr uint32_t vMeta = 1;
     constexpr uint32_t vAhead = SharedMem::nbVBuf - 1;
-    auto issueVCopies = [&](uint32_t t) {
+    uint32_t vTags = 0;
+    auto issueVCopies = [&](uint32_t t) -> uint32_t {
       uint32_t const buf = t % SharedMem::nbVBuf;
+      if (t % SharedMem::metaChunkTiles == 0) {
+        smem.vMetaReady[(t / SharedMem::metaChunkTiles) % SharedMem::nbMetaChunks].wait_parity(
+            toParity<1>(t / (SharedMem::metaChunkTiles * SharedMem::nbMetaChunks)));
+      }
       smem.vBar[buf].consumed.wait_parity(toParity<SharedMem::nbVBuf>(t));
-      issueCompressedPageCopies(
+      return issueCompressedPageCopies(
           cacheList, /*isK=*/false, idxHeadGrp, smem, vMeta, t,
           reinterpret_cast<SharedMem::PackedTile&>(smem.vBuf(buf)[cacheHeadNbParts - 1]),
           smem.vScales[t % SharedMem::nbScaleTiles], warpIdx.x);
     };
-    smem.vPagesReady.wait_parity(false);
 #pragma unroll
     for (uint32_t t = 0; t < vAhead; ++t) {
-      if (t < nbIters) issueVCopies(t);
+      if (t < nbIters) vTags |= issueVCopies(t) << (8 * t);
       ldgsts::commitGroup();
     }
     for (uint32_t idxIter = 0; idxIter < nbIters; ++idxIter) {
       uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
       ldgsts::waitGroup<vAhead - 1>();
       __syncwarp();
-      smem.vLoadReady[idxVBuf].arrive_and_wait();
       TRACE_STAMP(14, idxIter, warpIdx.x == 0);
       expandPackedStage(&smem.vBuf(idxVBuf)[0], smem.vScales[idxIter % SharedMem::nbScaleTiles],
-                        smem.vFormats[idxVBuf], fp8VGlobalScale, fp4VGlobalScale, warpIdx.x,
-                        /*namedBarrierId=*/2);
+                        static_cast<uint8_t>(vTags & 0xFFU), fp8VGlobalScale, fp4VGlobalScale,
+                        warpIdx.x);
       asm volatile("fence.proxy.async.shared::cta;\n");
       unused(smem.vBar[idxVBuf].produced.arrive());
       TRACE_STAMP(15, idxIter, warpIdx.x == 0);
-      if (idxIter + vAhead < nbIters) issueVCopies(idxIter + vAhead);
+      vTags >>= 8;
+      if (idxIter + vAhead < nbIters) {
+        vTags |= issueVCopies(idxIter + vAhead) << (8 * (vAhead - 1));
+      }
       ldgsts::commitGroup();
     }
 #endif
@@ -2564,7 +2614,9 @@ __device__ __forceinline__ KVTilePartLoader::PagePrefetch readMixedTileMeta(
 // per tile the only variable is the page (one multiply-add).  One cp.async
 // group per tile is committed by the caller.  Issue budget (C6): ~30
 // instructions per lane per tile.
-__device__ __forceinline__ void issueCompressedPageCopies(
+// Returns this warp's page tag for the tile (kMixedBadPageFormat, kA16, or the
+// compressed format), which the caller keeps for the tile's expansion.
+__device__ __forceinline__ uint32_t issueCompressedPageCopies(
     KVCacheList<usePagedKVCache> const& cacheList, bool isK, uint32_t idxHeadGrp,
     SharedMem const& smem, uint32_t operand, uint32_t idxIter, SharedMem::PackedTile& dstPacked,
     SharedMem::TileScales& dstScales, uint32_t idxWarp) {
@@ -2572,9 +2624,6 @@ __device__ __forceinline__ void issueCompressedPageCopies(
   static_assert(SharedMem::nbPagesPerTile == convertWarpsPerOperand, "one converter warp per page");
   static_assert(tokensPerPage == 16 && SharedMem::packedRowBytesFP8 == 128 &&
                 SharedMem::packedRowBytesFP4 == 64 && SharedMem::scaleBytesPerToken == 8);
-  if constexpr (MIXED_KV_EXPERIMENT & 2) {
-    return;
-  }
   // This warp's page and tag only.
   uint32_t const chunk = (idxIter / SharedMem::metaChunkTiles) % SharedMem::nbMetaChunks;
   uint32_t const entry = idxIter % SharedMem::metaChunkTiles;
@@ -2585,8 +2634,11 @@ __device__ __forceinline__ void issueCompressedPageCopies(
 #else
   uint8_t const format = tagged;
 #endif
+  if constexpr (MIXED_KV_EXPERIMENT & 2) {
+    return format;
+  }
   if (format == kMixedBadPageFormat || format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-    return;
+    return format;
   }
   uint32_t const page = static_cast<uint32_t>(smem.metaPages[operand][chunk][entry][idxWarp]);
   bool const isFP8 = format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
@@ -2630,6 +2682,7 @@ __device__ __forceinline__ void issueCompressedPageCopies(
       ldgsts::copyAsync<8>(&dstScales[idxWarp * tokensPerPage + lane][0], src, 8);
     }
   }
+  return format;
 }
 
 __device__ __forceinline__ uint8_t mixedTilePageFormat(
@@ -2760,10 +2813,10 @@ __device__ __forceinline__ void KVTilePartLoader::loadPackedScalesFrom(
 // likewise.  Because the last part's A16 rows overwrite the packed rows,
 // every read precedes a named barrier and every write follows it.
 template <typename PartBuf>
-__device__ __forceinline__ void expandPackedStage(
-    PartBuf* parts, SharedMem::TileScales const& scales,
-    MixedPageFormats<SharedMem::nbPagesPerTile> const& formats, float fp8GlobalScale,
-    float fp4GlobalScale, uint32_t idxWarp, uint32_t namedBarrierId) {
+__device__ __forceinline__ void expandPackedStage(PartBuf* parts,
+                                                  SharedMem::TileScales const& scales,
+                                                  uint8_t tag, float fp8GlobalScale,
+                                                  float fp4GlobalScale, uint32_t idxWarp) {
   using flashinfer::KVPageFormat;
   constexpr uint32_t blocksPerPart = exactDiv(cacheHeadPartElems, 16);
   constexpr uint32_t nbThreads = convertWarpsPerOperand * warp_size;
@@ -2780,7 +2833,16 @@ __device__ __forceinline__ void expandPackedStage(
   uint32_t const p = tid % cacheHeadNbParts;
   uint32_t const idxPage = token / tokensPerPage;
   uint32_t const tokenInPage = token % tokensPerPage;
-  uint8_t const format = mixedTilePageFormat(formats, idxPage);
+  // `tag` is this warp's page tag (warp-uniform).  Under a static format the
+  // only runtime information in it is "past the sequence end"; re-deriving the
+  // format here keeps the FP8/FP4 branches compile-time for static builds.
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+  uint8_t const format = tag == kMixedBadPageFormat
+                             ? kMixedBadPageFormat
+                             : static_cast<uint8_t>(MIXED_PAGE_STATIC_FORMAT);
+#else
+  uint8_t const format = tag;
+#endif
   bool const isFP8 = format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
   bool const isFP4 = format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4);
 
@@ -2812,7 +2874,6 @@ __device__ __forceinline__ void expandPackedStage(
   // Every packed read precedes every in-place write.  A warp covers exactly
   // one page's (token, part) lanes (static_assert above), so the hazard is
   // intra-warp and a warp sync suffices.
-  (void)namedBarrierId;
   (void)nbThreads;
   __syncwarp();
   if constexpr (MIXED_KV_EXPERIMENT & 1) {
