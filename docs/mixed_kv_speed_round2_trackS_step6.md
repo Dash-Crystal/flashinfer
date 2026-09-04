@@ -238,17 +238,22 @@ reorder; not part of this step).
 `expandMixedPartialHeadsInPlace` (`mhaUtils.cuh:813-917`) is left byte-for-byte as it is; a
 second helper with the new body is selected at the two call sites by a template bool.
 
-- **Guard (rev 2).**  `mha.cu` defines `kMixedOwnerCutExpansion = kCompactTileLoops &&
-  is_same<InputElem, __nv_bfloat16> && !grpLoadV && !compactMixedPages`, i.e. derived from the
-  step-5 predicate `__CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM == 5 && SPEC_DEC && M_TILESIZE == 16`
-  (`mha.cu:147-169`, `MIXED_COMPACT_TILE_LOOPS`) plus the bf16 requirement of the placement
-  decode; a bare `__CUDA_ARCH__ == 900 && !INPUT_FP16` (rev 1) would have handed the new cut to
-  the other sm90 `mha.cu` instantiations (64 B parts, `cacheVTileSeqLen 64`, `grpLoadV` V paths
-  with `headsPerWarp` row offsets), whose geometry it does not fit.  Both call sites
-  (`mha.cu:2594` K, `:3272` V) become `if constexpr (kMixedOwnerCutExpansion) newHelper(...) else
-  oldHelper(...)`, so every other build keeps the old body byte-for-byte (the q=1 sm90 and all
-  sm120 modules never instantiate the new helper; `mla_sm120.cu` includes `mhaUtils.cuh` too and is
-  covered by the same argument — the SASS comparison of section 6 A3 checks all of them).  The new
+- **Guard (rev 2).**  `mha.cu` defines `MIXED_BF16_PLACEMENT_EXPANSION = ENABLE_MIXED_KV_CACHE
+  && MIXED_COMPACT_TILE_LOOPS && !INPUT_FP16 && !(GRP_LOAD_V)` (and `kMixedBF16PlacementExpansion`
+  from it, `static_assert`ed to imply `kCompactTileLoops && is_same<InputElem, __nv_bfloat16> &&
+  !grpLoadV && !compactMixedPages`), i.e. derived from the step-5 predicate `__CUDA_ARCH__ == 900
+  && CACHE_ELEM_ENUM == 5 && SPEC_DEC && M_TILESIZE == 16` (`mha.cu:147-169`,
+  `MIXED_COMPACT_TILE_LOOPS`) plus the bf16 requirement of the placement decode; a bare
+  `__CUDA_ARCH__ == 900 && !INPUT_FP16` (rev 1) would have handed the new cut to the other sm90
+  `mha.cu` instantiations (64 B parts, `cacheVTileSeqLen 64`, `grpLoadV` V paths with
+  `headsPerWarp` row offsets), whose geometry it does not fit.  Both call sites (`mha.cu:2594` K,
+  `:3272` V) select the new helper under `#if MIXED_BF16_PLACEMENT_EXPANSION` — a preprocessor
+  guard rather than `if constexpr`, because the V site is in the kernel body (not a template):
+  a discarded `if constexpr` branch there is still instantiated, the new helper's
+  `static_assert`s would fire in the other builds, and the preprocessed source of those builds
+  must stay identical.  So every other build keeps the old body byte-for-byte (the q=1 sm90 and
+  all sm120 modules never instantiate the new helper; `mla_sm120.cu` includes `mhaUtils.cuh` too
+  and is covered by the same argument — the SASS comparison of section 6 A3 checks all of them).  The new
   helper `static_assert`s what the cut needs: `partBytes == 128` (`blocksPerPart == 4`,
   `blocksPerSpan == 64 == 2 * warp_size`, one pass per span), `headsPerSpan == 16 ==
   tokensPerPage`, `scaleLoadBytes == 4`, `nbWarps == 1` (no `idxWarp` parameter), `Tile::rowBytes
@@ -622,3 +627,65 @@ bit-exact against the A16-expansion reference; the harness would need an fp32-re
 on sm90 (`mma.sync` narrow types are `.e4m3/.e5m2` at k32 for sm_89+; `.e2m1` only under
 `.kind::f8f6f4` on sm_120a).  The instruction count is a wash (section 2, D), so the numerics
 buy nothing.
+
+## 8. As written (code state of this worktree; updated per commit)
+
+### 8.1 Item 1 — placement decode + fold vote (`expandMixedPartialHeadsInPlaceBF16Placement`, today's lane ownership)
+
+Files: `csrc/xqa/mhaUtils.cuh` (new helpers after `expandMixedPartialHeadsInPlace`: `ldsU16`,
+`ldsB64`, `e4m3x2ScalesToFloat`, `bf16x2Broadcast`, `MixedFoldTag`, `foldScalePairFinite`,
+`expandE4M3Block16BF16Placed<kFold>`, `expandE2M1Block16BF16Placed<kFold>`,
+`expandMixedPartialHeadsInPlaceBF16Placement`), `csrc/xqa/mha.cu` (guard after `grpLoadV`; K
+site in `runGemm0`, V site in the gemm1 loop, both `#if MIXED_BF16_PLACEMENT_EXPANSION`).  The
+stock helper and `mha_sm90.cu` are untouched; the block expanders mirror `mha_sm90.cu:2792-2830`
+under new names because that file belongs to another track.
+
+Data flow (one call = one 128 B K part of 64 rows, or one 32 x 128 B V half-tile; 16-row spans =
+pages):
+
+```
+smem tile row r (128 B, physical grain = logical ^ (r % 8)); block b of the row in logical grain 2b
+  (FP8 16 B; FP4 8 B in the low half), staged by copyMixedPartialHeadsAsync
+scale word per row (4 B, byte b = E4M3 scale of block b), staged by its scale loop
+lane l: b = l % 4, rows r0 = 16 span + l / 4, r1 = r0 + 8            (today's ownership; item 2 changes it)
+  addrA = tileBase + byteOffset<swz>(l/4, 2b), addrB = ... (l/4, 2b+1), scaleAddr = scales + (l/4)*4 + b
+  per span:  s0 = LDS.U8 [scaleAddr + 64 span], s1 = LDS.U8 [.. + 32]
+             r_i = float(E4M3 s_i)                        cvt.rn.f16x2.e4m3x2 + HADD2.F32 (exact)
+             f_i = r_i * (g * 2^k)                        k = 120 (FP8) / 126 (FP4)
+             fold = __all_sync(|g| >= 2^-117 && max|f_i| < 255.5 * 2^120)
+             fold:     sf2_i = bf16x2{f_i, f_i}           one F2FP.PACK_AB each
+             fallback: sf2_i = bf16x2{r_i g, r_i g}
+  per row j: FP8: LDS.128 [addrA + 2048 span + 1024 j] -> 4 x e4m3x4ToBF16x2Pow2m120 (x * 2^-120)
+             FP4: LDS.64  [same]                        -> 2 x e2m1x8ToBF16x2Pow2m126 (mag * 2^-126)
+             fallback only: HMUL2 by 0x7B80 / 0x7E80 (exactly 2^120 / 2^126)
+             HMUL2 by sf2_j; STS.128 [addrA + ...] , STS.128 [addrB + ...]
+```
+
+Control flow: `__syncwarp()` on entry (each lane has passed its own `cp.async.wait_group`; the
+scale word of a row was copied by lane `row % 32`, so the read is cross-lane even in today's
+cut) -> span loop (`#pragma unroll(pageLoopUnroll)`: unrolled in static modules, rolled in the
+dynamic one) -> per span the warp-uniform format branch (dynamic module) -> scale loads, vote
+(inside the format branch, all 32 lanes: convergent) -> `body(MixedFoldTag<true/false>)`, each
+straight-line over the lane's two rows via an explicit `row(rowOff, sf2)` called twice ->
+`__syncwarp()` before the `ldmatrix` reads.  No runtime-indexed register arrays (`out[2]` is
+indexed by literals; the two rows are two calls), no pointer selects (`g` / `pow2k` are
+`if constexpr`-resolved), every shared address is a lane-constant u32 plus an immediate.
+
+Static guarantees: `static_assert`s for bf16 `InputElem`, 16 B grains, `swizzle`, 128 B rows with
+8 grains, `partBytes 128` / `blocksPerPart 4`, `headsPerSpan 16`, 64 blocks per span = 2 lanes per
+row... (item 1: two rows per lane), 4 B scale words, `rowsPerIter % 8 == 0` (the swizzle term is
+lane-constant), `dstNbHeads >= maxNbCopiedHeads`; `MIXED_BF16_PLACEMENT_EXPANSION` is
+`static_assert`ed to imply `kCompactTileLoops && bf16 && !grpLoadV && !compactMixedPages`.
+
+Instantiations: K `<64, 2, true>` on `KSmemBuffer` (64 x 8 grains), V `<32, 2, true>` on
+`VSmemBuffer` (32 x 8 grains); both pass `sourceHeadOffset = 0`.
+
+Expected SASS per FP8 lane-call in this intermediate state (32 values, fold body): 2 LDS.U8 + 1
+LOP3 (pack) + F2FP + 2 HADD2 + 2 FMUL + FMNMX + FSETP + VOTE + PLOP3 + 2 F2FP.PACK + 2 (LDS.128 +
+24 + 8 HMUL2 + 2 STS.128) + ~3 = **~89** (today 106 for the same two lane-blocks); FP4 2 LDS.64 +
+... + 2 (26 + 8 + 2) = **~87**.  Item 2 (owner cut) removes nothing from this count except the
+second LDS.U8 / pack (the two scales become one LDS.U16) — its purpose is the cross-lane layout
+that lets the copy hoist (item 3) and the vote amortise over one row.  The verification list of
+section 6 A1 applies unchanged: F2FP per FP8 lane-call 18 -> 3, HADD2.F32 16 -> 2, HMUL2 16 per
+lane-call (32 in the fallback body), STS.128 4, `WARPSYNC` between the `DEPBAR` and the first LDS.
+
