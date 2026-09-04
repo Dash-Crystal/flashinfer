@@ -200,9 +200,21 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
+// sm120 (Track W [27]): also for the mixed-page transport build (CACHE_ELEM_ENUM 5) when its
+// V stream is FP8 or dynamically mixed: the two warps of a gemm1 group then load whole token
+// rows (one line request per token) instead of each fetching its own half row. The pure FP4
+// build (static format 2) is not request-bound on V and pays the group's per-tile syncs
+// (fp4 q=1 57.4 -> 71.7 us measured), so it keeps the per-warp loader; static A16 (0) too.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#define GRP_LOAD_V                                                                     \
+  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) ||                                   \
+   (CACHE_ELEM_ENUM == 5 && (MIXED_PAGE_STATIC_FORMAT == 1 || MIXED_PAGE_STATIC_FORMAT < 0)) || \
+   (HEAD_ELEMS == 256 && BEAM_WIDTH > 1))
+#else
 #define GRP_LOAD_V \
   ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) || \
    (HEAD_ELEMS == 256 && BEAM_WIDTH > 1))
+#endif
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER
