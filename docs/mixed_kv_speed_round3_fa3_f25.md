@@ -1255,3 +1255,26 @@ single-operand site (the exact-only `VOTE = false` static path does not apply
 to the dynamic module: its votes stay), the format loops with one back-edge
 `BRA` each and their `WARPSYNC` (if emitted) before the two `STS.128` pairs.
 Count per pair per warp (bench mix): ~790 (3.5).
+
+### Open items for F25e (nothing below was built or run in this worktree)
+
+1. Gate 6.0 (the a16 ncu probe at the `LDGSTS` PCs) decides between the 12-warp
+   centre and 2E / 2G before any F25 timing; the rev 2 prediction for fp8 / fp4
+   stands only if it passes.
+2. Byte-identity of the a16 module and the stock paged kernel against
+   `5cc416fd` is asserted from the text (the a16 `load()` folds to the [23]
+   text through the `pair_step` / `produce_pair` lambdas and the
+   `STATIC_A16` arm of `issue_operand`); ptxas's scheduling of the same code
+   through a different inlining order is the one thing reading cannot settle -
+   the SASS diff is the first 6.1 row.
+3. `ptxas -v`: no C7507 and `STACK 0` for fp8 / fp4 / dynamic at 136 / 184; the
+   dynamic module's F24 32 B frame is expected to vanish with the unrolled
+   copy body (no hoisted rolled-loop bases), to be confirmed.
+4. The predicated `cp.async` helpers (`cp16_pred`, `cp8_pred`) must appear as
+   `@P LDGSTS` with no branch in the dynamic copy body (6.1 dyn row); if ptxas
+   turns the `setp` + predicate into a branch, the alternative is the mask bit
+   as a `src-size` register with the destination kept per lane (never another
+   lane's slot) - not the withdrawn src-size-0-to-the-leader's-slot form.
+5. Tests: 104 cases (`run_fa3_mixed_page_transport.py`; exit code = failures):
+   64 matrix + 2 many-items + 6 parity-tail + 4 extremes-tail + 18 extremes + 6
+   NaN-tail + 4 dynamic-uniform.
