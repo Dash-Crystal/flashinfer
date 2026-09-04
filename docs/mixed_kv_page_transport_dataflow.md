@@ -270,6 +270,12 @@ On sm120 only the XQA host exists; see `mixed_kv_page_transport_backends.md`.
   first `cp.async` producer overwrote the pending tile's record when issuing the
   next pair (fix: two records, `staged` → `pending`, rotated after the finish).
 - `cuobjdump -sass` counts: `UTMALDG` = Q only, `LDGSTS` > 0, `LDL`/`STL` = 0.
+- sm90 XQA (`mha_sm90.cu`): `ptxas -v` on the TU must not print C7507
+  (`'setmaxnreg' ignored to maintain minimum register requirements`) — one
+  `.dec` below its role's need drops every setmaxnreg in the kernel silently,
+  and `cuobjdump -res-usage` still reports the launch cap (REG 48).  The SASS
+  must contain exactly two `USETMAXREG` (DEALLOC 0x28, TRY_ALLOC 0x38) and the
+  role budgets must balance inside 640 x 48 = 30720.
 
 ### A5. C7 — the first K tile of a work item is committed before `barrier_O.wait`
 

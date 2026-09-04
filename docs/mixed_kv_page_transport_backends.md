@@ -1282,3 +1282,75 @@ the converters actually achieve (P0.4), on the gemm0 chain that P0.3 shows is
 the binding consumer role.  The converter warp groups keep the expansion
 (`expandPackedStage`); the SASS of the sm90 TU is byte-identical before and
 after the deletion, confirming the loaders were dead code.
+
+### Round 2 baseline — wt/A + wt/B merged, and the setmaxnreg that never existed (2026-09-04, nkcut2 H200, main @ de2351fc / fe2e9a33)
+
+Matrix 54/54 (32 register-expansion + 2 native FP8 + 18 tail/value-range + 2
+independent stock-decode reference).  Locked bench, 5 x 5, B=17 S=4096 8 KV
+heads GQA 4 D=128, min/median/max:
+
+| q | mode | main @ de2351fc (A+B, split dropped) | main @ fe2e9a33 (split honored) | target |
+|---|---|---|---|---|
+| 1 | transport_a16 | 81.2 / **81.4** / 81.8 | 81.2 / **81.8** / 81.9 | parity (stock mha.cu 108-110) |
+| 1 | fp8 | 75.4 / **75.8** / 76.3 | 76.6 / **76.9** / 77.1 | <= 58 |
+| 1 | fp4 | 73.9 / **74.2** / 74.4 | 70.2 / **70.7** / 70.8 | <= 36 |
+| 1 | mixed | 82.9 / **83.3** / 83.8 | 79.3 / **79.5** / 80.5 | <= 62 |
+| 4 | transport_a16 | 93.5 / 93.7 / 94.0 | 93.4 / 94.1 / 94.7 | parity |
+| 4 | fp8 | 118.8 / 119.9 / 120.8 | 118.8 / 120.1 / 120.9 | <= 94 |
+| 4 | fp4 | 136.0 / 140.0 / 141.3 | 138.3 / 139.0 / 141.1 | <= 59 |
+| 4 | mixed | 132.1 / 135.3 / 135.9 | 135.3 / 136.6 / 136.9 | <= 101 |
+
+A+B combined equals wt/B alone (77.2 / 73.1 / 83.4): Track A's consumer
+levers add nothing on top of B — reading (ii) of the round-1 synthesis
+("the consumer does not pace"), settled below by the same-launch trace.
+
+**setmaxnreg was silently dropped.**  `ptxas -v` on the merged TU (real
+ninja flags, `-arch=sm_90a`) prints
+`(C7507) Potential Performance Loss: 'setmaxnreg' ignored to maintain minimum
+register requirements` and the SASS has zero `USETMAXREG`.  The IO group's
+`.dec 24` was below that role's own register need, and ptxas then drops
+*every* setmaxnreg in the kernel, so the converters ran at the launch cap of
+48 all along (the mixed module carried a 16-byte stack frame, 24 bytes of
+spill; the fp4 module 8 bytes).  Re-assembling the PTX with candidate splits:
+
+| IO .dec | converter .inc | C7507 | stack / spill | USETMAXREG in SASS |
+|---|---|---|---|---|
+| 24 | 56 or 64 | ignored | 16 B / 24 B | 0 |
+| 32 | 56 or 64 | honored | 32 B / 120 B (IO spills) | 2 |
+| 40 | 56 or 64 | honored | 0 / 0 | 2 |
+
+Pool balance at `__launch_bounds__(640, 2)`: 640 x 48 = 30720; the fix
+(fe2e9a33) is IO **and both GEMM groups** `.dec 40`, converters `.inc 56`:
+3 x 128 x 40 + 2 x 128 x 56 = 29696.  Verified: no C7507, 0 spill,
+`USETMAXREG.DEALLOC.CTAPOOL 0x28` + `USETMAXREG.TRY_ALLOC.CTAPOOL UP1, 0x38`,
+REG 48 STACK 0 on the mixed module, 2 CTAs/SM (ncu: registers and smem both
+limit 2).  Effect: fp4 74.2 -> 70.7, mixed 83.3 -> 79.5, fp8 unchanged —
+i.e. the register-starved converter was the FP4 pace, and the FP8 pace is
+elsewhere (below).  Rule added to the dataflow doc (A4): every sm90 build
+check is `ptxas -v` free of C7507 and two `USETMAXREG` in the SASS; the
+`cuobjdump -res-usage` REG line cannot show this (it reports the launch cap).
+
+**Same-launch role periods** (MIXED_KV_TRACE=1 on de2351fc, i.e. before the
+split fix; CTA 0, tiles 3-7, medians over 3 launches, 1.98 GHz; nbIters 13,
+nbSubSeq 5, grid 1 x 5 x 136 = 680 CTAs = 2.58 waves at 264 slots):
+
+| mode | gemm0 period | gemm1 | K load issue | V load issue | K convert done | V convert done | 13-tile CTA body |
+|---|---|---|---|---|---|---|---|
+| fp8 | 1.38 us | 1.46 | 1.43 | 1.39 | **1.62** | 1.02 | ~18 us |
+| fp4 | 1.14 | 1.15 | 1.13 | 1.17 | 1.18 | 1.12 | ~15 us |
+| a16 | 2.52 | 2.42 | 2.38 | 2.68 | 2.88 | 2.51 | ~33 us |
+
+- fp8 is K-converter paced (1.62 us against a 1.4 us consumer cadence; the V
+  converter runs the same code in 1.02) — the [43] parity question is now
+  "why is K 60 % slower than V on fp8", not the fp4 V-slower reading from
+  round 1.  Both converters have 56 registers only from fe2e9a33 on.
+- fp4 has no single pacing role: every period sits at 1.13-1.18 us, the
+  latency floor (P0.3: 1.00 us/tile consumer floor at 2 CTAs/SM).
+- a16 is transport paced (2.5 us/tile = 32 KB x 264 / 2.5 us = 3.4 TB/s).
+- The CTA body is 15-18 us of a 71-77 us wall: with 680 CTAs over 264 slots
+  the wall is ~3 lifetimes x (body + ~4-5 us fill/first-K latency) + tail.
+  Wave quantisation and per-CTA fill are 55-60 % of the fp8/fp4 wall — [8]
+  (persistent 264-CTA pull with cross-item prefetch) is the decisive lever:
+  8840 tile-iterations / 264 CTAs = 33.5 tiles per CTA -> fp8 ~47 + fill ~
+  53 us, fp4 ~39 + fill ~ 45 us at unchanged periods.
+
