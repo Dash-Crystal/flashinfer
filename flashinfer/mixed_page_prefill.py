@@ -171,6 +171,14 @@ def mixed_page_prefill_run_args(
                  (transport.fp4_k_scales, transport.fp4_v_scales)):
         if a.stride() != b.stride():
             raise ValueError("K and V transport tensors must share strides")
+    # The FP8 expansion folds 2^112 into (block_scale * global_scale) in bf16
+    # ([23]); the fold is exact while that product is below 2^16 for every block
+    # scale an E4M3 byte can hold (448).  One host sync per call site of this
+    # helper (the wrappers build the argument list once per shape).
+    if code in (-1, 1):
+        for gs in (transport.fp8_k_global_scale, transport.fp8_v_global_scale):
+            if gs is not None and gs.numel() == 1 and float(gs.item()) * 448.0 >= 2.0 ** 16:
+                raise ValueError("mixed KV pages: fp8 global scale must be below 2^16 / 448")
     tensors = [
         None,  # maybe_prefix_len_ptr
         None,  # maybe_token_pos_in_items_ptr
