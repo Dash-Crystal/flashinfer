@@ -636,3 +636,312 @@ ncu (one kernel, `--launch-skip` past warm-up): `launch__grid_size` = 264,
 
 Scope: `ENABLE_MIXED_KV_CACHE && !SPEC_DEC` only; SPEC_DEC (Track S) and the
 non-mixed sm90 kernel keep `chooseNbSubSeq` and the `1 x n x (B*H)` grid.
+
+---
+
+## 8. Amendments after review (resolved before code)
+
+Each item names the reviewer finding it answers.  Where it changes sections
+1-7 above, the amendment wins.
+
+### 8.1 Record read ordering (blockers 1 and 3) — C10 restated
+
+The pseudo-code of 2.3/2.4 read the record before the tile's `produced`
+wait.  That is wrong at g = 0 (no happens-before edge from the loader's
+chunk-0 STS to gemm0's LDS: gemm0 has waited on nothing but `qBar`, which the
+Q warp — a different warp from the K loader — arrives) and only accidentally
+right for g >= 1.  **Rule: every reader of record g reads it after the wait
+that the record's writer chain feeds.**
+
+- gemm0 reads record g (one `LDS.32` of the `tile` word) immediately after
+  `kBar[g%3].produced.arrive_and_wait()` and before its `kBar.consumed.arrive`.
+  Chain for every g >= 0: K loader STS (fill) -> `kMetaReady[c].arrive`
+  (release) -> K converter `wait_parity` (acquire) at `issue(g)` -> (program
+  order) converter `kBar[g%3].produced.arrive` (release) for tile g -> gemm0
+  wait (acquire).  For g in {0, 1} the converter's `issue(g)` is its prologue,
+  which still follows its `kMetaReady[0]` wait.  The Q wait therefore follows
+  the K wait: `if (first) { runningColMax = -inf; qBar[j&1].produced.arrive_and_wait(); }`.
+  Q is needed only by the HGMMA, which comes after both waits.
+- gemm1 reads record g's `tile` word after `vBar[g%3].produced.arrive_and_wait()`
+  (same chain through the V loader / V converters) and the `idxReq`/`idxHeadGrp`
+  pair only inside `if (last)`.
+- Converters read pages/format/head at `issue(g)` after their `kMetaReady`
+  wait (unchanged).
+- The a16 TMA loader reads record g at its own iteration g, after its own
+  fill (program order).
+
+WAR (reuse) with the record read placed *before* the reader's release arrive:
+the slot refilled at loader iteration g (section 8.2: tiles `[g+4, g+20)`)
+previously held tiles `[g-28, g-12)`.  Last readers of tile g-13: gemm1 (after
+`vBar.produced(g-13)`, before its `xBar[(g-13)%2].consumed.arrive`), gemm0
+(before its `kBar.consumed.arrive(g-13)`), converters (`issue(g-13)` at
+iteration g-15, before `produced.arrive(g-14)`).  The loader's
+`kBar[g%3].consumed` wait at iteration g needs gemm0's `consumed.arrive(g-3)`,
+which is program-ordered after gemm0's read of g-3 (hence of g-13), after
+gemm0's `xBar.consumed` wait for tile g-11 (which needs gemm1's arrive for
+tile g-13, program-ordered after gemm1's read of record g-13), and after
+gemm0's `produced` wait for g-3 (which needs the converters' arrive for g-3,
+program-ordered after their read of g-1).  So a lead L is WAR-safe iff the
+refilled slot's newest old tile `g+L-17 <= g-2`, i.e. L <= 15.  L = 4 (8.2).
+
+### 8.2 Metadata chunk fill: exactly one fill per chunk, lead 4 (notes)
+
+The prologue fills chunk 0 only.  Chunk c is filled for tiles `[16k, 16k+16)`
+at loader iteration `16k - 4` (`ahead = g + 4; ahead % 16 == 0 && ahead < G`),
+so chunk 1's first fill is at g = 12 and every chunk is filled exactly once
+per 32 tiles: `kMetaReady[c]` completes phase f on fill f, which is what the
+converters' `wait_parity(toParity<1>(t/32))` at `t % 16 == 0` assumes.  (The
+old `ahead >= 32` guard existed because the prologue also filled chunk 1; a
+second fill at ahead = 16 would have arrived `kMetaReady[1]` twice and put the
+parity one phase off — a hang, not a vacuous guard.  With the prologue fill of
+chunk 1 removed the guard is removed too; the invariant is stated here.)
+
+Lead 4 instead of 2: the fill's dependent page-table pair (`idxPage ->
+page_format[page]`, 0.75-1.25 us under load) is issued at loader iteration
+16k-4, gated on gemm0's `consumed(16k-7)`; the converters need it at
+`issue(16k)` in their iteration 16k-2.  That is ~2 tile periods of slack
+against ~1 us of latency.  C8 for `kMetaReady` with lead 4: fill f+1 of chunk c
+is issued at tile 32(f+1)+16c-4 after `kBar.consumed` for that tile ->
+gemm0 consumed 32(f+1)+16c-7 -> converters produced it -> they passed
+`issue(32f+16c)` (their wait on phase f) — the waiter is never two phases
+behind.  The fill loop itself is two-phase so its latency does not scale with
+the number of items in the chunk (8.4).
+
+### 8.3 `ItemCursor` (blocker 2 and notes)
+
+One `ItemCursor` implementation is used by all four walkers (K loader, V
+loader, Q warp, merge warp); the loaders call it with a clip limit (chunk
+end), the Q and merge warps with `xEnd`, so the Q/merge item sequences and the
+loaders' record flags are the same enumeration by construction.  State:
+`x, xEnd, x0, req, head, tileInSeq, seqLen, nextSeqLen, Lseq` (9 registers).
+`nextSeqLen = seqLen[req+1]` is loaded **only if `req + 1 < batchSize`**
+(else 0) — in the prologue scan and in the cursor.  Requests with zero tiles
+in use are skipped when entered (`while (req < B && tiles(seqLen) == 0)`); the
+scan's containment test `H*prefix(r) <= x0 < H*prefix(r+1)` skips them
+automatically (empty interval).
+
+Per-tile flags derived by the cursor for tile at linear x, in-use tile t of
+sequence (req, head) with tiles(req) = tl:
+
+    first    = (x == x0) || (t == 0)
+    last     = (x + 1 == xEnd) || (t + 1 == tl)
+    partial  = !(Lseq >= x0 && Lseq + tl <= xEnd)     (the item does not cover the whole sequence
+                                                       <=> some other CTA holds a tile of it <=> c0 < c1)
+    ctaLast  = (Lseq + tl >= xEnd)
+    validBeg = (t == 0) ? tile0NbSkipTokens(req) : 0
+    validEnd = (t + 1 == tl) ? (seqLen % 64 ? seqLen % 64 : 64) : 64
+
+`Lseq >= x0` identifies "this item started at the sequence start" without a
+flag: only the CTA's first item can start mid-sequence.  Entries of the last
+chunk past G are written as `kBAD_PAGE_INDEX` / `kMixedBadPageFormat` /
+`tile = 0`, so converters zero-fill and nothing stale is read.  gemm1 counts
+`last` flags to know the item index j and publishes `finalizedItems = j + 1`.
+
+Hang guard: the merge warp asserts (debug builds) at the end of its item loop,
+after the final `__syncthreads`, that `smem.finalizedItems` equals the number
+of items it enumerated.
+
+### 8.4 Fill is two-phase; per-fill cost is one dependent round trip
+
+`fillTileMeta(chunk)`: phase A walks the pieces overlapping the chunk with the
+cursor (warp-uniform, ALU only, plus one `seqLen[req+1]` load per request
+boundary crossed); each lane captures, for its two entries (tile lane/4 and
+lane/4 + 8, page lane % 4), the `(req, seqTile, nbPages, tile word, head)` of
+the piece that contains its tile.  Phase B issues the two dependent load
+pairs of every lane at once.  Phase C gathers the four page formats of a tile
+into its lane j = 0 (three `shfl`) and writes the record: lanes write their
+page (`STS.32`), lane j = 0 the second 16 B (`STS.128`).  The number of items
+in a chunk (up to 16 with 1-tile sequences) changes only the ALU loop, not the
+number of exposed memory round trips.
+
+### 8.5 Q is double-buffered (note promoted to design)
+
+`smem.q[2]`, `qBar[2]` (+2 KB, +16 B).  Q warp item j: `QCvt::load(laneId(), ...)`
+into registers, `qBar[j&1].consumed.arrive_and_wait()`, `QCvt::store(laneId(),
+smem.q[j&1], ...)`, `fence.proxy.async`, `qBar[j&1].produced.arrive()`.  gemm0
+pre-arrives `consumed` on both buffers, waits `qBar[j&1].produced` on the first
+tile of item j (after the K wait, 8.1), and arrives `qBar[j&1].consumed` after
+the last tile of item j.  `qBar[b].consumed` phase m completes with the Q
+warp's arrive for item 2m+b and gemm0's arrive for item 2m+b-2 (the pre-arrive
+for m = 0); gemm0 finishes item j-2 before it can need Q(j), so the Q warp's
+store of Q(j) happens while item j-1 runs and gemm0's `produced` wait at the
+item boundary is already complete: no rendezvous on gemm0's path.  Acyclic
+(the only edges are gemm0 -> Q warp on `consumed`, Q warp -> gemm0 on
+`produced`, both per item).  `QCvt::load/store` take `laneId()` (the
+converter is 32-thread; `threadIdx.x` on IO warp 2 is 64..95).
+
+### 8.6 Merge warp (notes)
+
+- Polls `ld.acquire.cta finalizedItems` (all 32 lanes, one broadcast LDS)
+  with `__nanosleep(1000)` between polls: <= 1 poll/us against converters
+  issuing ~300 instructions/us — negligible issue share.
+- Lane 0 executes `atom.acq_rel.gpu.inc`; `old` is broadcast by `shfl`; a
+  `__syncwarp()` follows the broadcast so the other lanes' loads are ordered
+  after lane 0's acquire (bar.warp.sync orders memory among the participating
+  lanes); the scratch loads use `__ldcg` (L2, no L1 allocation).
+- Head mapping: lane l owns head `l/8` of a group of 4, elements
+  `16*(l%8) .. +16`, processed in two 8-element halves (8 fp32 accumulators);
+  the pass loops over head groups of 4 (`divUp(ctaNbValidQHeads, 4)` passes,
+  compile-time), so any `headGrpSize` is covered (7.8 is withdrawn), and each
+  half is masked by `elem < validElemsPerHead` (isHeadPadded).
+- Tail model: if the merge warp is the last arriver for both of its items the
+  tail is two merges (~4 us) plus the last finalize; the histogram check (iii)
+  reads "end spread <= 5 us" with that in mind.
+
+### 8.7 Kernel entry changes (notes)
+
+Under the persistent build: no `idxReq`/`idxHeadGrp`/`cacheSeqLen` per
+thread; `assert(gridDim.y == 1 && gridDim.z == 1)` replaces the
+`gridDim.x == nbInputSeqSplit` / `gridDim.z == nbKHeads*batchSize` asserts;
+the `idxSubSeq >= nbSubSeq` early return is gone (every CTA reaches barrier
+init and the `__syncthreads`); `smem.finalizedItems` is zeroed and
+`smem.sched` written (by IO warp 3's scan) before the `__syncthreads`; T = 0
+(all sequences empty) gives `x0 = x1 = 0` for every CTA (no division: the
+scan tests `T == 0` first) and every role's loop runs zero times.
+
+### 8.8 Converter head coordinate cost (note)
+
+Today `idxHeadGrp * payload_stride.head` and `idxHeadGrp * scale_stride.head`
+are kernel-uniform and hoisted.  Per tile they become one `LDS.32` plus two
+64-bit multiply-add chains (~6-8 SASS of ~310 per converter lane-tile); the
+SASS count of the copy-issue path is part of the build check (+-5 rule on the
+`xqa_sm90_converter_sass.py` counts).
+
+### 8.9 Shared memory (note)
+
+Current 110 848 B (re-derived: k 49 152 + X/out 4 096 + v 49 152 + q 2 048 +
+col vectors 672 + pages/formats/meta/scales 5 416 + barriers 192 + isLastCta 1
+-> 110 729 -> 110 848 at 128 B alignment).  Changes: records +768 (2 048 for
+1 280), `sched` 48 + `finalizedItems` 4, second Q buffer +2 048, second `qBar`
++16, minus `pages`/`pageFormats`/`isLastCta` (41).  Total 113 572 -> **113 664 B**
+(128-aligned); trace build (`MIXED_KV_TRACE_TILES=8`, +1 032) 114 604 ->
+**114 688 B**, both <= 115 712.  The trace does **not** default to 16 tiles:
+`MIXED_KV_TRACE_TILE0` moves the 8-tile window (TILE0 = 27 covers the CTA-1
+boundary 31 -> 32 and the refill tile 32; TILE0 = 11 covers 12..19 for the
+chunk-1 fill at g = 12 / use at 16).  A `static_assert(sizeof(SharedMem) +
+1024 <= 233472 / 2)` is in the code; the measured `sizeof` is recorded at
+confirmation.
+
+### 8.10 Prediction restated (blocker 4 and note)
+
+A pipeline's steady-state tile period is the maximum of its roles' periods;
+1.38 us (gemm0 over tiles 3-7 of a 13-tile CTA, with the converters' 2-tile
+lead hiding the difference) is not a steady state when the K converter runs at
+1.62.  For a 33-tile CTA the K converter's 1.62 is the expected fp8 period; the
+optimistic column stands only if the same-launch trace on the persistent build
+shows the K converter period at or below gemm0's.
+
+| mode | period used | wall = F 3.5 + 33 x T + fin 0.8 + tail 3 | target | status |
+|---|---|---|---|---|
+| fp8 | 1.62 (K converter) | **60.8**; 53.3 if K conv <= 1.38 | <= 58 | pass/fail decided by the trace: fp8 <= 58 needs [15]/[43] (K converter parity) in addition to [8] unless the persistent trace shows kc_done <= 1.38 |
+| fp4 | 1.18 | **46.2** | <= 36 | fails as stated; [15]/[7] |
+| mixed | 1.44 (body-derived; no same-launch trace exists) | **54.8** | <= 62 | pass |
+| a16 | DRAM 2.5 | **78-81** | parity | pass |
+
+The confirmation trace must reproduce, on the persistent build, the
+same-launch periods of the baseline table (backends.md "Round 2 baseline")
+within +-5 %: fp8 gemm0 1.38 / gemm1 1.46 / K-load 1.43 / V-load 1.39 /
+K-convert 1.62 / V-convert 1.02; fp4 1.14 / 1.15 / 1.13 / 1.17 / 1.18 / 1.12.
+The role that paces fp8 on the persistent build is whichever period the wall
+follows: 33 x 1.62 + 7.3 = 60.8 or 33 x 1.38 + 7.3 = 52.8.  The accept gate
+stays at -12 % (67.7 / 62.2 / 70.0) because it tests *this* lever's premise
+(unchanged periods, one fill, no wave tail); the targets are a separate line.
+Additional trace acceptance: `kc_ready(16)` and `kc_ready(32)` at steady-state
+period (window TILE0 = 11 and TILE0 = 27), no `g0_kwait` bump at the item
+boundary.
+
+### 8.11 Protocol notes confirmed (no change)
+
+qBar per-item phases acyclic (8.5); kBar/vBar/xBar waits are token waits;
+converter parity waits are g-keyed with the C8 bound; scratch slot rule
+`2c + isCtaLast` and the merger's enumeration agree (`c < c1` -> `2c+1`;
+`c = c1` -> `2c1+1` iff `x_{c1+1} == L_s + tiles(s)` else `2c1`); no CTA
+spin-waits on another CTA (co-residency is a performance assumption only);
+`outSwizzleBuf(i)` aliases only X(i), so finalize inside the loop is safe.
+
+## 9. As written (kernel state after this change)
+
+Build scope: `MIXED_KV_PERSISTENT = ENABLE_MIXED_KV_CACHE && !SPEC_DEC`; the
+non-mixed sm90 kernel and SPEC_DEC keep the `1 x n x (B*H)` grid,
+`chooseNbSubSeq`, `MultiBlockSMem`.  Under the persistent build the mixed
+multi-block epilogue is not compiled.
+
+**Data flow.**
+
+    seqLenList[B] --scan (IO warp 3)--> smem.sched {x0, x1, T, req0, head0, tile0, Lseq0, seqLen0, seqLen1}
+    sched --> ItemCursor (registers) in IO warps 0 (K), 1 (V), 2 (Q), 3 (merge)
+    K loader: cursor + page table + page_format --fillTileMeta--> smem.meta[K][chunk][16] (32 B records)
+                                                                     --kMetaReady[chunk].arrive-->
+    K converters: meta[K][g] {page, format, head} --cp.async--> packed rows / scales --expand--> k stage
+                                                                     --kBar.produced.arrive-->
+    gemm0: kBar.produced.wait -> meta[K][g].tile {validBeg, validEnd, first, last} ; q[j&1] ; X(g%2)
+    Q warp: q[(req, head)] --regs--> smem.q[j&1]  (qBar[j&1])
+    gemm1: vBar.produced.wait -> meta[V][g].tile ; on last: meta[V][g].{idxReq, idxHeadGrp}
+           -> output[headGrpSize*(H*req + head)]  or  scratch chunk 2*blockIdx.x + ctaLast
+           -> st.release.cta smem.finalizedItems = j + 1
+    merge warp: finalizedItems > j -> atom.acq_rel.gpu.inc semaphores[H*req + head] (limit c1-c0)
+           -> last arriver: __ldcg chunks {2c+1 | c in [c0,c1)} + {2c1 + (x_{c1+1} == Lend)} -> output
+
+**Control flow per role** (g = CTA-local tile counter, G = x1 - x0, j = item
+counter):
+
+    gemm0   pre-arrive qBar[0..1].consumed, kBar[*].consumed
+            for g: kBar[g%3].produced.arrive_and_wait ; tile = LDS meta[K][g].tile
+                   if first: runningColMax = -inf ; qBar[j&1].produced.arrive_and_wait
+                   QK HGMMA (Q from q[j&1]) ; wait ; kBar[g%3].consumed.arrive
+                   mask if validBeg > 0 || validEnd < 64 ; colMax ; softmax ; X(g%2) ; xBar[g%2].produced.arrive
+                   if last: qBar[j&1].consumed.arrive ; j++
+    gemm1   pre-arrive vBar[*].consumed, xBar[*].consumed
+            for g: vBar[g%3].produced.arrive_and_wait ; tile = LDS meta[V][g].tile
+                   if first: acc = 0, accColMax = -inf, accColSum = 0
+                   xBar[g%2].produced.arrive_and_wait ; rescale ; PV HGMMA ; commit ; wait
+                   if last: publish colMax/colSum ; LDS idxReq/idxHeadGrp ; finalize -> scratch or output ;
+                            thread 0: st.release.cta finalizedItems = j + 1 ; j++
+                   xBar[g%2].consumed.arrive ; vBar[g%3].consumed.arrive
+    K loader (IO 0)   cursor ; fillTileMeta(chunk 0) ; kMetaReady[0].arrive
+            for g: [a16/mixed module: LDS meta[K][g] pages/formats/head]
+                   kBar[g%3].consumed.arrive_and_wait
+                   [a16/mixed module, elected: arrive_tx(nbA16 x 2 parts x 2 KB) + A16 boxes]
+                   if (g+4) % 16 == 0 && g+4 < G: fillTileMeta(chunk ((g+4)/16)%2) ; kMetaReady[..].arrive
+    V loader (IO 1)   mirror with vBar / meta[V] / vMetaReady (same code; operand selects addresses only)
+    Q warp (IO 2)     cursor ; for each item j: load Q(req, head) ; qBar[j&1].consumed.arrive_and_wait ;
+                      store q[j&1] ; fence.proxy.async ; qBar[j&1].produced.arrive
+    merge warp (IO 3) scan (before __syncthreads) ; cursor ; for each item j:
+                      if partial: poll finalizedItems > j (ld.acquire.cta, nanosleep 1 us) ;
+                                  lane 0 atom.acq_rel.gpu.inc ; shfl old ; __syncwarp ;
+                                  if last arriver: __ldcg chunks -> online combine -> (+ sinks) -> output
+                      debug builds: wait finalizedItems == number of items, assert
+    converters        unchanged loop over g < G ; issue(g) reads page/format/head from meta[op][g]
+    end               __syncthreads ; destroy barriers ; return
+
+Code shape rules applied: the operand-dependent objects of the loader (stage
+barriers, metadata barriers, stage base, tensor map) are selected as shared /
+param *addresses*, never as struct references; every record access is a
+shared-window `ld/st.shared` at `metaBase[op] + (g % 32) * 32 + imm`; the
+fill's per-entry state is two named register sets (entries lane/4 and
+lane/4 + 8), not an indexed array; all page loops are `#pragma unroll` over
+the four pages.  `KVTilePartLoader` keeps only its non-mixed members; the
+mixed metadata helpers (`readMixedTileMeta`, `fillTileMeta(idxIterBeg, ...)`,
+`publishPages`, `packedPartTxBytes`, `issuePackedPartLoad`,
+`loadPackedScales*`) are replaced by `fillTileMeta(gBeg, cursor)`,
+`issueCompressedPageCopies(record)` and the loader's inline A16 issue.
+
+Trace additions: `MIXED_KV_TRACE_CTA`, `MIXED_KV_TRACE_TILE0` (8-tile window),
+`TRACE ctarec <cta> start firstk last end tiles` per CTA (`%globaltimer`),
+parsed by `benchmarks/parse_xqa_trace.py` into the per-CTA histogram (start
+spread, fill, body, end spread, idle fraction); the `TRACE tile` parser splits
+launches on a non-increasing tile index so a moved window works.
+
+Host: `dimGrid = {P, 1, 1}` with `P = choosePersistentGridSize(SMs, ctasPerSm)`
+(`XQA_PERSISTENT_CTAS` override) in both launchers; `ScratchMem{scratch,
+2 * gridDim.x, 1}`; semaphores unchanged.  Conformance: `TAIL_CASES` now
+carry the `XQA_PERSISTENT_CTAS` override — (50/100/130, default P: T < P,
+empty CTAs, 1-3-tile items), (2200, P = 1), (2200, P = 3), (4096, P = 5),
+(285, subnormal / maxscale) — 8 x 3 modes = 24 tail cases; the matrix is
+32 + 2 + 24 + 2 = 60 cases.
+
+Verification for this change is section 6 plus 8.10's period rule.  Not run in
+this phase (review by reading first): `ptxas -v` (no C7507, 0 stack / spill,
+IO group at 40 with the cursor), `USETMAXREG` = 2, `LDL`/`STL` = 0, the
+60-case matrix, the locked bench, the same-launch trace with TILE0 = 0 / 11 /
+27 and the per-CTA histogram.

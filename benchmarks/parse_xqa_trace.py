@@ -1,8 +1,13 @@
 """Parse MIXED_KV_TRACE=1 'TRACE tile' lines from a bench log.
 
-Groups lines into launches (a new launch starts at tile 0), computes per-slot
+Groups lines into launches (a new launch starts when the tile index does not
+increase, so a window moved by -DMIXED_KV_TRACE_TILE0 works), computes per-slot
 differences per tile, and prints medians over launches for the steady-state
 tiles.  Cycle -> us conversion uses --sm-mhz (default 1980, H200 boost).
+
+Persistent build (lever [8]): 'TRACE ctarec <cta> start <ns> firstk <ns> last
+<ns> end <ns> tiles <n>' lines (one per CTA per launch) give the per-CTA
+histogram: start spread, body (firstk -> last), end spread, idle fraction.
 """
 import argparse
 import re
@@ -16,6 +21,8 @@ SLOT_NAMES = [
     "kc_ready", "kc_done", "vc_ready", "vc_done",
 ]
 PAT = re.compile(r"TRACE tile (\d+) (.*)")
+PAT_CTA = re.compile(
+    r"TRACE ctarec (\d+) start (\d+) firstk (\d+) last (\d+) end (\d+) tiles (\d+)")
 
 
 def parse(path, mode=None):
@@ -23,6 +30,7 @@ def parse(path, mode=None):
     launches = []
     pending = []
     cur = None
+    last_tile = None
     for line in open(path, errors="replace"):
         if line.startswith("{\"q_len\""):
             import json
@@ -31,6 +39,7 @@ def parse(path, mode=None):
                 launches.extend(pending)
             pending = []
             cur = None
+            last_tile = None
             continue
         m = PAT.search(line)
         if not m:
@@ -39,13 +48,52 @@ def parse(path, mode=None):
         nums = [int(t) for t in m.group(2).split() if re.fullmatch(r"-?\d+", t)]
         if len(nums) != 16:
             continue
-        if tile == 0:
+        if last_tile is None or tile <= last_tile:
             cur = {}
             pending.append(cur)
-        if cur is None:
-            continue
+        last_tile = tile
         cur[tile] = nums
     return launches
+
+
+def parse_cta_records(path, mode=None):
+    """Per-launch lists of (cta, start, firstk, last, end, tiles); a launch's
+    records are attributed to the JSON result line that follows them."""
+    launches = []
+    pending = []
+    for line in open(path, errors="replace"):
+        if line.startswith("{\"q_len\""):
+            import json
+            rec = json.loads(line)
+            if pending and (mode is None or rec["mode"] == mode):
+                launches.append(pending)
+            pending = []
+            continue
+        m = PAT_CTA.search(line)
+        if m:
+            pending.append(tuple(int(g) for g in m.groups()))
+    return launches
+
+
+def print_cta_histogram(launches):
+    for i, recs in enumerate(launches):
+        recs = [r for r in recs if r[5] > 0]
+        if not recs:
+            continue
+        t0 = min(r[1] for r in recs)
+        starts = [(r[1] - t0) / 1e3 for r in recs]
+        ends = [(r[4] - t0) / 1e3 for r in recs]
+        bodies = [(r[3] - r[2]) / 1e3 for r in recs]
+        fills = [(r[2] - r[1]) / 1e3 for r in recs]
+        wall = max(ends)
+        idle = [(wall - b - f) / wall for b, f in zip(bodies, fills)]
+        tiles = [r[5] for r in recs]
+        print(f"launch {i}: ctas {len(recs)} tiles {min(tiles)}..{max(tiles)} | "
+              f"start spread {max(starts) - min(starts):.2f} us | fill median {med(fills):.2f} us | "
+              f"body median {med(bodies):.2f} us (min {min(bodies):.2f} max {max(bodies):.2f}, "
+              f"per tile {med(bodies) / max(1, med(tiles)):.3f}) | "
+              f"end median {med(ends):.2f} max {wall:.2f} (spread {wall - med(ends):.2f}) | "
+              f"idle fraction median {med(idle):.3f}")
 
 
 def med(xs):
@@ -62,6 +110,10 @@ def main():
     ap.add_argument("--skip-launches", type=int, default=0, help="ignore the first N launches (warmup)")
     ap.add_argument("--mode", default=None, help="only launches attributed to this bench mode")
     a = ap.parse_args()
+    cta_launches = parse_cta_records(a.log, a.mode)[a.skip_launches:]
+    if cta_launches:
+        print(f"per-CTA record launches parsed: {len(cta_launches)}")
+        print_cta_histogram(cta_launches)
     launches = parse(a.log, a.mode)[a.skip_launches:]
     print(f"launches parsed: {len(launches)}")
     if not launches:
