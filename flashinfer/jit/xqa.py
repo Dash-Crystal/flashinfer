@@ -132,6 +132,12 @@ def gen_xqa_module(
         # The xqa() mask API indexes draft tokens by row position (linear
         # chains only); non-tree mode enables per-row sliding-window masking.
         flag_spec_dec.append("-DIS_SPEC_DEC_TREE=0")
+        # Track S step 4 [41]: a 16-row M tile when q_seq_len x GQA fits one (no padded
+        # MMA rows; on sm90 it is the condition for the 2-CTA/SM SharedMem layout and
+        # __launch_bounds__(256, 2) of the mixed-page build).  Only the mixed-page modules
+        # take it: they are the ones measured on both hosts.
+        if mixed_page and q_seq_len * head_group_ratio <= 16:
+            flag_spec_dec.append("-DM_TILESIZE=16")
     else:
         if use_ragged_q:
             raise ValueError("use_ragged_q requires q_seq_len > 1 (speculative decode)")
