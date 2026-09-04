@@ -203,6 +203,28 @@ constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPa
 // protocol.
 constexpr bool grpLoadV = GRP_LOAD_V;
 
+// [44] Track S step 6: the sm90 SPEC_DEC bf16 compact build expands compressed K/V blocks with
+// the bit-placement decode and the block scale folded with 2^k
+// (expandMixedPartialHeadsInPlaceBF16Placement).  Derived from the step-5 predicate
+// (kCompactTileLoops: __CUDA_ARCH__ 900, CACHE_ELEM_ENUM 5, SPEC_DEC, M_TILESIZE 16) plus the
+// decode's own requirements: bf16 math, per-warp V tiles (no grpLoadV row offsets), the
+// expansion (not the compact register) form.  Every other build keeps the stock helper.
+// A preprocessor guard (not `if constexpr`): the V call site is in the kernel body, not in a
+// template, where a discarded `if constexpr` branch is still instantiated - the new helper's
+// static_asserts would fire in the other builds and the preprocessed source of those builds
+// must stay identical (sm120 SASS byte-identity is the acceptance check).
+#define MIXED_BF16_PLACEMENT_EXPANSION \
+  (ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_TILE_LOOPS && !INPUT_FP16 && !(GRP_LOAD_V))
+constexpr bool kMixedBF16PlacementExpansion = MIXED_BF16_PLACEMENT_EXPANSION != 0;
+static_assert(!kMixedBF16PlacementExpansion ||
+                  (kCompactTileLoops && mha::is_same_v<InputElem, __nv_bfloat16> && !grpLoadV &&
+                   !compactMixedPages),
+              "[44] placement expansion: sm90 SPEC_DEC compact bf16 build with per-warp V tiles");
+// [44] item 3 (gated on artifact A0): the mixed copy with hoisted per-lane / per-page address
+// constants (copyMixedPartialHeadsAsyncHoisted).  Same build as the placement expansion; the
+// MIXED_KV_PROBE_C measurement build keeps the stock copy (the probe lives there).
+#define MIXED_HOISTED_COPY (MIXED_BF16_PLACEMENT_EXPANSION && !MIXED_KV_PROBE_C)
+
 // number of shared memory buffers for latency hiding
 constexpr uint32_t nbQBuffers = mha::min(nbPartsPerInputQHead, 2u);  // for latency hiding
 constexpr uint32_t nbKBuffers = 2;                                   // for latency hiding
@@ -435,14 +457,16 @@ struct alignas(128) SharedMem {
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   // Row maxNbCopiedHeads of a warp's range is the dump row for its lanes past the tile's
   // heads (copyMixedPartialHeadsAsync scale copy).
-  uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1][mixedKScaleBytes];
+  // 4 B alignment is a contract: the copies stage each row's scale group with a 4 B cp.async
+  // and the [44] expansion reads scale pairs with LDS.U16 at row * 4 + 2h.
+  alignas(4) uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1][mixedKScaleBytes];
   // Group scope under grpLoadV: the warps of a group stage the scales of their own disjoint
   // token ranges of the shared V tile; each warp's slot is headsPerWarp rows + its dump row.
   static constexpr uint32_t vScaleRowsPerWarp =
       (grpLoadV ? exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp) : cacheVTileSeqLen) + 1;
-  uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
-                 [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
-                 [mixedVScaleBytes];
+  alignas(4) uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
+                            [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
+                            [mixedVScaleBytes];
 #if MIXED_KV_PROBE_C
   // Dead landing area for the probe's shadow copies (never read). 16 B per lane per gemm0 warp.
   alignas(16) uint8_t probeScratch[ctaShapeInWarps.x][warp_size * 16];
@@ -2443,6 +2467,18 @@ CUBIN_EXPORT __global__
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
                               grainBytes, grainBytesGmemCache, qkSwizzle, false>(
             warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
+#if MIXED_HOISTED_COPY
+      } else {
+        // [44] item 3: isFullTile is constant false under kCompactTileLoops (one bounds-checked
+        // copy body); dstHeadOffset is 0 and the tile origin is page-aligned (asserted above).
+        static_assert(kCompactTileLoops, "MIXED_HOISTED_COPY implies the compact tile loops");
+        uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+        uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
+        copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
+            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
+            pageFormats, idxHeadGrp, idxPart, nbHeadsAvail);
+      }
+#else
       } else if (isFullTile) {
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
@@ -2467,6 +2503,7 @@ CUBIN_EXPORT __global__
 #endif
             );
       }
+#endif
 #else
       if (isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
@@ -2591,11 +2628,21 @@ CUBIN_EXPORT __global__
           if constexpr (!compactMixedPages) {
             if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
             // Tile origin ctaTile.x * seqIter + warpTile.x * warpIdx.x is page-aligned.
+#if MIXED_BF16_PLACEMENT_EXPANSION
+            // [44]: the helper begins with __syncwarp() - the waitGroup<1> above completed
+            // this lane's copies only, and the scale word of a row was copied by another lane.
+            expandMixedPartialHeadsInPlaceBF16Placement<warpTile.x, nbPartsPerCacheKHead,
+                                                        qkSwizzle>(
+                smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0],
+                smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, fp8KGlobalScale,
+                fp4KGlobalScale);
+#else
             expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead,
                                            qkSwizzle>(
                 smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], 0,
                 smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, p, fp8KGlobalScale,
                 fp4KGlobalScale);
+#endif
             }
           }
 #endif
@@ -3018,12 +3065,19 @@ CUBIN_EXPORT __global__
             warp, dst, dstHeadOffset, src, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       } else {
+#if MIXED_HOISTED_COPY
+        // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
+        copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
+            dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, pageFormats,
+            idxHeadGrp, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#else
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
                                    vSwizzle, false, compactMixedPages>(
             dst, getSmemVScales(idxNextSMemVBuf),
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#endif
       }
 #else
       if (isFullTile) {
@@ -3269,6 +3323,15 @@ CUBIN_EXPORT __global__
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
                     sourceHeadOffset, 0, fp8VGlobalScale, fp4VGlobalScale);
               } else {
+#if MIXED_BF16_PLACEMENT_EXPANSION
+                // [44]: helper begins with __syncwarp() after this warp's syncVTileLoad
+                // (waitGroup<nbVBuffers - 1>, per-thread completion) - see the K site.
+                expandMixedPartialHeadsInPlaceBF16Placement<cacheVTileSeqLen,
+                                                            gemm1WarpsPerGrp, true>(
+                    smemVTile, getSmemVScales(idxCurrSMemVBuf),
+                    smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], 0,
+                    fp8VGlobalScale, fp4VGlobalScale);
+#else
                 expandMixedPartialHeadsInPlace<cacheVTileSeqLen,
                                                gemm1WarpsPerGrp, true>(
                     smemVTile,
@@ -3276,6 +3339,7 @@ CUBIN_EXPORT __global__
                     0,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
                     0, warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
+#endif
               }
 #if GRP_LOAD_V
               auto& mixedVExpandBar =

@@ -915,6 +915,463 @@ __device__ inline void expandMixedPartialHeadsInPlace(
   __syncwarp();
 }
 
+
+// ---- [44] Track S step 6 (sm90 SPEC_DEC bf16 build): placement decode + folded scale ----
+//
+// Selected by mha.cu's MIXED_BF16_PLACEMENT_EXPANSION at the two expansion call sites; every
+// other build keeps expandMixedPartialHeadsInPlace above byte-for-byte.  The block expanders
+// mirror mha_sm90.cu's expandE4M3BlockBF16 / expandE2M1BlockBF16 (that file is owned by another
+// track and is not included here).
+//
+// Shared-window loads the expansion needs besides ldsGrain / stsGrain.
+__device__ inline uint32_t ldsU16(uint32_t addr) {
+  uint32_t v;
+  asm volatile("ld.shared.u16 %0, [%1];" : "=r"(v) : "r"(addr));
+  return v;
+}
+__device__ inline void ldsB64(uint32_t addr, uint32_t& lo, uint32_t& hi) {
+  asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(lo), "=r"(hi) : "r"(addr));
+}
+// Two E4M3 block scales (bytes 0 and 1 of s01) -> fp32, exact (E4M3 -> f16 -> f32 are both
+// exact embeddings; the same route as e4m3x4ScalesToFloat / convertE4M3ScaleToA16Bits).
+__device__ inline void e4m3x2ScalesToFloat(uint32_t s01, float& f0, float& f1) {
+  uint32_t f16x2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2) : "h"(static_cast<uint16_t>(s01)));
+  float2 const f = __half22float2(reinterpret_cast<__half2 const&>(f16x2));
+  f0 = f.x;
+  f1 = f.y;
+}
+// bf16 scale broadcast to both halves: one F2FP.BF16.PACK_AB with both inputs equal.
+__device__ inline uint32_t bf16x2Broadcast(float f) { return bf16x2BitsFromFloats(f, f); }
+template <bool kFold>
+struct MixedFoldTag {
+  static constexpr bool value = kFold;
+};
+// The warp's fold decision for one page span: every lane's two scaled block scales
+// (s * g * 2^k in fp32) stay finite in bf16 (bound = bf16 max + half an ulp: 255.5 * 2^120), and
+// |g| >= 2^-117 so that every s * g is fp32-normal (the smallest nonzero E4M3 scale is 2^-9),
+// which is what makes bf16_rn(s * g * 2^k) == bf16_rn(s * g) * 2^k.  foldOk is warp-uniform; it
+// is inside the vote so the result is uniform by construction.
+__device__ inline bool foldScalePairFinite(float f0, float f1, bool foldOk) {
+  float const fmax = fmaxf(fabsf(f0), fabsf(f1));
+  return __all_sync(0xFFFFFFFFu, foldOk && fmax < 255.5f * 0x1p120f);
+}
+// One 16-value E4M3 block (16 packed bytes) -> 32 bf16 bytes.  kFold: sf2 = bf16(s * g * 2^120)
+// broadcast; else sf2 = bf16(s * g) and the placed value (x * 2^-120) is first multiplied by
+// exactly 2^120 (0x7B80; E4M3 magnitudes have <= 4 significant bits, x < 449, so the product is
+// exact), giving the reference's single rounding either way.
+template <bool kFold>
+__device__ inline void expandE4M3Block16BF16Placed(LdGrain const& packed, uint32_t sf2,
+                                                   LdGrain (&out)[2]) {
+  constexpr uint32_t kTwoPow120x2 = 0x7B807B80u;
+#pragma unroll
+  for (uint32_t w = 0; w < 4; w++) {
+    uint32_t lo, hi;
+    e4m3x4ToBF16x2Pow2m120(packed[w], lo, hi);
+    if constexpr (!kFold) {
+      lo = mulA16x2<__nv_bfloat16>(lo, kTwoPow120x2);
+      hi = mulA16x2<__nv_bfloat16>(hi, kTwoPow120x2);
+    }
+    out[w / 2][(w % 2) * 2] = mulA16x2<__nv_bfloat16>(lo, sf2);
+    out[w / 2][(w % 2) * 2 + 1] = mulA16x2<__nv_bfloat16>(hi, sf2);
+  }
+}
+// One 16-value E2M1 block (8 packed bytes: packed0 = values 0-7, packed1 = 8-15) -> 32 bf16
+// bytes; placement is mag * 2^-126, the fold constant 2^126 (0x7E80).
+template <bool kFold>
+__device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t packed1,
+                                                   uint32_t sf2, LdGrain (&out)[2]) {
+  constexpr uint32_t kTwoPow126x2 = 0x7E807E80u;
+#pragma unroll
+  for (uint32_t h = 0; h < 2; h++) {
+    uint32_t v[4];
+    e2m1x8ToBF16x2Pow2m126(h == 0 ? packed0 : packed1, v);
+#pragma unroll
+    for (uint32_t k = 0; k < 4; k++) {
+      if constexpr (!kFold) {
+        v[k] = mulA16x2<__nv_bfloat16>(v[k], kTwoPow126x2);
+      }
+      out[h][k] = mulA16x2<__nv_bfloat16>(v[k], sf2);
+    }
+  }
+}
+
+// In-place expansion of one 128 B K part (maxNbCopiedHeads rows) or one 32-row V half-tile
+// with the bit-placement decode and the block scale folded with 2^k, half-row owner cut: lane l
+// owns token tok = l % 16 of the span (page) and blocks 2h, 2h+1 with h = l / 16 (32 values), so
+// the scale pair is one LDS.U16 and the vote / scale prep amortise over 32 values.  The copy's
+// ownership is different (blockInSpan = 32 * iteration + lane: row lane / 4 + 8 * iteration,
+// block lane % 4), hence the __syncwarp on entry.  Geometry is fixed by static_assert (128 B
+// parts, 16-token pages, 4 B scale words, one warp, 128 B swizzled rows); any other
+// instantiation fails to compile.
+//
+// Data flow, one call:
+//   tile rows (128 B, physical grain = logical ^ (row % 8)); compressed block b of a row sits in
+//   logical grain 2b (FP8: 16 B; FP4: 8 B in the low half), staged by the copy; one 4 B scale
+//   word per row (byte b = E4M3 block scale of block b), staged by the copy's scale loop.
+//   Lane: row r = 16 * span + tok, x = tok % 8 = r % 8 for every span; logical grains 4h + j
+//   (j = 0..3) are physical (4h ^ x) ^ j - a permutation of one 4-aligned group that depends on
+//   x & 3, so the lane holds four u32 addresses a_j = tileBase + byteOffset(tok, 4h + j), each
+//   used as [a_j + 2048 * span]; the scale pair is bytes 2h, 2h+1 of the row's word:
+//   [scales + 4 * tok + 2h + 64 * span].
+//   Per span: LDS.U16 [scales], LDS.128 / LDS.64 [a_0], LDS.128 / LDS.64 [a_2] (all loads issued
+//   first) -> fp32 s_0, s_1 (exact) -> f_i = s_i * g * 2^k -> warp vote ->
+//   [fold] sf2_i = bf16x2(f_i) | [fallback] sf2_i = bf16x2(s_i * g);
+//   block 2h:   placement decode of [a_0] -> (fallback: x 2^k) -> x sf2_0 ->
+//               STS.128 [a_0], STS.128 [a_1]
+//   block 2h+1: ... of [a_2] -> x sf2_1 -> STS.128 [a_2], STS.128 [a_3]
+//   A lane writes only grains it alone reads (its sources a_0, a_2 are among its outputs), so no
+//   barrier is needed between its loads and stores.  Bank behaviour: an 8-lane LDS/STS phase is
+//   8 consecutive rows at one logical grain -> 8 distinct physical grains, conflict-free; the
+//   LDS.U16 phase reads 16 consecutive words (lanes 16-31 the same words' upper halves).
+// Control flow:
+//   __syncwarp  (cp.async.wait_group completes the executing thread's copies only; the payload
+//                grains of row tok were copied by lanes 4 * (tok % 8) + 2h, + 2h + 1 at
+//                iteration tok / 8, the scale word by lane tok + 16 * (span % 2))
+//   for span (unrolled in static modules, rolled in the dynamic one):
+//     format (warp-uniform: per-page tag; the dynamic module branches, static ones fold)
+//     scales -> vote (convergent: inside the warp-uniform branch, all 32 lanes)
+//     fold ? body<true> : body<false>   (both straight-line over the lane's two blocks)
+//   __syncwarp  (before the warp's ldmatrix reads)
+template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, uint32_t dstNbHeads,
+          uint32_t dstNbGrains, uint32_t nbPages, typename _LdGrain>
+__device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
+    Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales,
+    MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset, float fp8GlobalScale,
+    float fp4GlobalScale) {
+  using Tile = Array2D<_LdGrain, dstNbHeads, dstNbGrains>;
+  // Every static_assert below is dependent on a template parameter so that a mixed build that
+  // never instantiates this helper (fp16 input, other page sizes, sm120) compiles unchanged.
+  static_assert(sizeof(_LdGrain) == grainBytes && mha::is_same_v<InputElem, __nv_bfloat16>,
+                "placement decode is bf16-only");
+  static_assert(sizeof(_LdGrain) == grainBytes && grainBytes == 16);
+  static_assert(swizzle, "the cut assumes the 128 B-row swizzle c ^ (r % 8)");
+  static_assert(Tile::rowBytes == 128 && dstNbGrains == 8, "128 B tile rows");
+  static_assert(dstNbGrains == 8 && warp_size == 32 && tokensPerPage == 16);
+  constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
+  static_assert(partBytes == 128, "128 B parts: 4 blocks per row, 64 blocks per 16-token span");
+  constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
+  static_assert(blocksPerPart == 4);
+  constexpr uint32_t headsPerSpan = mha::min(tokensPerPage, maxNbCopiedHeads);
+  static_assert(headsPerSpan == 16 && maxNbCopiedHeads % headsPerSpan == 0);
+  constexpr uint32_t nbSpans = exactDiv(maxNbCopiedHeads, headsPerSpan);
+  static_assert(headsPerSpan * blocksPerPart == 2 * warp_size,
+                "one row and two adjacent blocks per lane per span");
+  static_assert(mha::max(4U, blocksPerPart) == 4, "4 B scale word per row (scaleLoadBytes)");
+  constexpr uint32_t scaleRowBytes = 4;
+  constexpr uint32_t blocksPerLane = exactDiv(blocksPerPart, exactDiv(warp_size, headsPerSpan));
+  static_assert(blocksPerLane == 2);
+  static_assert(headsPerSpan % 8 == 0, "row + 16 span keeps row % 8: lane-constant swizzle term");
+  constexpr uint32_t spanTileBytes = headsPerSpan * Tile::rowBytes;       // 2048
+  constexpr uint32_t spanScaleBytes = headsPerSpan * scaleRowBytes;       // 64
+  constexpr uint32_t pageLoopUnroll = mixedPageLoopUnroll(nbSpans);
+  static_assert(dstNbHeads >= maxNbCopiedHeads);
+  using flashinfer::KVPageFormat;
+  uint8_t constexpr a16Format = static_cast<uint8_t>(KVPageFormat::kA16);
+  uint8_t constexpr fp8Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
+  uint8_t constexpr fp4Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4);
+
+  // Every lane has passed its own cp.async.wait_group; this makes all lanes' copies of the
+  // group visible to all lanes (the compact path has the same barrier at both sites).
+  __syncwarp();
+
+  // Lane constants: token tok of every span (row % 8 = tok % 8 for all spans), block pair h.
+  uint32_t const lane = laneId();
+  uint32_t const tok = lane % headsPerSpan;
+  uint32_t const h = lane / headsPerSpan;
+  uint32_t const grain0 = blocksPerLane * 2 * h;  // logical grain of block 2h = 4h
+  uint32_t const tileBase = smemAddr(&dst);
+  uint32_t const addr0 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 0);
+  uint32_t const addr1 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 1);
+  uint32_t const addr2 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 2);
+  uint32_t const addr3 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 3);
+  uint32_t const scaleAddr = smemAddr(scales) + tok * scaleRowBytes + blocksPerLane * h;
+
+  auto const expandSpan = [&](uint32_t span, auto formatTag) {
+    constexpr uint8_t formatValue = decltype(formatTag)::value;
+    static_assert(formatValue == fp8Format || formatValue == fp4Format);
+    constexpr bool isFP8 = formatValue == fp8Format;
+    constexpr float pow2k = isFP8 ? 0x1p120f : 0x1p126f;
+    float const g = isFP8 ? fp8GlobalScale : fp4GlobalScale;
+    float const gFold = g * pow2k;                 // exact for |g| < 2^8; inf beyond -> fallback
+    bool const foldOk = fabsf(g) >= 0x1p-117f;     // every s * g fp32-normal
+    uint32_t const tileOff = span * spanTileBytes;
+    uint32_t const scaleOff = span * spanScaleBytes;
+    // All shared loads of the span first (the lds* helpers are asm volatile: source order is
+    // issue order): the scale pair and both packed blocks are in flight while the scale chain
+    // and the vote run, and the fold branch bodies only compute and store.  The first cut
+    // loaded the payload inside the fold branch, after the vote: every span then exposed the
+    // LDS latency twice in series (LDS.U16 -> cvt -> FMUL -> vote -> LDS.128 -> decode) and ncu
+    // measured short_scoreboard 1.32 -> 2.39 (fp8) with the instruction count down 16 %.
+    // mha_sm90.cu's expandPackedStage has the same loads-first order.
+    uint32_t const s01 = ldsU16(scaleAddr + scaleOff);  // scales of blocks 2h (lo), 2h+1 (hi)
+    LdGrain packed[blocksPerLane];  // FP8: 16 B per block; FP4: 8 B in [i][0], [i][1]
+    if constexpr (isFP8) {
+      packed[0] = ldsGrain(addr0 + tileOff);
+      packed[1] = ldsGrain(addr2 + tileOff);
+    } else {
+      ldsB64(addr0 + tileOff, packed[0][0], packed[0][1]);
+      ldsB64(addr2 + tileOff, packed[1][0], packed[1][1]);
+    }
+    float r0, r1;
+    e4m3x2ScalesToFloat(s01, r0, r1);
+    float const f0 = r0 * gFold;
+    float const f1 = r1 * gFold;
+    bool const fold = foldScalePairFinite(f0, f1, foldOk);
+
+    auto const body = [&](auto foldTag) {
+      constexpr bool kFold = decltype(foldTag)::value;
+      uint32_t const sf2_0 = kFold ? bf16x2Broadcast(f0) : bf16x2Broadcast(r0 * g);
+      uint32_t const sf2_1 = kFold ? bf16x2Broadcast(f1) : bf16x2Broadcast(r1 * g);
+      // One block: packed[i] came from grain a; outputs go to grains a, b (logical 2b, 2b+1).
+      auto const block = [&](LdGrain const& p, uint32_t a, uint32_t b, uint32_t sf2) {
+        LdGrain out[2];
+        if constexpr (isFP8) {
+          expandE4M3Block16BF16Placed<kFold>(p, sf2, out);
+        } else {
+          expandE2M1Block16BF16Placed<kFold>(p[0], p[1], sf2, out);
+        }
+        stsGrain(a, out[0]);
+        stsGrain(b, out[1]);
+      };
+      block(packed[0], addr0 + tileOff, addr1 + tileOff, sf2_0);  // block 2h   (grains 4h, 4h+1)
+      block(packed[1], addr2 + tileOff, addr3 + tileOff, sf2_1);  // block 2h+1 (grains 4h+2, 4h+3)
+    };
+    if (fold) {
+      body(MixedFoldTag<true>{});
+    } else {
+      body(MixedFoldTag<false>{});
+    }
+  };
+
+#if MIXED_PAGE_STATIC_FORMAT == 0
+  unused(formats);
+  unused(expandSpan);
+  unused(sourceHeadOffset);
+  unused(a16Format);
+#else
+#pragma unroll(pageLoopUnroll)
+  for (uint32_t span = 0; span < nbSpans; ++span) {
+#if MIXED_PAGE_STATIC_FORMAT > 0
+    unused(formats);
+    unused(sourceHeadOffset);
+    unused(a16Format);
+    expandSpan(span, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
+#else
+    uint32_t const localPage = (sourceHeadOffset + span * headsPerSpan) / tokensPerPage;
+    assert(localPage < nbPages);
+    uint8_t const format = selectByIndex(formats.values, localPage);
+    if (format == fp8Format) {
+      expandSpan(span, MixedFormatTag<fp8Format>{});
+    } else if (format == fp4Format) {
+      expandSpan(span, MixedFormatTag<fp4Format>{});
+    } else {
+      assert(format == a16Format);
+    }
+#endif
+  }
+#endif
+  __syncwarp();
+}
+
+// ---- [44] item 3 (gated on artifact A0): copy with hoisted per-lane / per-page constants ----
+//
+// Same ownership, formats, cache policies and zero-fill rules as copyMixedPartialHeadsAsync
+// (lane = block l % 4 of rows l / 4 + 8 * iteration: coalesced 16 B / 8 B lanes per token row),
+// same page-outer dispatch; only where the address arithmetic is done changes.  Selected by
+// mha.cu's MIXED_HOISTED_COPY at the two mixed copy sites of the sm90 SPEC_DEC compact build;
+// geometry fixed by static_assert (128 B parts, 16-token spans, 4 B scale words, one warp, row 0
+// origin, page-aligned source), any other instantiation fails to compile.
+//
+// Data flow, one call (K: one 128 B part of 64 rows = 4 spans; V: one 32-row half-tile = 2):
+//   lane constants: b = l % 4, x = l / 4 (= row % 8 for every row the lane copies: rows advance
+//   by 8 per iteration and 16 per span, origin row 0), elem = (idxPart * 4 + b) * 16,
+//   dstFirst = tileBase + byteOffset<swz>(x, 2b), dstSecond = ... (x, 2b + 1)   (u32)
+//   per span (page): pageValid; laneSrc = payload + [page * stride.page + headIdx * stride.head +
+//   x * stride.token] (0 if !pageValid) + elemOff(format) (u64: 3 IMAD.WIDE), iterStride = 8 *
+//   stride.token (u64)
+//   per iteration i in {0, 1}: src = laneSrc + i * iterStride (one 64-bit add), valid = pageValid
+//   && 16 span + x + 8 i < nbAvailHeads (ISETP + PLOP3), LDGSTS [dstFirst + 2048 span + 1024 i]
+//   (immediate) with src-size valid ? n : 0 (SEL): A16 two cg 16 B (second grain from src + 16),
+//   FP8 one ca 16 B (MIXED_FP8_COPY 1; 0 / 2 as in the stock helper), FP4 one ca 8 B.
+//   scale loop: lane = row l + 32 i of the tile; page l / 16 + 2 i, token l % 16; for compressed
+//   pages one ca 4 B LDGSTS of the row's scale group [scales + page/token/head strides + 4 idxPart]
+//   to [scaleBase + 4 l + 128 i], src-size 4 if the row is valid else 0 (zero scale word ->
+//   the expansion's f = 0: vote-neutral, 0 x payload 0); A16 / bad pages issue nothing (their
+//   scale word is never read: A16 spans are skipped by the expansion) - no pointer select.
+// Control flow: page loop (unrolled in static modules, rolled in the dynamic one) -> warp-uniform
+//   format branch (dynamic) -> two unrolled iterations; then the scale loop (1-2 iterations).
+//   No __syncwarp here: cp.async completion is the caller's wait_group + the expansion's barrier.
+template <uint32_t size>
+__device__ inline void cpAsyncCaShared(uint32_t dstAddr, void const* src, uint32_t srcSize) {
+  static_assert(size == 4 || size == 8 || size == 16);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(dstAddr), "l"(src),
+               "n"(size), "r"(srcSize));
+}
+__device__ inline void cpAsyncCgShared16(uint32_t dstAddr, void const* src, uint32_t srcSize) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dstAddr), "l"(src),
+               "r"(srcSize));
+}
+
+template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, bool isK,
+          uint32_t dstNbHeads, uint32_t nbPages, typename _LdGrain>
+__device__ inline void copyMixedPartialHeadsAsyncHoisted(
+    Array2D<_LdGrain, dstNbHeads,
+            exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
+    uint8_t* dstScales, PageTransport const& transport,
+    Vec<KVCachePageIndex, nbPages> const& pages, MixedPageFormats<nbPages> const& formats,
+    uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
+  using Tile = Array2D<_LdGrain, dstNbHeads,
+                       exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
+  // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
+  static_assert(sizeof(_LdGrain) == grainBytes && grainBytes == 16);
+  static_assert(swizzle && Tile::rowBytes == 128 && Tile::cols == 8, "128 B swizzled tile rows");
+  static_assert(Tile::cols == 8 && warp_size == 32 && tokensPerPage == 16);
+  constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
+  static_assert(partBytes == 128, "128 B parts");
+  constexpr uint32_t blocksPerPart = exactDiv(exactDiv(partBytes, grainBytes), 2);
+  static_assert(blocksPerPart == 4);
+  constexpr uint32_t headsPerSpan = mha::min(tokensPerPage, maxNbCopiedHeads);
+  static_assert(headsPerSpan == 16 && maxNbCopiedHeads % headsPerSpan == 0);
+  constexpr uint32_t nbSpans = exactDiv(maxNbCopiedHeads, headsPerSpan);
+  static_assert(nbSpans <= nbPages, "one page index per span (page-aligned tile origin)");
+  constexpr uint32_t blocksPerSpan = headsPerSpan * blocksPerPart;
+  constexpr uint32_t iterationsPerSpan = exactDiv(blocksPerSpan, warp_size);  // 2
+  constexpr uint32_t rowsPerIter = exactDiv(warp_size, blocksPerPart);         // 8
+  static_assert(rowsPerIter == 8 && headsPerSpan % 8 == 0, "row % 8 is a lane constant");
+  static_assert(partBytes == 128 &&
+                    validElemsPerHead == exactDiv(sizeof(PaddedCacheHead), sizeof(CacheElem)),
+                "every 16-element block of the head is valid: no per-block elem check");
+  static_assert(dstNbHeads >= maxNbCopiedHeads);
+  static_assert(maxNbCopiedHeads % warp_size == 0, "scale loop: no dump row needed");
+  constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
+  static_assert(scaleLoadBytes == 4);
+  constexpr uint32_t spanTileBytes = headsPerSpan * Tile::rowBytes;   // 2048
+  constexpr uint32_t iterTileBytes = rowsPerIter * Tile::rowBytes;    // 1024
+  constexpr uint32_t pageLoopUnroll = mixedPageLoopUnroll(nbSpans);
+  using flashinfer::KVPageFormat;
+  uint8_t constexpr a16Format = static_cast<uint8_t>(KVPageFormat::kA16);
+  uint8_t constexpr fp8Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
+  uint8_t constexpr fp4Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4);
+
+  // Lane constants.
+  uint32_t const lane = laneId();
+  uint32_t const blockInPart = lane % blocksPerPart;
+  uint32_t const headInSpan0 = lane / blocksPerPart;  // = row % 8 for every copied row
+  uint32_t const elem = (idxPart * blocksPerPart + blockInPart) * 16;
+  uint32_t const tileBase = smemAddr(&dst);
+  uint32_t const dstFirst = tileBase + Tile::template byteOffset<swizzle>(headInSpan0, blockInPart * 2);
+  uint32_t const dstSecond =
+      tileBase + Tile::template byteOffset<swizzle>(headInSpan0, blockInPart * 2 + 1);
+
+  auto const copySpan = [&](uint32_t span, KVCachePageIndex page, auto formatTag) {
+    constexpr uint8_t format = decltype(formatTag)::value;
+    constexpr bool isA16 = format == a16Format;
+    constexpr bool isFP8 = format == fp8Format;
+    constexpr bool isFP4 = format == fp4Format;
+    static_assert(isA16 || isFP8 || isFP4);
+    auto const& fmt = transport.formats[format];
+    uint8_t const* payload;
+    if constexpr (isK) {
+      payload = static_cast<uint8_t const*>(fmt.k_payload);
+    } else {
+      payload = static_cast<uint8_t const*>(fmt.v_payload);
+    }
+    bool const pageValid = page != kBAD_PAGE_INDEX;
+    uint32_t const spanHead0 = span * headsPerSpan;
+    // Byte offset of this lane's block inside the token row, per format.
+    uint32_t const elemOff = isA16 ? elem * uint32_t(sizeof(InputElem)) : (isFP8 ? elem : elem / 2);
+    // Page + head + lane-row terms once per span; the two iterations add 8 * stride.token.
+    uint64_t const laneOff =
+        pageValid ? uint64_t(page) * fmt.payload_stride.page +
+                        uint64_t(headIdx) * fmt.payload_stride.head +
+                        uint64_t(headInSpan0) * fmt.payload_stride.token
+                  : 0;
+    uint8_t const* const laneSrc = payload + laneOff + elemOff;
+    uint64_t const iterStride = uint64_t(rowsPerIter) * fmt.payload_stride.token;
+    uint32_t const dstSpan = span * spanTileBytes;
+    auto const iteration = [&](uint32_t i) {
+      uint8_t const* const src = laneSrc + i * iterStride;
+      uint32_t const localHead = spanHead0 + headInSpan0 + i * rowsPerIter;
+      bool const valid = pageValid && localHead < nbAvailHeads;
+      uint32_t const dstOff = dstSpan + i * iterTileBytes;
+      if constexpr (isA16) {
+        cpAsyncCgShared16(dstFirst + dstOff, src, valid ? grainBytes : 0U);
+        cpAsyncCgShared16(dstSecond + dstOff, src + grainBytes, valid ? grainBytes : 0U);
+      } else if constexpr (isFP4) {
+        cpAsyncCaShared<8>(dstFirst + dstOff, src, valid ? 8U : 0U);
+      } else {
+#if MIXED_FP8_COPY == 0
+        cpAsyncCaShared<8>(dstFirst + dstOff, src, valid ? 8U : 0U);
+        cpAsyncCaShared<8>(dstFirst + dstOff + 8, src + 8, valid ? 8U : 0U);
+#elif MIXED_FP8_COPY == 1
+        cpAsyncCaShared<16>(dstFirst + dstOff, src, valid ? grainBytes : 0U);
+#else
+        cpAsyncCgShared16(dstFirst + dstOff, src, valid ? grainBytes : 0U);
+#endif
+      }
+    };
+    static_assert(iterationsPerSpan == 2);
+    iteration(0);  // rows 16 span + x
+    iteration(1);  // rows 16 span + x + 8
+  };
+
+#pragma unroll(pageLoopUnroll)
+  for (uint32_t span = 0; span < nbSpans; ++span) {
+    KVCachePageIndex const page = selectByIndex(pages, span);
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+    unused(formats);
+    copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
+#else
+    uint8_t const format = selectByIndex(formats.values, span);
+    if (format == a16Format) {
+      copySpan(span, page, MixedFormatTag<a16Format>{});
+    } else if (format == fp8Format) {
+      copySpan(span, page, MixedFormatTag<fp8Format>{});
+    } else {
+      assert(format == fp4Format);
+      copySpan(span, page, MixedFormatTag<fp4Format>{});
+    }
+#endif
+  }
+
+  // Scale words: one lane per row, rows lane + 32 i; the row's 4 B group of this part.
+  uint32_t const scaleGroup = idxPart * blocksPerPart;
+  uint32_t const scaleBase = smemAddr(dstScales) + lane * scaleLoadBytes;
+  uint32_t const token = lane % tokensPerPage;
+  constexpr uint32_t headIterations = exactDiv(maxNbCopiedHeads, warp_size);
+#pragma unroll
+  for (uint32_t i = 0; i < headIterations; ++i) {
+    uint32_t const localHead = i * warp_size + lane;
+    uint32_t const localPage = i * exactDiv(warp_size, tokensPerPage) + lane / tokensPerPage;
+    static_assert(headIterations * exactDiv(warp_size, tokensPerPage) <= nbPages);
+    KVCachePageIndex const page = selectByIndex(pages, localPage);
+    bool const pageValid = page != kBAD_PAGE_INDEX;
+    uint8_t const format =
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+        pageValid ? MIXED_PAGE_STATIC_FORMAT : a16Format;
+#else
+        pageValid ? selectByIndex(formats.values, localPage) : a16Format;
+#endif
+    bool const compressed = format != a16Format;
+    if (compressed) {
+      auto const& sp = transport.formats[format];
+      uint8_t const* scales;
+      if constexpr (isK) {
+        scales = sp.k_scales;
+      } else {
+        scales = sp.v_scales;
+      }
+      bool const valid = localHead < nbAvailHeads;
+      uint64_t const scaleOffset = uint64_t(page) * sp.scale_stride.page +
+                                   uint64_t(token) * sp.scale_stride.token +
+                                   uint64_t(headIdx) * sp.scale_stride.head + scaleGroup;
+      cpAsyncCaShared<scaleLoadBytes>(scaleBase + i * warp_size * scaleLoadBytes,
+                                      scales + scaleOffset, valid ? scaleLoadBytes : 0U);
+    }
+  }
+}
+
 #endif  // ENABLE_MIXED_KV_CACHE
 
 template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, uint32_t grainBytesSmem,

@@ -1517,6 +1517,136 @@ Identical binaries, identical numbers within the round-to-round spread
 (<= 0.9 us); the mixed q=4 +4 us against the record is the co-tenant session
 offset, present in the base column too.
 
+### Track S step 6 — [44] placement decode + owner-cut expansion + hoisted copy constants, sm90 SPEC_DEC q=4 (2026-09-04, nkcut2 H200 + ws-1 RTX 5090, worktree S6)
+
+Design: `docs/mixed_kv_speed_round2_trackS_step6.md` (rev 2 + section 9 results).  Code:
+`csrc/xqa/mhaUtils.cuh` (`expandMixedPartialHeadsInPlaceBF16Placement`,
+`copyMixedPartialHeadsAsyncHoisted`, helpers), `csrc/xqa/mha.cu` (guards
+`MIXED_BF16_PLACEMENT_EXPANSION` = `ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_TILE_LOOPS &&
+!INPUT_FP16 && !GRP_LOAD_V`, `MIXED_HOISTED_COPY`; `alignas(4)` on `kScales` / `vScales`).
+Every other build keeps the stock helpers byte-for-byte (preprocessor guard).
+
+**A0 (zero-code attribution, pristine `5cc416fd` = step-5 modules; `FLASHINFER_JIT_LINEINFO=1`
+build whose stripped SASS is byte-identical to the production build and to the step-5
+`/tmp/mixedkv-wtE-s5-v1-sass` artifact for all four q=4 modules; ncu `--section SourceCounters`,
+`smsp__inst_executed` bucketed by any inlined `mhaUtils.cuh` frame; U = per 64-token tile =
+/ 8,704).**  Note the SourceCounters totals run 3-5 M above the plain `smsp__inst_executed.sum`
+(fp8 45.9 vs 42.8 M): the difference is the `barriers.cuh` spin loops (SYNCS / NANOSLEEP /
+BRA, 3.4-5.5 M), whose trip count depends on the replay timing.
+
+| bucket (base) | fp8 | fp4 | mixed | a16 |
+|---|---|---|---|---|
+| expansion (`expandMixedPartialHeadsInPlace` + converters) | 15.60 M, **34.0 %**, 1,792 U | 23.83 M, **43.6 %**, 2,738 U | 16.24 M, 28.6 %, 1,866 U | 0 |
+| copy + scales (`copyMixedPartialHeadsAsync`) | 11.43 M, **24.9 %**, 1,313 U | 11.25 M, 20.6 %, 1,293 U | 17.47 M, 30.8 %, 2,007 U | (stock A16 copy, in "tags/pages": 16.2 M, 50 %) |
+| mha.cu body (softmax, control) | 743 U | 747 U | 840 U | 749 U |
+| barriers.cuh (xBar / ring waits, spin) | 388 U | 466 U | 627 U | 295 U |
+| tags / pages (`mhaUtils` other) | 274 U | 278 U | 360 U | - |
+| total (SourceCounters) | 45.94 M | 54.71 M | 56.75 M | 32.24 M |
+
+Gate outcome: expansion 34.0 / 43.6 % (accept >= 35 / 45: at the line), copy + scales 24.9 /
+20.6 % (>= 18 %; the 12 % drop-item-3 threshold is not approached) -> **item 3 kept**.
+
+**Correctness (final tree).**  `run_xqa_mixed_page_transport.py` now has 66 cases: the 54
+of step 5 plus `TAIL_CASES` regime rows at q=4 (`subnormal`, `maxscale`) and a new
+`tinyglobal` regime (every finite E4M3 code, block scales {2, 4, 128, 448}, global scale
+`2^-118` < `2^-117`: the `foldOk` fallback on every span) at q=1 and q=4, so the sm90 M16
+modules see every finite E4M3 payload code incl. subnormals and 448 through the placement
+decode, FP4 spans with `|s g| >= 4` (fold vote fails -> two-multiply body) and the tiny-global
+fallback.  The host reference models the kernels' two roundings, `bf16(x * bf16(s * g))`
+(identical to the old `bf16(x * s)` at `g = 1`).  **66/66 on nkcut2 (default and
+`XQA_NB_SUB_SEQ=2`) and 66/66 on ws-1**, on the final tree.
+
+**SASS (sm90 q=4 modules, `cuobjdump -res-usage` / lineinfo attribution).**  REG 124 (dyn) /
+127 (a16) / 126 / 126 (fp8 / fp4), STACK 0, LDL 0, STL 0 (2 CTAs/SM, `launch__occupancy_limit_*`
+2 / 2, `launch__shared_mem_per_block_dynamic` 115,456 B: `alignas(4)` changed no layout).  Module
+SASS 4,760 / 3,928 / 4,600 / 4,640 (step 5: 4,968 / 3,928 / 4,352 / 4,688).  Static class counts
+in the guarded expansion (fp8 module, 12 span-bodies = 2 formats' fold + fallback per span x
+(4 K + 2 V) spans): F2FP 30 (**2.5 per span-call**: one `F2FP.F16.E4M3` for the scale pair
++ two `PACK_AB`; was 18 per lane-call), HADD2.F32 12, HMUL2 288 (= 12 x 16 fold + 6 x 16
+fallback: **8 per block, 16 in the fallback body**), PRMT 192 + LOP3 205 + IMAD 207 (the
+`PRMT, IMAD.SHL, LOP3` placement triple per pair), STS.128 48 (4 per span-call), LDS 18 (2 x
+LDS.128 + 1 LDS.U16 per span-call), VOTE 6, one `WARPSYNC` at the helper entry; no LDL / STL.
+Hoisted copy: LDGSTS 30 (unchanged count), `IMAD.WIDE` only in the per-span page/head/row
+terms, destinations `[R + imm]`; the scale loop's `if (compressed)` is predicated (`@!P0 / @!P1
+LDGSTS`, no BSSY) in the hot K body; two cold instances (prologue) use a BSSY/BRA/BSYNC
+pair.  sm120: all eight `xqa_mha` modules (formats -1/0/1/2 x q=1/q=4) byte-identical to the
+pristine `5cc416fd` build except the dyn q=1 pair (`cb834699b703` vs `1604033e8955` — the
+same two hashes step 5 recorded for two pristine builds: ptxas variation).  sm90 q=1:
+`xqa_mha_sm90.cuda.o` and the q=1 `xqa_mha.cuda.o` byte-identical base vs new for all four
+formats (`mhaUtils.cuh` is included there; the guard excludes the new helpers).
+
+**Executed instructions and attribution (final tree; ncu one launch).**
+
+| metric | fp8 step 5 -> [44] | fp4 | mixed | a16 |
+|---|---|---|---|---|
+| `smsp__inst_executed.sum` | 42.76 -> **35.99 M** (0.84x; accept band 32-35) | 50.85 -> **36.53 M** (0.72x; 32-35) | 51.47 -> **42.44 M** (0.82x; 40-43: in band) | 29.85 -> 29.91 M |
+| expansion (SourceCounters, U) | 1,792 -> **1,506** | 2,738 -> **1,570** | 1,866 -> (see note) | 0 |
+| copy + scales (U) | 1,313 -> **504** | 1,293 -> **514** | 2,007 -> (see note) | - |
+| issue-active (% of active cycles) | 52.0 -> **43.2** | 58.1 -> **47.5** | 58.3 -> 51.7 | 50.4 -> 51.1 |
+| warp-cycles per issued instruction | 6.61 -> **8.13** | 5.76 -> **7.30** | 5.78 -> 6.56 | 6.61 -> 6.66 |
+| short_scoreboard / long_scoreboard / wait | 1.32 / 1.39 / 1.02 -> **2.01 / 1.81 / 0.97** | 0.69 / 0.99 / 0.97 -> **1.64 / 1.48 / 0.96** | 0.51 / 0.93 / 1.24 -> 0.73 / 1.34 / 1.42 | 0.28 / 2.81 / 0.92 -> 0.28 / 2.73 / 0.92 |
+| no_instruction | 0.15 -> 0.43 | 0.30 -> 0.45 | 0.51 -> 0.46 | 0.14 -> 0.13 |
+| gpu__time_duration (serialized under ncu) | 139.3 -> 138.2 | 147.7 -> 126.8 | 148.7 -> 137.0 | 98.0 -> 97.6 |
+
+Note (mixed): in the dyn module the lineinfo frames of the rolled loop body do not separate
+the expansion from the copy cleanly (HMUL2 / F2FP appear under copy lines), so only the sum is
+quoted: copy + expansion 3,873 -> **2,698 U** (samples 5,795 -> 4,382 of ~10 K).
+
+**Where the time went (warp-stall PC sampling, same SourceCounters runs; samples per bucket,
+fp8).**  base 9,829 -> [44] 9,960 total (the kernel is not shorter).  Copy 2,122 -> **889**
+(-1,233, the hoist did what it was built for); expansion 2,282 -> **2,331** (+49 with 16 % fewer
+instructions: the expansion's time share is unchanged); mha.cu body 2,766 -> 3,539 (+773, 34 %
+long_scoreboard), tags / pages 693 -> 1,156 (+463, 48 % long_scoreboard), mma / ldmatrix 613 ->
+747, barriers 142 -> 285.  Inside the new expansion the samples sit on `F2FP.F16.E4M3`
+(86 % short_sb: waits for the `LDS.U16` scale pair), the next span's `LDS.128` (73 % short_sb:
+register WAR against the previous span's `STS.128` still reading the same registers) and the
+fold `@P BRA` (78 % short_sb: waits for `VOTE.ALL`).  fp4 shows the same pattern (F2FP 80 %,
+LDS 75 %, BRA 66 % short_sb) but its expansion did shrink (3,605 -> 2,487 samples, total
+10,425 -> 9,151).  Reading: the per-span dependency chain `LDS.U16 -> F2FP -> HADD2 -> FMUL ->
+FMNMX -> FSETP -> VOTE -> BRA` (~8 dependent instructions before any decode) plus the
+`STS -> LDS` register reuse is exposed at 4 warps per SMSP; the issue slots the copy freed
+became landing-latency waits (long scoreboard on the page/tag `LDG`s and the K/V ring),
+so for fp8 the instruction-count lever has run out at this pipeline depth.  A first cut with the
+payload `LDS` inside the fold branch (after the vote) measured short_sb 2.39 / issue-active 42.4 %
+(fp8 117.8 us); the committed loads-first order (`LDS.U16`, `LDS.128`, `LDS.128` before the
+chain, as `mha_sm90.cu`'s `expandPackedStage`) gives 2.01 / 43.2 % (116.7 us): the WAR and the
+scale-chain stalls remain.
+
+**Timing (nkcut2, `flock`, `--repeats 2 --trials 5`, three rounds; co-tenant VLLM::EngineCore
+resident, 2 x 117 us = 0.23 ms per event pair; q=1 = untouched `mha_sm90.cu` control).**
+
+| mode | q=4 step-5 record | q=4 [44] r1 / r2 / r3 (median; min-max) | ratio | design band | target | q=1 control |
+|---|---|---|---|---|---|---|
+| transport_a16 | 86.1 | 86.2 / 86.4 / 86.8 (85.2-88.6) | 1.00x | 80-86 | 135 (pass) | 81.7 (82.3) |
+| fp8 | 114.0 | **116.7 / 116.7 / 116.7** (114.4-117.6) | **1.024x** | 79-95 (missed) | <= 94 (open, 1.24x) | 76.5 |
+| fp4 | 115.9 | **103.6 / 103.3 / 104.0** (101.8-105.1) | **0.89x** | 77-84 (missed; accept <= 90 missed) | <= 59 (open, 1.76x) | 70.7 |
+| mixed | 116.1 | **110.6 / 110.3 / 109.6** (108.4-111.4) | **0.95x** | 89-96 (missed) | <= 101 (open, 1.09x) | 79.8 |
+
+Design accept rule: not met (fp8 > 94, mixed > 101, fp4 > 90).  Reject rule (any compressed
+mode > 1.05x step 5, or a16 > 5 %): not triggered (fp8 1.024x, a16 1.00x).  The tree is kept
+for the fp4 (-12 us) and mixed (-6 us) gains; fp8's 2.4 % regression is recorded against it.
+Reading (ii) of the design (issue rate recovers with the shorter chain) is refuted by the
+counters: issue-active fell, short_scoreboard rose.
+
+**ws-1 (RTX 5090, sm120) interleaved pristine `5cc416fd` / [44] rounds, `--repeats 5 --trials 5`,
+identical binaries (no VLLM co-tenant this session):** q=1 base 173.0-173.2 / 100.3-100.9 /
+59.6-60.2 / 113.5-114.0 vs new 173.2-173.4 / 100.6-100.9 / 59.8-60.4 / 113.5-114.2; q=4 base
+176.1 / 114.2-114.9 / 65.5-65.9 / 119.1-119.5 vs new 175.9-176.1 / 114.4-115.3 / 65.5-65.9 /
+119.0-119.2 (a16 / fp8 / fp4 / mixed).  Equal within 0.9 us; the sm120 q=4 targets stay passed.
+
+**Behavioural note.**  The sm90 q=4 modules now decode the E4M3 NaN codes `0x7F` / `0xFF` by
+placement to the finite `480 * 2^-120` (x scale) where the stock `cvt` path (sm120, M32, q=64
+modules) yields NaN — the same choice `mha_sm90.cu` made in [16]; the sealer never emits those
+codes (payload capped at 448) and the test harness remaps them, so this is outside the contract
+but is a difference between the sm90 q=4 modules and the sm120 / M32 ones.
+
+**Artifacts.**  nkcut2: `/tmp/mixedkv-wtS6-a0/` (base `fmt*.nvdis`, `*.source.csv`,
+`*.ncu-rep`; final `v2-*`; `attrib2.py`, `stalls.py`, `buckets.py`), workspaces
+`/tmp/mixedkv-wtS6{-base,-base-li,v2,v2-li}`, logs `/tmp/mixedkv-wtS6-{a0,stage1,stage2,v2}.log`,
+matrices `/tmp/mixedkv-wtS6v2.matrix{,2}.log`; checkouts
+`/home/bigboi/dash-flashinfer-claude-wtS6{base,v2}`.  ws-1: `/tmp/mixedkv-wtS6{-base,v2}`,
+`/tmp/mixedkv-wtS6-b-{base,new}-q{1,4}-r{1,2,3}.json`, `/tmp/mixedkv-wtS6-stage2.log`.
+
 #### Correction to the round-2 baseline pacing reading (2026-09-04)
 
 The "fp8 is K-converter paced (1.62 vs 1.02 us)" table above was traced on
