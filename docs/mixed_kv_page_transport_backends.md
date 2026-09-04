@@ -1825,3 +1825,23 @@ is correct (60/60), structurally as designed (build facts above), and -9 to
 -15 us on the compressed modes.  Next levers in order of measured size: pair
 asymmetry (-6 to -10.6 us fp8), fill (-4 to -5 us), item boundary (-0.8 us
 per CTA).
+
+### Merged-tree confirmation @ 67a6b4aa ([8] + Track S step 6 + F [23] on main; 2026-09-04)
+
+72/72 on nkcut2 (H200) and ws-1 (RTX 5090) with the unified tail table
+(q=1 override `XQA_PERSISTENT_CTAS`, q=4 override `XQA_NB_SUB_SEQ`).  Locked
+bench, standard script (5 x 5), min / median / max us:
+
+| host | q | transport_a16 | fp8 | fp4 | mixed |
+|---|---|---|---|---|---|
+| H200 | 1 | 78.9 / **79.4** / 79.6 | 67.5 / **67.9** / 68.5 | 60.3 / **60.6** / 60.9 | 64.4 / **64.6** / 65.2 |
+| H200 | 4 | 82.9 / **83.4** / 84.3 | 112.6 / **113.5** / 113.8 | 100.6 / **101.5** / 102.0 | 107.6 / **107.8** / 108.2 |
+| RTX 5090 | 1 | 172.7 / 173.3 / 174.1 | 100.2 / 100.7 / 100.8 | 59.8 / 59.9 / 60.4 | 112.8 / 113.6 / 114.0 |
+| RTX 5090 | 4 | 175.6 / 176.0 / 177.0 | 114.6 / 116.3 / 116.6 | 65.5 / 65.9 / 66.2 | 119.2 / 119.8 / 120.1 |
+
+sm90 q=1 object: REG 48 STACK 0, USETMAXREG 2 (0x28 / 0x38), 2 CTAs/SM
+(registers and smem both limit 2), dyn smem 113.66 KB, issue-active 64 %.
+Gate status: sm120 all six rows pass; H200 q=1 fp8 67.9 (<= 58), mixed 64.6
+(<= 62), fp4 60.6 (<= 36) open — round 3 (pair asymmetry, fill, [15]/[34]);
+H200 q=4 fp8 113.5 (<= 94), fp4 101.5 (<= 59), mixed 107.8 (<= 101) open;
+FA3 compressed 474 / 507 / 880 (<= 330) open — F24.
