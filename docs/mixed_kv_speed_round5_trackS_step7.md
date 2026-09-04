@@ -637,3 +637,37 @@ modules `seqLen || list -> copy` (was `seqLen -> list -> copy`; the tag load is 
 bench builds have `SLIDING_WINDOW=0`.  Expected SASS: the list `LDG.E.CONSTANT` (`.nc`) no
 longer under a predicate derived from the `seqLenList` load; `SEL` after it; count of `LDG` per
 `loadPages` unchanged (4 K / 2 V; [45d] takes it to 1).  Registers: 0 (one more predicate).
+
+### 8.4 [45d] — lane-distributed page indices (commit "[45d]")
+
+Files: `csrc/xqa/mhaUtils.cuh` (`getPageLaneUngated<nbLoadedPages>`: lane s < nbLoadedPages
+loads page `idxPageBeg + s` with the [45f] predicate split, returns one `KVCachePageIndex` per
+lane; `mixedPageTagOfLane(transport, pageLane)`: each lane loads the tag of its own page (0 for
+BAD); `copyMixedPartialHeadsAsyncHoisted<..., isK, nbPages>(dst, scales, transport,
+KVCachePageIndex pageLane, uint32_t formatWord, ...)` — `nbPages` is now an explicit template
+argument (it was deduced from the vector), the span loop reads `page = __shfl_sync(~0,
+pageLane, span)` and the scale loop `__shfl_sync(~0, pageLane, localPage)` with the
+lane-dependent source), `csrc/xqa/mha.cu` (`MIXED_ALL_HOISTED_COPY` modules: `KVCachePageIndex
+pageLane, pageLaneNext` replace `KCachePageIndices pageIdx, pageIdxNext` (V: the
+`VCachePageIndices` pair); `loadPages` rotates the lane value, the dyn module's tag load is
+`mixedPageTagOfLane(pageLane)`; the two hoisted copy calls pass `pageLane` and
+`nbPagesPerWarpTile` / `nbPagesPerVTile`).  The a16 module and every non-hoisted build keep the
+vector form (`#else` = stock / [45f] text; the stock-view `unifdef` of `mha.cu` is
+token-identical to the tip's).
+
+Data flow (fp8 / fp4 / dyn), per `loadPages(p)` call: `pageLane <- pageLaneNext` (indices of the
+tile about to be copied; loaded two calls ago), dyn: `pageTagLane <- page_format[pageLane]` (lane
+s, predicated on `pageLane != BAD`), `pageLaneNext <- getPageLaneUngated(p)` (one predicated
+`LDG` per warp: lanes 0..3 (K) / 0..1 (V), consecutive words of one 16 B sector; BAD elsewhere).
+Per copy call: span s -> `SHFL.IDX pageLane, s` -> `pageValid`, `laneOff` (3 `IMAD.WIDE`) ->
+LDGSTS x2 as before; scale loop i -> `SHFL.IDX pageLane, 2 i + lane / 16` -> `pageValid`, scale
+`LDGSTS`.  Nothing about the page index is ever warp-uniform-provable (each lane's value is its
+own load), so ptxas cannot park it in a uniform register: the `R2UR` 12 instructions after the
+`LDG` (section 2 (a)) has no source.  Prefetch distance unchanged (indices two tiles ahead, tags
+one tile ahead); the V prime loop and `advanceVPages` are untouched (they call `loadPages` as
+before).  Control flow: unchanged; the copy's per-span branch (dyn) is on the tag word, not on the
+page.  `SHFL.IDX` per copy call: K 4 + 2 = 6, V 2 + 1 = 3 (the tag broadcast's 4 `SHFL` + 3 `PRMT`
+are gone since [45c]).  Expected SASS: `LDG` in `loadPages` 1 (+1 tag, dyn) per call instead of
+4 + 1 (K) / 2 + 1 (V); `R2UR` fed by the page-index `LDG` 0; `LDGSTS` count unchanged.
+Registers: K -6, V -2 per stage pair if the vectors were vector registers (0 if ptxas held them in
+URs, which the `R2UR` suggests); +0 otherwise.
