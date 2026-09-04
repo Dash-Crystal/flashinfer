@@ -716,3 +716,34 @@ loop.  Expected SASS (A1): `VOTE.ALL` in the expansion 2 per module (K call, V c
 had 6), `F2FP.F16.E4M3` in the static K body 4 before the vote + 1 per span in each fold body,
 one `BRA` on the vote per call; `LDS.U16` per K call 4 (static) / 8 (dyn: pre-vote + body);
 `LDS.128` / `LDS.64` 2 and `STS.128` 4 per span unchanged; no LDL / STL.
+
+### 8.6 [45b] — block-pipelined spans, two register sets, static modules only (commit "[45b]")
+
+File: `csrc/xqa/mhaUtils.cuh`, the static branch of `expandMixedPartialHeadsInPlaceBF16Placement`
+(`MIXED_PAGE_STATIC_FORMAT > 0`); the dynamic branch is untouched (one set; section 3.2).  Switch
+`MIXED_EXPANSION_PIPELINED_SPANS` (default 1; 0 = the [45a] single-set body, the section-4
+register-gate fallback — a build constant, not a tuning knob).  `packed[2][2]` = `[set][block]`,
+indexed only by the unrolled span parity (compile-time after `#pragma unroll`; the LDL / STL 0
+gate catches any failure to unroll).
+
+```
+spans<fold>, span s (unrolled), set = s % 2, nxt = (s + 1) % 2:
+  sf2 pair = scalePair(s01[s])
+  s + 1 < nbSpans:  LDS [addr0 + 2048 (s+1)] -> packed[nxt][0]      (before any STS of span s)
+  decode packed[set][0] -> STS.128 [addr0 + 2048 s], [addr1 + 2048 s]
+  s + 1 < nbSpans:  LDS [addr2 + 2048 (s+1)] -> packed[nxt][1]
+  decode packed[set][1] -> STS.128 [addr2 + 2048 s], [addr3 + 2048 s]
+```
+
+Why the WAR disappears structurally: the `LDS` that fills a register is issued before the `STS`
+that could otherwise recycle that register's previous contents (span s's `out` registers do not
+exist yet when span s+1's loads are issued), so ptxas has no reason to place an `LDS` destination
+on a register a draining `STS` still reads; each `LDS` then lands under the ~24 instructions of
+the previous block's decode.  Shared-memory ordering: spans are 2,048 B apart, so a load of span
+s+1 never aliases a store of span s; within a span both blocks are loaded (one in the previous
+iteration, one now) before the span's first store, as in [44].  Peak live set: `packed[set][1]`
++ `packed[nxt][0]` + `packed[nxt][1]` (12 FP8 / 6 FP4) + `out` (8) + `sf2` (2) = 22 / 16 vs
+[45a]'s 18 / 14: **+4 (FP8) / +2 (FP4)**.  Expected SASS (A1): in each static fold body the
+`LDS.128` / `LDS.64` of span s+1 precede the `STS.128` of span s (address immediates `+2048 (s+1)`
+vs `+2048 s`); counts per span unchanged (2 `LDS`, 4 `STS.128`); REG <= 128, STACK 0 — if not,
+`MIXED_EXPANSION_PIPELINED_SPANS 0`.

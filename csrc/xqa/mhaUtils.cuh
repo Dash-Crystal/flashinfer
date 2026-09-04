@@ -1008,6 +1008,13 @@ struct MixedFoldTag {
 // bf16_rn(s * g * 2^k) == bf16_rn(s * g) * 2^k.  foldOk is warp-uniform; it is inside the vote so
 // the result is uniform by construction.  A call takes the fallback iff any span would have.
 constexpr float kMixedFoldBound = 255.5f * 0x1p120f;
+// [45b] (Track S step 7): the static modules' fold bodies issue span s+1's payload LDS before span
+// s's decode + STS (two register sets, indexed by the unrolled span parity), so no LDS destination
+// is a register a still-draining STS reads and each LDS latency is covered by the previous
+// block's decode.  0 = one set (the register-gate fallback of the design's section 4).
+#ifndef MIXED_EXPANSION_PIPELINED_SPANS
+#define MIXED_EXPANSION_PIPELINED_SPANS 1
+#endif
 __device__ inline bool foldScalesFinite(bool finite, bool foldOk) {
   return __all_sync(0xFFFFFFFFu, foldOk && finite);
 }
@@ -1227,30 +1234,55 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   for (uint32_t s = 0; s < nbSpans; ++s) {
     s01[s] = ldsU16(scaleAddr + s * spanScaleBytes);
   }
-  LdGrain packed[2];  // [block]: FP8 16 B per block; FP4 8 B in [i][0], [i][1]
-  loadBlock(Fmt{}, addr0, packed[0]);
-  loadBlock(Fmt{}, addr2, packed[1]);
+#if MIXED_EXPANSION_PIPELINED_SPANS
+  // [45b] [set][block]: span s decodes from set s % 2 while span s+1 lands in set (s + 1) % 2.
+  LdGrain packed[2][2];
+#else
+  LdGrain packed[1][2];  // one set: every span loads, decodes and stores in place
+#endif
+  loadBlock(Fmt{}, addr0, packed[0][0]);  // FP8 16 B per block; FP4 8 B in [.][i][0], [.][i][1]
+  loadBlock(Fmt{}, addr2, packed[0][1]);
   bool finite = true;
 #pragma unroll
   for (uint32_t s = 0; s < nbSpans; ++s) {
     finite = finite && spanFinite(s01[s], gFold);
   }
   bool const fold = foldScalesFinite(finite, foldOk);  // one VOTE.ALL per call
-  // Both bodies are straight-line over the unrolled spans: per span, (s > 0: payload loads),
-  // sf2 pair from the kept scale word, block 2h, block 2h+1.  A lane writes only grains it
-  // alone reads, so no barrier sits between its loads and stores.
+  // Both bodies are straight-line over the unrolled spans.  A lane writes only grains it alone
+  // reads, so no barrier sits between its loads and stores.
+  //   [45b] (MIXED_EXPANSION_PIPELINED_SPANS): per span s - sf2 pair from the kept scale word;
+  //   LDS span s+1 block 2h into the other set; decode + STS span s block 2h; LDS span s+1
+  //   block 2h+1; decode + STS span s block 2h+1.  Every LDS is issued before the STS that could
+  //   otherwise recycle its destination register, and lands under ~24 decode instructions.
+  //   Peak live: 3 blocks (12 FP8 / 6 FP4) + out (8) + sf2 (2).
+  //   Fallback (0): span s > 0 loads both of its blocks first, then decodes and stores them.
   auto const spans = [&](auto foldTag) {
 #pragma unroll
     for (uint32_t s = 0; s < nbSpans; ++s) {
       uint32_t const off = s * spanTileBytes;
-      if (s > 0) {  // span 0's payload was issued before the vote
-        loadBlock(Fmt{}, addr0 + off, packed[0]);
-        loadBlock(Fmt{}, addr2 + off, packed[1]);
-      }
       uint32_t sf2_0, sf2_1;
       scalePair(Fmt{}, foldTag, s01[s], sf2_0, sf2_1);
-      block(Fmt{}, foldTag, packed[0], addr0 + off, addr1 + off, sf2_0);  // grains 4h, 4h+1
-      block(Fmt{}, foldTag, packed[1], addr2 + off, addr3 + off, sf2_1);  // grains 4h+2, 4h+3
+#if MIXED_EXPANSION_PIPELINED_SPANS
+      uint32_t const set = s % 2;                  // compile-time after unrolling
+      uint32_t const nxt = (s + 1) % 2;
+      uint32_t const offNext = (s + 1) * spanTileBytes;
+      bool const hasNext = s + 1 < nbSpans;
+      if (hasNext) {
+        loadBlock(Fmt{}, addr0 + offNext, packed[nxt][0]);
+      }
+      block(Fmt{}, foldTag, packed[set][0], addr0 + off, addr1 + off, sf2_0);  // grains 4h, 4h+1
+      if (hasNext) {
+        loadBlock(Fmt{}, addr2 + offNext, packed[nxt][1]);
+      }
+      block(Fmt{}, foldTag, packed[set][1], addr2 + off, addr3 + off, sf2_1);  // grains 4h+2, 4h+3
+#else
+      if (s > 0) {  // span 0's payload was issued before the vote
+        loadBlock(Fmt{}, addr0 + off, packed[0][0]);
+        loadBlock(Fmt{}, addr2 + off, packed[0][1]);
+      }
+      block(Fmt{}, foldTag, packed[0][0], addr0 + off, addr1 + off, sf2_0);  // grains 4h, 4h+1
+      block(Fmt{}, foldTag, packed[0][1], addr2 + off, addr3 + off, sf2_1);  // grains 4h+2, 4h+3
+#endif
     }
   };
   if (fold) {
