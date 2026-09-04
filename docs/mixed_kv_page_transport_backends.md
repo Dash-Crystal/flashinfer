@@ -2433,3 +2433,12 @@ x 44; `ncu_{a16,fp8,fp4,mixed}*`):
 5. The a16 byte-identity: if the letter matters, the a16 module needs the
    [23] non-peeled loop text under `if constexpr (STATIC_A16)` (two loop
    shapes in the source) - the instruction stream is already identical.
+
+### FA3 merged-tree confirmation @ 40dcdc32 (F25 on main; 2026-09-04, nkcut2 H200)
+
+104/104 bit-exact.  Locked bench `--repeats 1 --trials 5`, medians (q=1 / q=64
+us): stock_a16 300.6 / 311.7, transport_a16 282.0 / 289.3, fp8 402.1 / 414.7,
+fp4 422.4 / 428.4, mixed 650.6 / 662.6 — equal to the wt/F25 record.  Target
+<= 330 open; F26 (scale-load ordering, 2-instruction copy addresses, protocol
+<= 70, fp4 expK/expV asymmetry, fp8 STS wavefronts, dynamic-module loop
+consolidation) in design.
