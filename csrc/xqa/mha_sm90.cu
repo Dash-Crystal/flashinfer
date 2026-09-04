@@ -117,6 +117,13 @@ constexpr uint32_t nbIOThrds = warp_size * nbIOWarps;
 #ifndef MIXED_KV_TRACE_TILE0
 #define MIXED_KV_TRACE_TILE0 0
 #endif
+// Diagnostic (trace builds): give CTA c the tile range of CTA P-1-c, so a per-CTA
+// throughput pattern can be attributed to the tile range (memory side) or to the
+// CTA id / SM placement.  A pure permutation of ranges among CTAs: results are
+// unchanged (scratch slots and the merger's enumeration both use the range index).
+#ifndef MIXED_KV_TRACE_REVERSE_RANGES
+#define MIXED_KV_TRACE_REVERSE_RANGES 0
+#endif
 // Persistent, balanced CTA scheduling (docs/mixed_kv_speed_round2_lever8.md):
 // the q=1 mixed build launches gridDim.x = ctasPerSm * SMs CTAs, each owning a
 // contiguous range of the linearized (request, head, tile) space.  SPEC_DEC and
@@ -668,6 +675,16 @@ struct KVTilePartLoader {
 //                       ld.acquire.cta -> atom.acq_rel.gpu.inc semaphores[H*req+head] ->
 //                       last arriver reads chunks {2c+1 | c0 <= c < c1} + {2c1 + (x_{c1+1} == Lend)}
 // ---------------------------------------------------------------------------
+
+// Range index of this CTA (the c of x_c = ceil(c*T/P)); blockIdx.x unless the
+// trace diagnostic reverses the assignment.
+__device__ __forceinline__ uint32_t persistentCtaIndex() {
+#if MIXED_KV_TRACE_REVERSE_RANGES
+  return gridDim.x - 1 - blockIdx.x;
+#else
+  return blockIdx.x;
+#endif
+}
 
 // Sliding-window bookkeeping per sequence length (the only per-request inputs).
 __device__ __forceinline__ uint32_t seqSkipTokens(uint32_t seqLen, uint32_t slidingWinSize) {
@@ -1991,7 +2008,7 @@ __launch_bounds__(128 * ctaWarpGroups)
           // arriving CTA of this sequence combines the slots.
           uint32_t const isCtaLast = (tileWord & SharedMem::tileCtaLastBit) != 0 ? 1U : 0U;
           ScratchMem const scratchMem{scratch, 2 * gridDim.x, 1};
-          uint32_t const idxChunk = 2 * blockIdx.x + isCtaLast;
+          uint32_t const idxChunk = 2 * persistentCtaIndex() + isCtaLast;
           static_assert(ctaNbValidQHeads <= gmmaWarpsPerGrp * warp_size);
           if (threadIdx.x < ctaNbValidQHeads) {
             float const colMax = smem.gemm1AccColMax[threadIdx.x];
@@ -2305,7 +2322,7 @@ __launch_bounds__(128 * ctaWarpGroups)
           // ones (x_c == x_{c+1}) never arrive on the semaphore.
           bool const sparse = nbTotalTiles < nbCtas;
           uint32_t const nbPartials = mha::min(c1 - c0 + 1, item.tiles);
-          assert(nbPartials >= 2 && c0 <= blockIdx.x && blockIdx.x <= c1);
+          assert(nbPartials >= 2 && c0 <= persistentCtaIndex() && persistentCtaIndex() <= c1);
           assert(sparse || nbPartials == c1 - c0 + 1);
           // 1. This CTA's chunk for item j is written (gemm1 -> st.release.cta).
           for (;;) {
@@ -3216,7 +3233,7 @@ __device__ inline void persistentPrologueScan(SharedMem& smem,
                                               uint32_t slidingWinSize) {
   uint32_t const lane = laneId();
   uint32_t const nbCtas = gridDim.x;
-  uint32_t const idxCta = blockIdx.x;
+  uint32_t const idxCta = persistentCtaIndex();
   uint32_t totalTiles = 0;
   for (uint32_t r0 = 0; r0 < batchSize; r0 += warp_size) {
     uint32_t const r = r0 + lane;
