@@ -39,3 +39,17 @@ Method: every change is a lever with an analytic model that predicts its gain
 from the measured record (docs/mixed_kv_page_transport_backends.md) and a
 verification artifact that reads the mechanism (SASS counts, per-tile trace,
 ncu launch/issue statistics); the stopwatch confirms, it does not steer.
+
+## Offloaded KV cache (sm120 and any host reading pages over a link)
+
+When pages stream from a host tier (PCIe / NVLink) rather than local device
+memory, the byte ratio is the wall: the link is 10-100x slower than DRAM, so
+FP4/FP8 pages decide between a pipeline stall and none, and the on-device
+request-pattern effects (sector utilization, L2 neighbour hits) are second order.
+Requirement carried by every host, independent of whether it is currently
+request-pattern-bound: the expansion path must consume packed pages at whatever
+rate they land without adding a stall of its own - lean, issue-light,
+shared-window `LDS`/`STS` with immediate offsets and independent block bodies,
+verified in SASS (no generic `LD.E`/`ST.E` for the expansion, no `LDL`/`STL`).
+On sm120 the compute warps are the expanders, so a lean expansion returns issue
+slots to the MMA directly; Track W's [29] adopts the same discipline as FA3's [23].
