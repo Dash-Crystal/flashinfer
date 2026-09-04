@@ -313,23 +313,34 @@ def test_xqa_native_block_fp8_matches_a16_expansion(q_len):
 
 
 # Tail / long-CTA / value-range cases for the q=1 (sm90 GMMA) host, run by
-# run_xqa_mixed_page_transport.py: (seq_len, XQA_NB_SUB_SEQ override, regime).
+# run_xqa_mixed_page_transport.py: (seq_len, XQA_PERSISTENT_CTAS override, regime).
+# The sm90 mixed q=1 build is persistent (lever [8]): P CTAs each own a contiguous
+# range of the linearized (request, head, tile) space; the override sets P
+# (None = ctasPerSm x SMs, i.e. more CTAs than tiles for these shapes).
 TAIL_CASES = [
-    # nbIters < kAhead + 1 tails (C7 class): one and two 64-token tiles per CTA, odd tails.
+    # T < P: empty CTAs, 1..3-tile items, every item after a CTA's first begins with a
+    # compressed tile issued mid-pipeline (C7 class); odd tails (mask on the last tile).
     (50, None, "normal"),
     (100, None, "normal"),
     (130, None, "normal"),
-    # 35 tiles in one CTA (single sub-sequence): more than two metadata chunks, so the
-    # chunk refill and its ready barrier are exercised (tiles 32.. read a refilled chunk).
+    # P = 1: one CTA runs everything (2 x 2 x 35 = 140 tiles: > 2 metadata chunk
+    # refills, 4 items, every output direct, no merge).
     (2200, 1, "normal"),
+    # P = 3: 46/47-tile CTAs over 35-tile sequences: partial items at both range
+    # ends, merges by non-first CTAs, chunk refills inside items.
+    (2200, 3, "normal"),
+    # P = 5 over 64-tile sequences (2 x 2 x 64 = 256 tiles, 51/52 per CTA): every
+    # sequence split across 2-3 CTAs, first/last items partial.
+    (4096, 5, "normal"),
     # converter decode value ranges (sm90 FP8 folded-scale fast path and its fallback).
     (285, None, "subnormal"),
     (285, None, "maxscale"),
 ]
 
 
-def test_xqa_mixed_page_transport_tails_and_value_ranges(page_mode, seq_len, nb_sub_seq, regime):
-    """Short and odd sequence tails, 35-tile CTAs, and extreme E4M3 values (q=1)."""
+def test_xqa_mixed_page_transport_tails_and_value_ranges(page_mode, seq_len, nb_ctas, regime):
+    """Short and odd sequence tails, persistent-grid item boundaries (P = 1 / 3 / 5 and
+    T < P), and extreme E4M3 values (q=1)."""
 
     import os
 
@@ -365,9 +376,9 @@ def test_xqa_mixed_page_transport_tails_and_value_ranges(page_mode, seq_len, nb_
         mask=None,
         enable_pdl=True,
     )
-    saved = os.environ.get("XQA_NB_SUB_SEQ")
-    if nb_sub_seq is not None:
-        os.environ["XQA_NB_SUB_SEQ"] = str(nb_sub_seq)
+    saved = os.environ.get("XQA_PERSISTENT_CTAS")
+    if nb_ctas is not None:
+        os.environ["XQA_PERSISTENT_CTAS"] = str(nb_ctas)
     try:
         expected = xqa_batch_decode_with_kv_cache(
             query,
@@ -390,9 +401,9 @@ def test_xqa_mixed_page_transport_tails_and_value_ranges(page_mode, seq_len, nb_
         torch.cuda.synchronize()
     finally:
         if saved is None:
-            os.environ.pop("XQA_NB_SUB_SEQ", None)
+            os.environ.pop("XQA_PERSISTENT_CTAS", None)
         else:
-            os.environ["XQA_NB_SUB_SEQ"] = saved
+            os.environ["XQA_PERSISTENT_CTAS"] = saved
     assert not torch.isnan(expected).any()
     assert not torch.isnan(actual).any()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
