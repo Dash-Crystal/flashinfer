@@ -160,8 +160,12 @@ constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPa
 
 // false - each warp load V tiles independent of each other; true - all warps in a warp group load V
 // tiles together.
-// @fixme: when true, and nbVBuffers is only 2, we need to sync all warps in a group after finishing
-// using a buffer and before refill it with prefetch data. We may need at least 3.
+// With true and nbVBuffers == 2 the refill of a buffer must wait until every warp of the group has
+// finished reading it: the group-scoped warpGrpBar does that (each warp arrives after its gemm1 on
+// buffer b, and the next iteration waits for the phase before issuing the copies into b). The
+// mixed-page expansion adds mixedVExpandBarriers so that every warp's expanded rows are visible
+// before the group's gemm1 reads the whole tile. A third buffer would only remove the wait, not the
+// protocol.
 constexpr bool grpLoadV = GRP_LOAD_V;
 
 // number of shared memory buffers for latency hiding
@@ -386,10 +390,16 @@ struct alignas(128) SharedMem {
       vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
-  uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1]
-                 [mixedKScaleBytes];
-  uint8_t vScales[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers]
-                 [cacheVTileSeqLen + 1][mixedVScaleBytes];
+  // Row maxNbCopiedHeads of a warp's range is the dump row for its lanes past the tile's
+  // heads (copyMixedPartialHeadsAsync scale copy).
+  uint8_t kScales[ctaShapeInWarps.x][nbKBuffers][warpTile.x + 1][mixedKScaleBytes];
+  // Group scope under grpLoadV: the warps of a group stage the scales of their own disjoint
+  // token ranges of the shared V tile; each warp's slot is headsPerWarp rows + its dump row.
+  static constexpr uint32_t vScaleRowsPerWarp =
+      (grpLoadV ? exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp) : cacheVTileSeqLen) + 1;
+  uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
+                 [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
+                 [mixedVScaleBytes];
 #if MIXED_KV_PROBE_C
   // Dead landing area for the probe's shadow copies (never read). 16 B per lane per gemm0 warp.
   alignas(16) uint8_t probeScratch[ctaShapeInWarps.x][warp_size * 16];
@@ -2730,6 +2740,13 @@ CUBIN_EXPORT __global__
     auto const getSmemVBar = [&](uint32_t idx) -> SharedMem::Barrier* {
       return smem.vBarrier(warpGrpIdx, idx);
     };
+#if ENABLE_MIXED_KV_CACHE
+    // This warp's scale rows of V buffer idx (its own token range + dump row under grpLoadV).
+    auto const getSmemVScales = [&](uint32_t idx) -> uint8_t* {
+      return &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idx]
+                          [grpLoadV ? SharedMem::vScaleRowsPerWarp * warpIdxInGrp : 0][0];
+    };
+#endif
 #if BEAM_WIDTH == 1
     VCachePageIndices pageIdx = VCachePageIndices::filled(kBAD_PAGE_INDEX);
 #if ENABLE_MIXED_KV_CACHE
@@ -2918,7 +2935,7 @@ CUBIN_EXPORT __global__
             sourceHeadOffset < nbHeadsAvail ? nbHeadsAvail - sourceHeadOffset : 0U;
         copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false,
                                    compactMixedPages>(
-            dst, &smem.vScales[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf][0][0],
+            dst, getSmemVScales(idxNextSMemVBuf),
             sourceHeadOffset, cacheList.transport, pageIdx, pageFormats,
             sourceHeadOffset, idxHeadGrp, false, 0,
             mha::min(warpHeadsAvail, headsPerWarp));
@@ -2953,7 +2970,7 @@ CUBIN_EXPORT __global__
       } else {
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
                                    vSwizzle, false, compactMixedPages>(
-            dst, &smem.vScales[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf][0][0],
+            dst, getSmemVScales(idxNextSMemVBuf),
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
@@ -3031,7 +3048,10 @@ CUBIN_EXPORT __global__
     idxCurrSMemVBuf++;
     ParityOrNone<grpLoadV> vBarParity{};
 #if ENABLE_MIXED_KV_CACHE && GRP_LOAD_V
-    bool mixedVExpandParity[nbVBuffers]{};
+    // Bit idxBuf: wait parity of mixedVExpandBarriers[warpGrpIdx][idxBuf] (a bool array
+    // indexed by the runtime buffer index lands in local memory in the SPEC_DEC build).
+    uint32_t mixedVExpandParity = 0;
+    static_assert(nbVBuffers <= 32);
 #endif
     // @fixme: do prefetch for next iter tile if last part
 
@@ -3186,7 +3206,7 @@ CUBIN_EXPORT __global__
                 uint32_t const sourceHeadOffset = headsPerWarp * warpIdxInGrp;
                 expandMixedPartialHeadsInPlace<headsPerWarp, 1, true>(
                     smemVTile,
-                    &smem.vScales[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf][0][0],
+                    getSmemVScales(idxCurrSMemVBuf),
                     sourceHeadOffset,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
                     sourceHeadOffset, 0, fp8VGlobalScale, fp4VGlobalScale);
@@ -3194,7 +3214,7 @@ CUBIN_EXPORT __global__
                 expandMixedPartialHeadsInPlace<cacheVTileSeqLen,
                                                gemm1WarpsPerGrp, true>(
                     smemVTile,
-                    &smem.vScales[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf][0][0],
+                    getSmemVScales(idxCurrSMemVBuf),
                     0,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
                     0, warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
@@ -3203,9 +3223,8 @@ CUBIN_EXPORT __global__
               auto& mixedVExpandBar =
                   smem.mixedVExpandBarriers[warpGrpIdx][idxCurrSMemVBuf];
               unused(mixedVExpandBar.arrive());
-              mixedVExpandBar.wait_parity(mixedVExpandParity[idxCurrSMemVBuf]);
-              mixedVExpandParity[idxCurrSMemVBuf] =
-                  !mixedVExpandParity[idxCurrSMemVBuf];
+              mixedVExpandBar.wait_parity((mixedVExpandParity >> uint32_t(idxCurrSMemVBuf)) & 1U);
+              mixedVExpandParity ^= (1U << uint32_t(idxCurrSMemVBuf));
 #endif
               }
             }
@@ -3223,7 +3242,7 @@ CUBIN_EXPORT __global__
                     warp, acc, skipXRowRescale, xRowNeedRescaleMask,
                     xRowScales, smemXTile, idxVTile, smemVTile,
                     smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    &smem.vScales[warpGrpIdx][warpIdxInGrp]
+                    &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp]
                                  [idxCurrSMemVBuf][0][0],
                     warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
               } else {
