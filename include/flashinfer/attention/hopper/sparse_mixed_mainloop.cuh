@@ -103,14 +103,6 @@ template <typename Mainloop, typename SharedStorage>
 inline constexpr bool mainloop_has_init_shared_v =
     mainloop_has_init_shared<Mainloop, SharedStorage>::value;
 
-// The AttentionVariant may carry the module's static page format (variants.cuh
-// MixedPageAttention<N>); without it the producer reads per-page tags.
-template <typename Variant, typename = void>
-struct mixed_static_format_of : std::integral_constant<int, -1> {};
-template <typename Variant>
-struct mixed_static_format_of<Variant, std::void_t<decltype(Variant::kMixedStaticFormat)>>
-    : std::integral_constant<int, Variant::kMixedStaticFormat> {};
-
 namespace mixed_detail {
 
 CUTLASS_DEVICE uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
@@ -341,9 +333,10 @@ struct SparseMixedCollectiveMainloop {
   static_assert(TOKENS_PER_PAGE * SCALE_ROW_BYTES <= SCALE_PAGE_BYTES, "row slots fit the page slot");
   static_assert(SCALE_STAGE_BYTES == SharedStorage::kMixedScaleStageBytes, "scale stage size");
 
-  // [22] compile-time page format: -1 dynamic (per-page tags), 0 A16, 1 E4M3, 2 E2M1.
-  static constexpr int STATIC_FORMAT =
-      mixed_static_format_of<typename Ktraits::AttentionVariant>::value;
+  // [22] compile-time page format: -1 dynamic (per-page tags), 0 A16, 1 E4M3, 2 E2M1,
+  // read from the variant by the traits (kernel_traits.cuh mixed_variant_static_format;
+  // the same constant sizes the producer warp-group count there).
+  static constexpr int STATIC_FORMAT = Ktraits::kMixedStaticFormat;
   static_assert(STATIC_FORMAT >= -1 && STATIC_FORMAT <= 2, "static format is -1, 0, 1 or 2");
   static constexpr bool DYNAMIC = STATIC_FORMAT < 0;
   static constexpr bool STATIC_A16 = STATIC_FORMAT == 0;
@@ -649,15 +642,19 @@ struct SparseMixedCollectiveMainloop {
     }
   }
 
-  // One tile's row of the chunk table in registers.  Static modules: two
-  // LDS.128 (pages, w6 = tags 0..3, w7 = tags 4, 5 | valid << 16 | flags << 24).
-  // Dynamic module ([24c]): one LDS.32 of w7 = m8 | m4 << 8 | valid << 16 |
-  // flags << 24 plus the row's smem address; page indices are read by LDS.32
-  // at row_addr + 4 i inside the rolled page loops (C2, C10).
+  // One tile's row of the chunk table in registers.  One struct, two shapes
+  // (the unused fields of either module are constant zero and dead after DCE):
+  //  * static modules: two LDS.128 fill `pages` (6 indices), `w6` (tags 0..3)
+  //    and `w7` (tags 4, 5 | valid << 16 | flags << 24); `row_addr` is unused;
+  //  * dynamic module ([24c], C10): one LDS.32 fills `w7` = m8 | m4 << 8 |
+  //    valid << 16 | flags << 24 and `row_addr` is the row's smem address;
+  //    `pages` and `w6` are 0 (the pending word is then w7 << 32 | stage << 60);
+  //    page indices are read from the row by LDS.32 (page_at), never from a
+  //    runtime-indexed register array (C2).
   struct TileRegs {
-    uint32_t pages[PAGES_PER_TILE];
-    uint32_t w6, w7;
-    uint32_t row_addr;
+    uint32_t pages[PAGES_PER_TILE];  // static modules only
+    uint32_t w6, w7;                 // w6: static modules only
+    uint32_t row_addr;               // dynamic module only
     // [24b] Page index of this thread's j-th page (tile page h + NUM_PRODUCER_WGS
     // * j, h = warp-group parity), static modules.  `j` is a constant after
     // unrolling; `h` is runtime, so the select is one SEL between two loaded
@@ -981,23 +978,39 @@ struct SparseMixedCollectiveMainloop {
     } else {
       // [24c] Dynamic module, [40]'s pattern (C10): format-outer, page-rolled.
       // Data flow: the tile's two 6-bit masks (chunk table, w7) restricted to this
-      // warp group's parity; per format one rolled loop over the set bits, the
-      // page index read from the table row by LDS.32, destinations base + i *
-      // PAGE_REGION_BYTES (one IMAD).  Control flow: three warp-uniform loops
-      // (FP8, FP4, A16) with one copy body each and no per-page format branch;
-      // each format's source set-up (compressed_src) runs only if its mask is
-      // nonzero.  Every quantity here is warp-uniform data from smem, so the
-      // loops never diverge.
+      // warp group's parity; the parity's PAGES_PER_THREAD page indices (tile
+      // pages i = h + NUM_PRODUCER_WGS * j) are read from the table row up front
+      // with independent LDS.32 into scalars - one smem latency per tile, off the
+      // copy issue path - and selected per page by a constant-unrolled
+      // compare/select chain on j = i / NUM_PRODUCER_WGS (C2: no runtime index
+      // into a register array, no LDS on the LDGSTS address chain); destinations
+      // base + i * PAGE_REGION_BYTES (one IMAD).  Control flow: per format one
+      // rolled loop over the set bits, three warp-uniform loops (FP8, FP4, A16)
+      // with one copy body each and no per-page format branch; each format's
+      // source set-up (compressed_src) runs only if its mask is nonzero.  Every
+      // quantity here is warp-uniform data from smem, so the loops never diverge.
       uint32_t const par = parity_mask(h);
       uint32_t const m8 = m.mask8() & par;
       uint32_t const m4 = m.mask4() & par;
       uint32_t const ma = par & ~(m8 | m4);
+      uint32_t pg[PAGES_PER_THREAD];
+#pragma unroll
+      for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) {
+        pg[j] = m.page_at(h + NUM_PRODUCER_WGS * j);
+      }
+      auto const page_of = [&pg](uint32_t i) {
+        uint32_t const j = i / NUM_PRODUCER_WGS;
+        uint32_t r = pg[0];
+#pragma unroll
+        for (uint32_t k = 1; k < PAGES_PER_THREAD; ++k) r = (j == k) ? pg[k] : r;
+        return r;
+      };
       if (m8) {
         CompressedSrc const s8 = compressed_src<kTagFP8>(p, isK, kv_head_idx, thread_idx);
 #pragma unroll 1
         for (uint32_t mm = m8; mm; mm &= mm - 1) {
           uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP8, FULL>(b, s8, m.page_at(i), dynamic_page(i), stage, valid,
+          copy_compressed_page<kTagFP8, FULL>(b, s8, page_of(i), dynamic_page(i), stage, valid,
                                               thread_idx);
         }
       }
@@ -1006,14 +1019,14 @@ struct SparseMixedCollectiveMainloop {
 #pragma unroll 1
         for (uint32_t mm = m4; mm; mm &= mm - 1) {
           uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP4, FULL>(b, s4, m.page_at(i), dynamic_page(i), stage, valid,
+          copy_compressed_page<kTagFP4, FULL>(b, s4, page_of(i), dynamic_page(i), stage, valid,
                                               thread_idx);
         }
       }
 #pragma unroll 1
       for (uint32_t mm = ma; mm; mm &= mm - 1) {
         uint32_t const i = __ffs(mm) - 1;
-        copy_a16_page<FULL>(b, m.page_at(i), dynamic_page(i), a16_dst_stage, valid, thread_idx);
+        copy_a16_page<FULL>(b, page_of(i), dynamic_page(i), a16_dst_stage, valid, thread_idx);
       }
     }
   }

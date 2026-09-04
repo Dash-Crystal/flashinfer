@@ -52,6 +52,15 @@ def main() -> int:
             for q_len in (1, 64):
                 cases.append((q_len, "NHD", mode))
                 failures += _run_parity_tail(mode, q_len)
+        # [24] the FP8 cold path (fold vote fails) on a *partial* page: the
+        # extremes transport (block scales incl. 448, g = 1) under kv_len 149, so
+        # the odd-parity page 3's five valid rows can carry a 448 scale in the
+        # same warp as the src-size-0 zero-filled rows 5..15 (the whole warp then
+        # takes the exact two-multiply path with zero payload and zero scale).
+        for mode in ("fp8", "mixed"):
+            for q_len in (1, 64):
+                cases.append((q_len, "NHD", mode))
+                failures += _run_parity_tail(mode, q_len, extremes=True)
         # [23] decode corner cases: E4M3 subnormal payload values (and -0), the
         # maximal block scale 448 and subnormal block scales, FP8 and FP4 pages.
         # [24a] the same payloads under three FP8 global scales (C9): g = 1 (the
@@ -157,17 +166,22 @@ def _run_extremes(mode: str, q_len: int, gs: float = 1.0) -> int:
         return 1
 
 
-def _run_parity_tail(mode: str, q_len: int) -> int:
-    """kv_len 149 = one full tile + 3 full pages + 5 tokens of page 3 (odd parity)."""
+def _run_parity_tail(mode: str, q_len: int, extremes: bool = False) -> int:
+    """kv_len 149 = one full tile + 3 full pages + 5 tokens of page 3 (odd parity).
+    ``extremes``: the payload / block-scale set of _extreme_transport (448 scales
+    among them, g = 1), so the FP8 fold vote fails inside the partial page."""
     import torch
     from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    name = f"[parity-tail-{mode}-{q_len}]"
+    name = f"[parity-tail-{'extremes-' if extremes else ''}{mode}-{q_len}]"
     try:
         dev, dtype = torch.device("cuda"), torch.bfloat16
         B, H, D, P, pages_per_req = 3, 2, 128, 16, 10
         shape = (B * pages_per_req, P, H, D)
-        ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+        if extremes:
+            ck, cv, rk, rv, t = _extreme_transport(shape, dtype, dev, mode, 1.0)
+        else:
+            ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
         kv_len = 96 + 3 * P + 5
         assert kv_len <= pages_per_req * P
         qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)

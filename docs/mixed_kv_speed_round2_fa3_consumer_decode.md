@@ -773,7 +773,10 @@ g))`; `_run_extremes(mode, q_len, gs)` runs for `gs` in {1, 0.5, 1.1 x 2^-118}
 x {fp8, mixed} x {q 1, 64} = 12 cases (was 4); the matrix is 64 + 2 + 12 = 78.
 
 **Expected artifacts (section 5, restated for what was written).**  fp8 module
-producer region: `F2FP.E4M3` ~30 (from 270), `PRMT` 9 per block, `IMAD` sign-fix
+producer region: `F2FP.E4M3` ~24 static sites = 12 hot + 12 cold (the cold path
+recomputes `scale_byte_f32(sw, sel)` - PRMT, F2FP.E4M3, HADD2 - rather than
+holding the f32 scale across the decode; executed count 12 per call per thread
+on the fold path; from 270), `PRMT` 9 per block, `IMAD` sign-fix
 0, `VOTE.ALL` one per block site, no `BSSY/BSYNC` in the pair body, `STACK 0`,
 `LDGSTS 36+36`, `BAR.SYNC 4`, `FENCE.VIEW.ASYNC 3`; a16 module byte-identical to
 `5cc416fd` (no code path of the a16 module touches `expand_block`, `make_bases`'
@@ -850,7 +853,10 @@ wavefront arithmetic of 2C is unaffected (the LDS.32 of 32 lanes still reads
 
 **Tests.**  `_run_parity_tail(mode, q_len)`: `kv_len = 149` (`96 + 3 x 16 + 5`)
 for fp8, fp4, mixed at q 1 and 64 — the last tile's partial page 3 is owned by
-the odd-parity warp group; matrix 64 + 2 + 6 + 12 = 84.
+the odd-parity warp group; plus `extremes=True` (the `_extreme_transport`
+payload / 448 block scales at `g = 1`) for fp8 and mixed at q 1 and 64, so the
+FP8 fold vote fails inside the partial page and the zero-filled rows 5..15 take
+the exact path together with the 448 row; matrix 64 + 2 + 6 + 4 + 12 = 88.
 
 **Expected artifacts.**  fp8 / fp4 / dynamic modules: `USETMAXREG.DEALLOC
 0x48` + `TRY_ALLOC 0xB8`, `ptxas -v` without C7507, STACK 0; per thread per
@@ -896,7 +902,13 @@ built or run here.
 **Control flow (dynamic module).**
 - `issue_tile_copies`: `m8 = mask8 & par`, `m4 = mask4 & par`, `ma = par & ~(m8
   | m4)` (tail slots past `valid` are tagged A16 by `chunk_load` and land in
-  `ma`, zero-filled by the `FULL = false` arm as before).  Three `#pragma unroll
+  `ma`, zero-filled by the `FULL = false` arm as before).  The parity's
+  `PAGES_PER_THREAD` (3) page indices `pg[j] = LDS.32(row_addr + 4 (h + 2 j))`
+  are read up front (independent loads, one smem latency per tile) and a page's
+  index is `pg[i / 2]` by a constant-unrolled compare/select chain (two ISETP +
+  two SEL; C2: no runtime-indexed register array, and no LDS on the LDGSTS
+  address chain — the review of the first form found `LDS.32 -> IMAD.WIDE ->
+  LDGSTS` serialised once per page).  Three `#pragma unroll
   1` loops `for (mm = m; mm; mm &= mm - 1) { i = ffs(mm) - 1; ... }` — FP8, FP4
   (each with its `compressed_src` set-up inside `if (m)`), A16 — one copy body
   each; no per-page format branch.  All operands are warp-uniform smem data.
@@ -917,8 +929,9 @@ pc-sampling run on the F24b build (mixed module, producer region:
 first two, this commit is dropped from the merge.
 
 **Expected artifacts.**  Dynamic module producer region: one `REDUX`-pair site
-per chunk store, `LDS.32` page-index reads inside the rolled loops (`FLO`/`POPC`
-for `ffs`), one copy body per format and one expansion body per format,
+per chunk store, `LDS.32` page-index reads before the copy loops (three per
+tile per operand) and inside the rolled expansion loops (`FLO`/`POPC` for
+`ffs`), one copy body per format and one expansion body per format,
 `LDL/STL` 0 in the pair loop, `STACK` <= [23]'s 16 B (prologue only); SASS
 well below the pre-[22] 5263.  Static modules: SASS identical to the F24b
 build (the `PagePos` refactor is a pure re-spelling of the same immediates —
