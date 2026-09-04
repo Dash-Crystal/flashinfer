@@ -22,9 +22,18 @@ mixed stream used by the benchmarks 1.66x (172 MB vs 285 MB).
 | RTX 5090 sm120 XQA, q=4 | 184 | <= 128 | <= 81 | <= 138 | FP8 155, FP4 101, mixed 157 |
 | H200 FA3 prefill, q>=64 | 300 | parity | parity | parity | A16 528, compressed ~1500-1800 |
 
-Byte rooflines (H200 4.8 TB/s): A16 59, FP8 32, FP4 17, mixed 36 us. The sm90
-XQA consumer chain floor measured ~62 us (converters skipped), so the FP4 target
-requires the consumer chain itself to get faster, not only the transport.
+Byte rooflines, corrected by the P0.1 host probe (measured achievable streaming
+read at each footprint on nkcut2: 4.23 TB/s at 285 MB, 4.5 sustained): A16 67.5,
+FP8 38.6, FP4 23.0, mixed 43.0 us (the 4.8 TB/s paper values 59/32/17/36 are not
+reachable).  "A16 83 us" is transport_a16 through mha_sm90.cu; the stock mha.cu
+A16 baseline at q=1 is 108-110 us.  At q=4 every mode runs mha.cu SPEC_DEC; the
+recorded 935 us for mixed q=4 was co-tenant time slicing (bursts > ~2 ms are
+inflated 1.8-2.1x) - the kernel takes 441-452 us (fp4 277-285).  The sm90 XQA
+consumer chain floor is 1.00 us/tile with converters skipped (0.84 at 1 CTA/SM),
+i.e. latency-bound on round trips, not issue-bound.
+
+Measurement rule (H200): keep repeats x kernel time < 1.5 ms per event pair and
+report min/median/max; --repeats 1 carries a 5-15 us launch gap.
 
 Method: every change is a lever with an analytic model that predicts its gain
 from the measured record (docs/mixed_kv_page_transport_backends.md) and a
