@@ -86,12 +86,8 @@ struct SparseCollectiveMainloop {
 
   static constexpr bool USE_TMA_LOAD_KV = false;
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMmaQK{});
-  // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading.  The
-  // mixed-page mainloop (sparse_mixed_mainloop.cuh) derives from this class for
-  // its Q TMA / layout types only and may run two producer warp groups ([24b]);
-  // its own copy tiling does not use NUM_COPY_THREADS.
-  static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS ||
-                    (Ktraits::kMixedTraits && Ktraits::NUM_PRODUCER_THREADS % NUM_COPY_THREADS == 0),
+  // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading
+  static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS,
                 "NUM_PRODUCER_THREADS must equal NUM_COPY_THREADS for sparse/paged KV loading");
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
