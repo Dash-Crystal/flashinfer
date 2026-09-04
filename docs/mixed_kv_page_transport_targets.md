@@ -18,7 +18,7 @@ mixed stream used by the benchmarks 1.66x (172 MB vs 285 MB).
 |---|---|---|---|---|---|
 | H200 sm90 XQA decode, q=1 | 83 us | <= 58 | <= 36 | <= 62 | FP8 91, FP4 96, mixed 114 |
 | H200 sm90 XQA, q=4 (SPEC_DEC, runs mha.cu) | 135 | <= 94 | <= 59 | <= 101 | FP8 231, FP4 277, mixed 437 (co-tenant-corrected; after [29]: 198/240/420; **after [40]: 198 / 236 / 216** — mixed 0.92x fp4, Track S acceptance met; targets need the 1-CTA/SM occupancy levers) |
-| RTX 5090 sm120 XQA decode, q=1 | 180 (175 after [29]) | <= 125 | <= 79 | <= 135 | **after [29]: FP8 118.8, FP4 65.5, mixed 126.4 - all pass** (were 139/84/146) |
+| RTX 5090 sm120 XQA decode, q=1 | 174 (A16) | <= 125 | <= 79 | <= 135 | **after [29][26][27]: FP8 100.5, FP4 59.5, mixed 113.5** (were 139/84/146; 2.93x / 1.73x / 1.53x vs A16 against analytic 3.56 / 1.87 / 1.66) |
 | RTX 5090 sm120 XQA, q=4 | 184 (179) | <= 128 | <= 81 | <= 138 | **after [29]: FP8 125.0, FP4 81.9, mixed 132.3** (FP8/mixed pass, FP4 within 1%) |
 | H200 FA3 prefill, q>=64 | 300 (stock) | parity | parity | parity | **after [21][22]: A16 282-287 (0.94x stock, passes)**, FP8 737-748, FP4 944-964, mixed 1760 (awaiting [23]) |
 
