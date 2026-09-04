@@ -224,6 +224,17 @@ static_assert(!kMixedBF16PlacementExpansion ||
 // constants (copyMixedPartialHeadsAsyncHoisted).  Same build as the placement expansion; the
 // MIXED_KV_PROBE_C measurement build keeps the stock copy (the probe lives there).
 #define MIXED_HOISTED_COPY (MIXED_BF16_PLACEMENT_EXPANSION && !MIXED_KV_PROBE_C)
+// [45] Track S step 7 (docs/mixed_kv_speed_round5_trackS_step7.md): register-only dependency cuts
+// in the same build.  [45c]: the page metadata (expansion flag, format tags) stays in registers -
+// the static modules' format is a build constant (no tag is loaded, broadcast or staged), the
+// dynamic module packs the tile's tags into one word per buffer.  MIXED_ALL_HOISTED_COPY marks the
+// modules whose every K / V copy is the hoisted copy (fp8 / fp4: the stock A16 copy is dead code
+// once the flag is the constant true; dyn: kA16CopyFastPath is false); the a16 module keeps the
+// stock A16 copy, whose HeadPtr indexes the page vector.
+#define MIXED_ALL_HOISTED_COPY (MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT != 0)
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+constexpr bool kMixedStaticNeedsExpansion = MIXED_PAGE_STATIC_FORMAT > 0;
+#endif
 
 // number of shared memory buffers for latency hiding
 constexpr uint32_t nbQBuffers = mha::min(nbPartsPerInputQHead, 2u);  // for latency hiding
@@ -799,7 +810,17 @@ __device__ inline QuadRegRowMax computeRowSum(Warp const& warp, GemmOutRegTile c
 // each quad to eliminate mismatch. This has no visible impact on final result and can be removed.
 #pragma unroll
   for (uint32_t i = 0; i < QuadRegRowMax::size; i++) {
+#if MIXED_COMPACT_TILE_LOOPS
+    // [45e] (Track S step 7): the same quad broadcast with a constant full mask and the quad-base
+    // source lane (lane & ~3).  The stock form's lane-dependent mask made ptxas wrap every shuffle
+    // in WARPSYNC / MATCH.ANY / REDUX / VOTEU / BRA.DIV convergence code (111 PC samples per fp8
+    // launch on gemm0's critical path); this is one SHFL.IDX.  Value-identical: both broadcast
+    // lane 0 of the quad, and computeRowSum runs in the converged gemm0 warp.  Preprocessor
+    // guard so the sm120 / M32 modules keep their SASS.
+    auto const lane0Val = __shfl_sync(0xFFFFFFFFU, rowSum[i], laneId() & ~3U);
+#else
     auto const lane0Val = __shfl_sync(0xFU << (laneId() / 4 * 4), rowSum[i], 0, 4);
+#endif
     // Disable the assert, sometimes it triggers because of different orders of accumulation.
     // assert(fabs(rowSum[i] - lane0Val) < 1E-4f);
     rowSum[i] = lane0Val;
@@ -2363,7 +2384,21 @@ CUBIN_EXPORT __global__
     // by the previous call become current, their tags are requested, and p's
     // indices are requested.
     KCachePageIndices pageIdxNext = KCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+    // [45c] static modules: the format is the build constant MIXED_PAGE_STATIC_FORMAT; no tag
+    // is loaded, broadcast or staged (the copy and the expansion ignored the tags already).
+#else
     uint32_t pageTagLane = 0;
+#endif
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+    // [45c] dynamic module: the tile's tags packed (byte s = page s; 0 = every page A16), one
+    // word per K buffer, rotated with idxCurrSMemKBuf as two named registers (a u32[2] indexed
+    // by the runtime CircIdx would land in local memory).  kTagWordNext is written by the copy
+    // of buffer next (loadKTilePart), kTagWordCurr is read by the expansion of buffer curr; the
+    // copy at the two idxCurrSMemKBuf++ sites is the rotation.
+    uint32_t kTagWordNext = 0;
+    uint32_t kTagWordCurr = 0;
+#endif
 #endif
 #endif
     auto loadPages = [&](uint32_t idxPage) mutable {
@@ -2371,9 +2406,18 @@ CUBIN_EXPORT __global__
       uint32_t const idxBeam = 0;
 #if ENABLE_MIXED_KV_CACHE
       pageIdx = pageIdxNext;
+#if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
       pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
+#endif
+#if MIXED_COMPACT_TILE_LOOPS
+      // [45f]: list load predicated on the kernel parameter maxNbPagesPerSeq, BAD selected on
+      // nbPages afterwards (one dependent round trip less in the CTA prologue; same values).
+      unused(idxBeam);
+      pageIdxNext = getPageUngated<KCachePageIndices::size>(cacheList, idxReq, idxPage, nbPages);
+#else
       pageIdxNext =
           getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+#endif
 #else
       pageIdx =
           getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
@@ -2405,12 +2449,14 @@ CUBIN_EXPORT __global__
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
 
 #if BEAM_WIDTH == 1
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_KV_CACHE && !MIXED_HOISTED_COPY
       auto const pageFormats = broadcastMixedPageTags<nbPagesPerWarpTile>(pageTagLane);
 #endif
+#if !MIXED_ALL_HOISTED_COPY
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
           cacheList.kCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
           kv_stride_page,       kv_stride_token, kv_stride_head};
+#endif
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerWarpTile> const srcSf{
           cacheList.kSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
@@ -2446,6 +2492,44 @@ CUBIN_EXPORT __global__
       // is warpTile.x for full tiles); the isFull specialisation doubled the copy code.
       bool const isFullTile = !kCompactTileLoops && (seqIter + 1 < nbSeqIters);
 #if ENABLE_MIXED_KV_CACHE
+#if MIXED_HOISTED_COPY
+      // [45c] metadata in registers (sm90 SPEC_DEC compact build; the stock body is the #else).
+      // Data flow: static modules - the expansion decision is the build constant
+      //   kMixedStaticNeedsExpansion, nothing is loaded or stored for it; dynamic module -
+      //   pageTagLane (lane s = tag of page s, requested one tile ago by loadPages) -> REDUX.OR ->
+      //   tagWord (byte s = tag of span s; 0 = all A16), passed by value to the copy (per-span
+      //   format branch, scale-loop format) and kept in kTagWordNext for the expansion of this
+      //   buffer one part later (rotated to kTagWordCurr at idxCurrSMemKBuf++).
+      // Control flow: no lane-0 store, no __syncwarp (it existed only for the STS -> LDS flag
+      //   path; the stock loaders issue cp.async with no barrier before it); one copy body per
+      //   module - MIXED_ALL_HOISTED_COPY (fp8 / fp4 / dyn): the hoisted copy; a16: the stock
+      //   bounds-checked A16 copy (isFullTile is constant false under kCompactTileLoops).
+      static_assert(kCompactTileLoops, "MIXED_HOISTED_COPY implies the compact tile loops");
+      static_assert(ctaTile.x % tokensPerPage == 0 && warpTile.x % tokensPerPage == 0);
+      assert(tokenOffset == 0);
+      unused(isFullTile);
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+      constexpr uint32_t tagWord = 0;  // static modules: the copy ignores the word
+#else
+      uint32_t const tagWord = packMixedPageTags<nbPagesPerWarpTile>(pageTagLane);
+      kTagWordNext = tagWord;
+#endif
+      uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+      uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
+#if MIXED_ALL_HOISTED_COPY
+      unused(dstHeadOffset);
+      copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
+          dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
+          tagWord, idxHeadGrp, idxPart, nbHeadsAvail);
+#else
+      static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
+                    "a16 static module: every page is A16, the stock A16 copy is the only body");
+      unused(tagWord);
+      copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+                            grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
+                                                                   idxPart, nbHeadsAvail);
+#endif
+#else
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // The mixed copy/expand helpers take no token offset: the warp tile's origin
       // is page-aligned, so a block's page is a compile-time index (C2).
@@ -2467,18 +2551,6 @@ CUBIN_EXPORT __global__
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
                               grainBytes, grainBytesGmemCache, qkSwizzle, false>(
             warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
-#if MIXED_HOISTED_COPY
-      } else {
-        // [44] item 3: isFullTile is constant false under kCompactTileLoops (one bounds-checked
-        // copy body); dstHeadOffset is 0 and the tile origin is page-aligned (asserted above).
-        static_assert(kCompactTileLoops, "MIXED_HOISTED_COPY implies the compact tile loops");
-        uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
-        uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
-        copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
-            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
-            pageFormats, idxHeadGrp, idxPart, nbHeadsAvail);
-      }
-#else
       } else if (isFullTile) {
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
@@ -2503,7 +2575,7 @@ CUBIN_EXPORT __global__
 #endif
             );
       }
-#endif
+#endif  // MIXED_HOISTED_COPY
 #else
       if (isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
@@ -2553,6 +2625,9 @@ CUBIN_EXPORT __global__
     loadKTilePart(seqIterInit, 0, 0);
     ldgsts::commitGroup();  // @fixme: do prefetch for next iter tile if last part
     idxCurrSMemKBuf++;
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+    kTagWordCurr = kTagWordNext;  // [45c] rotation: buffer next becomes curr
+#endif
 
     auto& xBar = smem.xBarriers[warpIdx.y][warpIdx.x];
     bool xBarConsumedParityNext = false;
@@ -2626,7 +2701,17 @@ CUBIN_EXPORT __global__
           SharedMem::KSmemBuffer& smemKPart = getSMemKTile(idxCurrSMemKBuf);
 #if ENABLE_MIXED_KV_CACHE
           if constexpr (!compactMixedPages) {
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+            // [45c] static modules: the build constant (fp8 / fp4: every part is expanded; a16:
+            // never - the call below is a discarded statement of this generic lambda).
+            if constexpr (kMixedStaticNeedsExpansion) {
+#elif MIXED_HOISTED_COPY
+            // [45c] dynamic module: the register word of the buffer being consumed (0 = all A16)
+            // replaces the LDS.U8 -> ISETP -> BRA on smem.kNeedsExpansion after the DEPBAR.
+            if (kTagWordCurr != 0u) {
+#else
             if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
+#endif
             // Tile origin ctaTile.x * seqIter + warpTile.x * warpIdx.x is page-aligned.
 #if MIXED_BF16_PLACEMENT_EXPANSION
             // [44]: the helper begins with __syncwarp() - the waitGroup<1> above completed
@@ -2634,8 +2719,14 @@ CUBIN_EXPORT __global__
             expandMixedPartialHeadsInPlaceBF16Placement<warpTile.x, nbPartsPerCacheKHead,
                                                         qkSwizzle>(
                 smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0],
-                smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, fp8KGlobalScale,
-                fp4KGlobalScale);
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+                0u,
+#elif MIXED_HOISTED_COPY
+                kTagWordCurr,
+#else
+                mixedPageTagsWord(smem.kFormats[warpIdx.x][idxCurrSMemKBuf]),
+#endif
+                0, fp8KGlobalScale, fp4KGlobalScale);
 #else
             expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead,
                                            qkSwizzle>(
@@ -2686,6 +2777,9 @@ CUBIN_EXPORT __global__
             );
           }
           idxCurrSMemKBuf++;
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+          kTagWordCurr = kTagWordNext;  // [45c] rotation (see the prologue site)
+#endif
         }
         return acc;
       };
@@ -2849,7 +2943,17 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE
     // Two-deep prefetch, see the K loader.
     VCachePageIndices pageIdxNext = VCachePageIndices::filled(kBAD_PAGE_INDEX);
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+    // [45c] static modules: no tags (see the K loader).
+#else
     uint32_t pageTagLane = 0;
+#endif
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+    // [45c] dynamic module: packed tag word per V buffer, rotated at idxCurrSMemVBuf++ (see the
+    // K loader's kTagWordNext / kTagWordCurr).
+    uint32_t vTagWordNext = 0;
+    uint32_t vTagWordCurr = 0;
+#endif
 #endif
 #endif
     auto loadPages = [&](uint32_t idxPageBeg) mutable {
@@ -2857,9 +2961,18 @@ CUBIN_EXPORT __global__
       uint32_t const idxBeam = 0;
 #if ENABLE_MIXED_KV_CACHE
       pageIdx = pageIdxNext;
+#if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
       pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
+#endif
+#if MIXED_COMPACT_TILE_LOOPS
+      // [45f]: see the K loader.
+      unused(idxBeam);
+      pageIdxNext =
+          getPageUngated<VCachePageIndices::size>(cacheList, idxReq, idxPageBeg, nbPages);
+#else
       pageIdxNext =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+#endif
 #else
       pageIdx =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
@@ -2961,7 +3074,23 @@ CUBIN_EXPORT __global__
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
 
 #if BEAM_WIDTH == 1
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_KV_CACHE && MIXED_HOISTED_COPY
+      // [45c] metadata in registers (see loadKTilePart for the data / control flow): no
+      // broadcast, no lane-0 stores, no __syncwarp; static modules carry no tag at all, the
+      // dynamic module packs pageTagLane into tagWord (copy) = vTagWordNext (expansion, one V
+      // iteration later, rotated at idxCurrSMemVBuf++).
+      static_assert(ctaTile.x % tokensPerPage == 0 &&
+                    (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
+                    cacheVTileSeqStride % tokensPerPage == 0 &&
+                    cacheVTileSeqLen % tokensPerPage == 0);
+      assert(tokenOffset == 0);
+#if MIXED_PAGE_STATIC_FORMAT >= 0
+      constexpr uint32_t tagWord = 0;  // static modules: the copy ignores the word
+#else
+      uint32_t const tagWord = packMixedPageTags<nbPagesPerVTile>(pageTagLane);
+      vTagWordNext = tagWord;
+#endif
+#elif ENABLE_MIXED_KV_CACHE
       auto const pageFormats = broadcastMixedPageTags<nbPagesPerVTile>(pageTagLane);
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // Page-aligned V tile origin (see loadKTilePart): no token offset for the helpers.
@@ -2978,9 +3107,11 @@ CUBIN_EXPORT __global__
       }
       __syncwarp();
 #endif
+#if !MIXED_ALL_HOISTED_COPY
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
           cacheList.vCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
           kv_stride_page,       kv_stride_token, kv_stride_head};
+#endif
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerVTile> const srcSf{
           cacheList.vSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
@@ -3053,6 +3184,24 @@ CUBIN_EXPORT __global__
                : 0U);  // may also be full but it can be handled correctly anyway
       bool const isFullTile = !kCompactTileLoops && (seqIter + 1 < nbSeqIters);  // [43]
 #if ENABLE_MIXED_KV_CACHE
+#if MIXED_HOISTED_COPY
+      // [45c]: one copy body per module (see loadKTilePart); isFullTile is constant false here.
+      unused(isFullTile);
+#if MIXED_ALL_HOISTED_COPY
+      // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
+      unused(dstHeadOffset);
+      copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
+          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, tagWord,
+          idxHeadGrp, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#else
+      static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
+                    "a16 static module: every page is A16, the stock A16 copy is the only body");
+      unused(tagWord);
+      copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
+                            grainBytesGmemCache, vSwizzle, false>(
+          warp, dst, dstHeadOffset, src, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+#endif
+#else
       if (kA16CopyFastPath && !needsExpansion && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
                               gemm1WarpsPerGrp, grainBytes, grainBytesGmemCache,
@@ -3065,20 +3214,14 @@ CUBIN_EXPORT __global__
             warp, dst, dstHeadOffset, src, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       } else {
-#if MIXED_HOISTED_COPY
-        // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
-        copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
-            dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, pageFormats,
-            idxHeadGrp, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
-#else
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
                                    vSwizzle, false, compactMixedPages>(
             dst, getSmemVScales(idxNextSMemVBuf),
             dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
             idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
-#endif
       }
+#endif  // MIXED_HOISTED_COPY
 #else
       if (isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
@@ -3150,6 +3293,9 @@ CUBIN_EXPORT __global__
     loadVTilePart(seqIterInit, 0, 0, 0);
     commitVTileLoad(idxCurrSMemVBuf.next());
     idxCurrSMemVBuf++;
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+    vTagWordCurr = vTagWordNext;  // [45c] rotation: buffer next becomes curr
+#endif
     ParityOrNone<grpLoadV> vBarParity{};
 #if ENABLE_MIXED_KV_CACHE && GRP_LOAD_V
     // Bit idxBuf: wait parity of mixedVExpandBarriers[warpGrpIdx][idxBuf] (a bool array
@@ -3307,8 +3453,14 @@ CUBIN_EXPORT __global__
             }
             auto& smemVTile = getSmemVTile(idxCurrSMemVBuf);
 #if ENABLE_MIXED_KV_CACHE
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+            constexpr bool needsExpansion = kMixedStaticNeedsExpansion;  // [45c] build constant
+#elif MIXED_HOISTED_COPY
+            bool const needsExpansion = vTagWordCurr != 0u;  // [45c] register word, no LDS.U8
+#else
             bool const needsExpansion =
                 smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf];
+#endif
             if constexpr (!compactMixedPages) {
               if (needsExpansion) {
               // The V tile origin is page-aligned (static_assert in loadVTilePart).
@@ -3329,8 +3481,14 @@ CUBIN_EXPORT __global__
                 expandMixedPartialHeadsInPlaceBF16Placement<cacheVTileSeqLen,
                                                             gemm1WarpsPerGrp, true>(
                     smemVTile, getSmemVScales(idxCurrSMemVBuf),
-                    smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], 0,
-                    fp8VGlobalScale, fp4VGlobalScale);
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
+                    0u,
+#elif MIXED_HOISTED_COPY
+                    vTagWordCurr,
+#else
+                    mixedPageTagsWord(smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf]),
+#endif
+                    0, fp8VGlobalScale, fp4VGlobalScale);
 #else
                 expandMixedPartialHeadsInPlace<cacheVTileSeqLen,
                                                gemm1WarpsPerGrp, true>(
@@ -3401,6 +3559,9 @@ CUBIN_EXPORT __global__
               unused(pWarpGrpBar->arrive());
             }
             idxCurrSMemVBuf++;
+#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
+            vTagWordCurr = vTagWordNext;  // [45c] rotation (see the prologue site)
+#endif
           }
         }  // idxBeam
 #if __CUDA_ARCH__ == 1210

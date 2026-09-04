@@ -225,6 +225,49 @@ __device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t lane
   return ret;
 }
 
+// [45c] (Track S step 7, sm90 SPEC_DEC compact build): the tile's tags as one register word,
+// byte s = tag of page s, from the lane-distributed tag load (lane s holds the tag of page s;
+// lanes past the tile and BAD pages hold 0 = kA16).  One redux.sync.or over `tag << 8 lane`
+// (sm80+) in place of nbPages SHFL.IDX + PRMTs; the word is warp-uniform by construction
+// (0 <=> every page is A16 <=> no expansion) and stays in a register: the build passes it to the
+// copy and to the expansion instead of staging kFormats / kNeedsExpansion in shared memory.
+// Data flow: laneValue (u8 in a u32, lane s) -> contrib = lane < nbPages ? tag << 8 lane : 0 ->
+// REDUX.OR -> word.  Control flow: convergent (all 32 lanes; called by the whole loader warp).
+template <uint32_t nbPages>
+__device__ inline uint32_t packMixedPageTags(uint32_t laneValue) {
+  static_assert(nbPages <= 4, "four 8-bit tags per word");
+  uint32_t const lane = laneId();
+  uint32_t const contrib = lane < nbPages ? (laneValue << (8u * (lane & 3u))) : 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  return __reduce_or_sync(0xFFFFFFFFu, contrib);
+#else
+  uint32_t word = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < nbPages; ++i) {
+    word |= __shfl_sync(0xFFFFFFFFu, contrib, i);
+  }
+  return word;
+#endif
+}
+
+// The same word from a staged MixedPageFormats (the MIXED_KV_PROBE_C build, whose expansion
+// takes the [45c] word but whose stock copy still stages the struct).
+template <uint32_t nbPages>
+__device__ inline uint32_t mixedPageTagsWord(MixedPageFormats<nbPages> const& formats) {
+  static_assert(nbPages <= 4, "four 8-bit tags per word");
+  uint32_t word = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < nbPages; ++i) {
+    word |= uint32_t(formats.values[i]) << (8u * i);
+  }
+  return word;
+}
+
+// Byte s of the [45c] tag word = the tag of span / page s.
+__device__ inline uint8_t mixedPageTagOfSpan(uint32_t formatWord, uint32_t span) {
+  return static_cast<uint8_t>((formatWord >> (8u * span)) & 0xFFu);
+}
+
 template <uint32_t nbPages>
 __device__ inline bool needsMixedPageExpansion(
     MixedPageFormats<nbPages> const& formats) {
@@ -947,14 +990,33 @@ template <bool kFold>
 struct MixedFoldTag {
   static constexpr bool value = kFold;
 };
-// The warp's fold decision for one page span: every lane's two scaled block scales
-// (s * g * 2^k in fp32) stay finite in bf16 (bound = bf16 max + half an ulp: 255.5 * 2^120), and
-// |g| >= 2^-117 so that every s * g is fp32-normal (the smallest nonzero E4M3 scale is 2^-9),
-// which is what makes bf16_rn(s * g * 2^k) == bf16_rn(s * g) * 2^k.  foldOk is warp-uniform; it
-// is inside the vote so the result is uniform by construction.
-__device__ inline bool foldScalePairFinite(float f0, float f1, bool foldOk) {
-  float const fmax = fmaxf(fabsf(f0), fabsf(f1));
-  return __all_sync(0xFFFFFFFFu, foldOk && fmax < 255.5f * 0x1p120f);
+// The warp's fold decision for one call ([45a]: all spans of a K part / V half-tile at once;
+// [44] voted per span): every lane's scaled block scales (s * g * 2^k in fp32) stay finite in
+// bf16 (bound = bf16 max + half an ulp: 255.5 * 2^120), and |g| >= 2^-117 so that every s * g is
+// fp32-normal (the smallest nonzero E4M3 scale is 2^-9), which is what makes
+// bf16_rn(s * g * 2^k) == bf16_rn(s * g) * 2^k.  foldOk is warp-uniform; it is inside the vote so
+// the result is uniform by construction.  A call takes the fallback iff any span would have.
+constexpr float kMixedFoldBound = 255.5f * 0x1p120f;
+// [45b] (Track S step 7): the static modules' fold bodies issue span s+1's payload LDS before span
+// s's decode + STS (two register sets, indexed by the unrolled span parity), so no LDS destination
+// is a register a still-draining STS reads and each LDS latency is covered by the previous
+// block's decode.  0 = one set (the register-gate fallback of the design's section 4).
+// Set to 0 at verification (A1 STS -> LDS WAR gate, section 8.6): in the fp4 module's fold body
+// ptxas placed span 2's `LDS.64 R36` on the registers of span 0's `STS.128 [R51], R36` seven
+// instructions earlier (`0xc090` -> `0xc100`), i.e. the WAR the two-set body exists to remove
+// survived in one of the four static bodies; the design takes the single-set body rather than
+// the +4 / +2 registers.  The two-set code is kept under the switch for the record.
+#ifndef MIXED_EXPANSION_PIPELINED_SPANS
+#define MIXED_EXPANSION_PIPELINED_SPANS 0
+#endif
+// [45a] in the dynamic module: 1 = one fold vote per call (pre-vote pass over the tag-selected
+// spans), 0 = the design's fallback (per-span vote, as [44]).  Static modules always vote once per
+// call.  0 at verification, see the dynamic branch of expandMixedPartialHeadsInPlaceBF16Placement.
+#ifndef MIXED_DYN_CALL_VOTE
+#define MIXED_DYN_CALL_VOTE 0
+#endif
+__device__ inline bool foldScalesFinite(bool finite, bool foldOk) {
+  return __all_sync(0xFFFFFFFFu, foldOk && finite);
 }
 // One 16-value E4M3 block (16 packed bytes) -> 32 bf16 bytes.  kFold: sf2 = bf16(s * g * 2^120)
 // broadcast; else sf2 = bf16(s * g) and the placed value (x * 2^-120) is first multiplied by
@@ -1014,9 +1076,13 @@ __device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t pa
 //   x & 3, so the lane holds four u32 addresses a_j = tileBase + byteOffset(tok, 4h + j), each
 //   used as [a_j + 2048 * span]; the scale pair is bytes 2h, 2h+1 of the row's word:
 //   [scales + 4 * tok + 2h + 64 * span].
-//   Per span: LDS.U16 [scales], LDS.128 / LDS.64 [a_0], LDS.128 / LDS.64 [a_2] (all loads issued
-//   first) -> fp32 s_0, s_1 (exact) -> f_i = s_i * g * 2^k -> warp vote ->
-//   [fold] sf2_i = bf16x2(f_i) | [fallback] sf2_i = bf16x2(s_i * g);
+//   [45a] Per call: LDS.U16 [scales + 64 s] for every span s, LDS.128 / LDS.64 [a_0], [a_2] of
+//   span 0 (all issued first) -> per span fp32 s_0, s_1 (exact) -> |s_i g 2^k| < bound, ANDed over
+//   the spans -> ONE warp vote (static modules: one format; dynamic module: each span's (g 2^k,
+//   foldOk) selected by its tag byte, A16 / BAD spans contribute true by select) ->
+//   [fold] sf2_i = bf16x2(s_i g 2^k) | [fallback] sf2_i = bf16x2(s_i g)   (recomputed per span
+//   from the kept scale word: 1 F2FP + 2 HADD2 + 2 FMUL + 2 PACK, no vote, no branch);
+//   per span (s > 0: LDS of its two blocks), then
 //   block 2h:   placement decode of [a_0] -> (fallback: x 2^k) -> x sf2_0 ->
 //               STS.128 [a_0], STS.128 [a_1]
 //   block 2h+1: ... of [a_2] -> x sf2_1 -> STS.128 [a_2], STS.128 [a_3]
@@ -1028,17 +1094,17 @@ __device__ inline void expandE2M1Block16BF16Placed(uint32_t packed0, uint32_t pa
 //   __syncwarp  (cp.async.wait_group completes the executing thread's copies only; the payload
 //                grains of row tok were copied by lanes 4 * (tok % 8) + 2h, + 2h + 1 at
 //                iteration tok / 8, the scale word by lane tok + 16 * (span % 2))
-//   for span (unrolled in static modules, rolled in the dynamic one):
-//     format (warp-uniform: per-page tag; the dynamic module branches, static ones fold)
-//     scales -> vote (convergent: inside the warp-uniform branch, all 32 lanes)
-//     fold ? body<true> : body<false>   (both straight-line over the lane's two blocks)
+//   scale words of all spans -> one vote (convergent, all 32 lanes, before any format branch)
+//   static modules: fold ? spans<true> : spans<false>  (each straight-line over the unrolled spans
+//                   and the lane's two blocks per span)
+//   dynamic module: for span (rolled): format byte -> warp-uniform format branch ->
+//                   fold ? body<true> : body<false>  (the call-level flag; no vote in the loop)
 //   __syncwarp  (before the warp's ldmatrix reads)
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, uint32_t dstNbHeads,
-          uint32_t dstNbGrains, uint32_t nbPages, typename _LdGrain>
+          uint32_t dstNbGrains, typename _LdGrain>
 __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
-    Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales,
-    MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset, float fp8GlobalScale,
-    float fp4GlobalScale) {
+    Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales, uint32_t formatWord,
+    uint32_t sourceHeadOffset, float fp8GlobalScale, float fp4GlobalScale) {
   using Tile = Array2D<_LdGrain, dstNbHeads, dstNbGrains>;
   // Every static_assert below is dependent on a template parameter so that a mixed build that
   // never instantiates this helper (fp16 input, other page sizes, sm120) compiles unchanged.
@@ -1087,55 +1153,200 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
   uint32_t const addr3 = tileBase + Tile::template byteOffset<swizzle>(tok, grain0 + 3);
   uint32_t const scaleAddr = smemAddr(scales) + tok * scaleRowBytes + blocksPerLane * h;
 
-  auto const expandSpan = [&](uint32_t span, auto formatTag) {
-    constexpr uint8_t formatValue = decltype(formatTag)::value;
-    static_assert(formatValue == fp8Format || formatValue == fp4Format);
-    constexpr bool isFP8 = formatValue == fp8Format;
+  // ---- building blocks; every format / fold decision is a compile-time tag ----
+  // One block: p came from grain a; outputs go to grains a, b (logical 2b', 2b'+1).
+  auto const block = [&](auto formatTag, auto foldTag, LdGrain const& p, uint32_t a, uint32_t b,
+                         uint32_t sf2) {
+    constexpr bool isFP8 = decltype(formatTag)::value == fp8Format;
+    constexpr bool kFold = decltype(foldTag)::value;
+    LdGrain out[2];
+    if constexpr (isFP8) {
+      expandE4M3Block16BF16Placed<kFold>(p, sf2, out);
+    } else {
+      expandE2M1Block16BF16Placed<kFold>(p[0], p[1], sf2, out);
+    }
+    stsGrain(a, out[0]);
+    stsGrain(b, out[1]);
+  };
+  // The lane's packed block at shared address addr: FP8 16 B, FP4 8 B (words 0, 1).
+  auto const loadBlock = [&](auto formatTag, uint32_t addr, LdGrain& p) {
+    constexpr bool isFP8 = decltype(formatTag)::value == fp8Format;
+    if constexpr (isFP8) {
+      p = ldsGrain(addr);
+    } else {
+      ldsB64(addr, p[0], p[1]);
+    }
+  };
+  // sf2 pair of one span from its scale word (recomputed inside the body: 1 F2FP + 2 HADD2 +
+  // 2 FMUL + 2 PACK, no vote, no branch): fold -> bf16x2(s_i g 2^k), fallback -> bf16x2(s_i g).
+  auto const scalePair = [&](auto formatTag, auto foldTag, uint32_t s01, uint32_t& sf2_0,
+                             uint32_t& sf2_1) {
+    constexpr bool isFP8 = decltype(formatTag)::value == fp8Format;
+    constexpr bool kFold = decltype(foldTag)::value;
     constexpr float pow2k = isFP8 ? 0x1p120f : 0x1p126f;
     float const g = isFP8 ? fp8GlobalScale : fp4GlobalScale;
-    float const gFold = g * pow2k;                 // exact for |g| < 2^8; inf beyond -> fallback
-    bool const foldOk = fabsf(g) >= 0x1p-117f;     // every s * g fp32-normal
-    uint32_t const tileOff = span * spanTileBytes;
-    uint32_t const scaleOff = span * spanScaleBytes;
-    // All shared loads of the span first (the lds* helpers are asm volatile: source order is
-    // issue order): the scale pair and both packed blocks are in flight while the scale chain
-    // and the vote run, and the fold branch bodies only compute and store.  The first cut
-    // loaded the payload inside the fold branch, after the vote: every span then exposed the
-    // LDS latency twice in series (LDS.U16 -> cvt -> FMUL -> vote -> LDS.128 -> decode) and ncu
-    // measured short_scoreboard 1.32 -> 2.39 (fp8) with the instruction count down 16 %.
-    // mha_sm90.cu's expandPackedStage has the same loads-first order.
-    uint32_t const s01 = ldsU16(scaleAddr + scaleOff);  // scales of blocks 2h (lo), 2h+1 (hi)
-    LdGrain packed[blocksPerLane];  // FP8: 16 B per block; FP4: 8 B in [i][0], [i][1]
-    if constexpr (isFP8) {
-      packed[0] = ldsGrain(addr0 + tileOff);
-      packed[1] = ldsGrain(addr2 + tileOff);
-    } else {
-      ldsB64(addr0 + tileOff, packed[0][0], packed[0][1]);
-      ldsB64(addr2 + tileOff, packed[1][0], packed[1][1]);
-    }
+    float const m = kFold ? g * pow2k : g;  // g * 2^k exact for |g| < 2^8; inf beyond -> fallback
     float r0, r1;
     e4m3x2ScalesToFloat(s01, r0, r1);
-    float const f0 = r0 * gFold;
-    float const f1 = r1 * gFold;
-    bool const fold = foldScalePairFinite(f0, f1, foldOk);
+    sf2_0 = bf16x2Broadcast(r0 * m);
+    sf2_1 = bf16x2Broadcast(r1 * m);
+  };
+  // The fold predicate of one span for this lane: both scaled scales |s_i g 2^k| below the bf16
+  // bound.  Same per-span semantics as [44] (fmaxf of the pair, then the compare: a NaN pair -
+  // zero scales with g >= 2^8 - fails the compare and forces the fallback, as before).
+  auto const spanFinite = [&](uint32_t s01, float gFold) {
+    float r0, r1;
+    e4m3x2ScalesToFloat(s01, r0, r1);
+    return fmaxf(fabsf(r0 * gFold), fabsf(r1 * gFold)) < kMixedFoldBound;
+  };
 
+#if MIXED_PAGE_STATIC_FORMAT == 0
+  // a16 static module: never called (kMixedStaticNeedsExpansion is false); nothing to expand.
+  unused(formatWord);
+  unused(sourceHeadOffset);
+  unused(a16Format);
+  unused(block);
+  unused(loadBlock);
+  unused(scalePair);
+  unused(spanFinite);
+  unused(addr0);
+  unused(addr1);
+  unused(addr2);
+  unused(addr3);
+  unused(scaleAddr);
+#elif MIXED_PAGE_STATIC_FORMAT > 0
+  // ---- static fp8 / fp4 module: [45a] one vote per call, spans unrolled inside the bodies ----
+  unused(formatWord);
+  unused(sourceHeadOffset);
+  unused(a16Format);
+  using Fmt = MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>;
+  constexpr bool isFP8 = MIXED_PAGE_STATIC_FORMAT == fp8Format;
+  constexpr float pow2k = isFP8 ? 0x1p120f : 0x1p126f;
+  float const g = isFP8 ? fp8GlobalScale : fp4GlobalScale;
+  float const gFold = g * pow2k;
+  bool const foldOk = fabsf(g) >= 0x1p-117f;  // every s * g fp32-normal
+  // Loads first (the lds* helpers are asm volatile: source order is issue order): every span's
+  // scale word (nbSpans x LDS.U16, independent), then span 0's payload; the chain over all
+  // spans and the single vote run while they land.  [44] voted per span, and the asm volatile
+  // loads of span s+1 could not cross span s's fold branch: four ~110-cycle chains in series.
+  uint32_t s01[nbSpans];  // compile-time indices only (unrolled loops)
+#pragma unroll
+  for (uint32_t s = 0; s < nbSpans; ++s) {
+    s01[s] = ldsU16(scaleAddr + s * spanScaleBytes);
+  }
+#if MIXED_EXPANSION_PIPELINED_SPANS
+  // [45b] [set][block]: span s decodes from set s % 2 while span s+1 lands in set (s + 1) % 2.
+  LdGrain packed[2][2];
+#else
+  LdGrain packed[1][2];  // one set: every span loads, decodes and stores in place
+#endif
+  loadBlock(Fmt{}, addr0, packed[0][0]);  // FP8 16 B per block; FP4 8 B in [.][i][0], [.][i][1]
+  loadBlock(Fmt{}, addr2, packed[0][1]);
+  bool finite = true;
+#pragma unroll
+  for (uint32_t s = 0; s < nbSpans; ++s) {
+    finite = finite && spanFinite(s01[s], gFold);
+  }
+  bool const fold = foldScalesFinite(finite, foldOk);  // one VOTE.ALL per call
+  // Both bodies are straight-line over the unrolled spans.  A lane writes only grains it alone
+  // reads, so no barrier sits between its loads and stores.
+  //   [45b] (MIXED_EXPANSION_PIPELINED_SPANS): per span s - sf2 pair from the kept scale word;
+  //   LDS span s+1 block 2h into the other set; decode + STS span s block 2h; LDS span s+1
+  //   block 2h+1; decode + STS span s block 2h+1.  Each LDS lands under ~24 decode instructions
+  //   and is issued before the STS of the block it interleaves with, so THAT block's out registers
+  //   cannot be its destination.  The argument is incomplete for the block just stored: the LDS
+  //   into packed[nxt][1] follows block(set, 0)'s STS.128 pair directly, and the LDS into
+  //   packed[nxt][0] follows the previous span's block-1 STS.128 pair after only scalePair; the
+  //   out registers of those STSs are dead there and ptxas may place the LDS destination on them
+  //   (the STS -> LDS register WAR this item exists to remove).  Gate (A1, read in SASS): no
+  //   LDS.128 / LDS.64 destination in either fold body is a source of an STS.128 within the
+  //   preceding ~10 instructions; if it is, MIXED_EXPANSION_PIPELINED_SPANS 0 (single set) is
+  //   taken rather than paying the registers for nothing.
+  //   Peak live: 3 blocks (12 FP8 / 6 FP4) + out (8) + sf2 (2).
+  //   Fallback (0): span s > 0 loads both of its blocks first, then decodes and stores them.
+  auto const spans = [&](auto foldTag) {
+#pragma unroll
+    for (uint32_t s = 0; s < nbSpans; ++s) {
+      uint32_t const off = s * spanTileBytes;
+      uint32_t sf2_0, sf2_1;
+      scalePair(Fmt{}, foldTag, s01[s], sf2_0, sf2_1);
+#if MIXED_EXPANSION_PIPELINED_SPANS
+      uint32_t const set = s % 2;                  // compile-time after unrolling
+      uint32_t const nxt = (s + 1) % 2;
+      uint32_t const offNext = (s + 1) * spanTileBytes;
+      bool const hasNext = s + 1 < nbSpans;
+      if (hasNext) {
+        loadBlock(Fmt{}, addr0 + offNext, packed[nxt][0]);
+      }
+      block(Fmt{}, foldTag, packed[set][0], addr0 + off, addr1 + off, sf2_0);  // grains 4h, 4h+1
+      if (hasNext) {
+        loadBlock(Fmt{}, addr2 + offNext, packed[nxt][1]);
+      }
+      block(Fmt{}, foldTag, packed[set][1], addr2 + off, addr3 + off, sf2_1);  // grains 4h+2, 4h+3
+#else
+      if (s > 0) {  // span 0's payload was issued before the vote
+        loadBlock(Fmt{}, addr0 + off, packed[0][0]);
+        loadBlock(Fmt{}, addr2 + off, packed[0][1]);
+      }
+      block(Fmt{}, foldTag, packed[0][0], addr0 + off, addr1 + off, sf2_0);  // grains 4h, 4h+1
+      block(Fmt{}, foldTag, packed[0][1], addr2 + off, addr3 + off, sf2_1);  // grains 4h+2, 4h+3
+#endif
+    }
+  };
+  if (fold) {
+    spans(MixedFoldTag<true>{});
+  } else {
+    spans(MixedFoldTag<false>{});
+  }
+#else
+  // ---- dynamic module: rolled span loop; the fold vote is per span (MIXED_DYN_CALL_VOTE 0, the
+  // design's [45a] fallback "per-span vote in the dyn module only") or one per call ([45a] as
+  // written, MIXED_DYN_CALL_VOTE 1).  Set to 0 at verification: the per-commit bisect priced the
+  // call-level vote at mixed +2.8 us (its pre-vote pass runs the four spans' LDS.U16 -> F2FP chains
+  // whatever their format; F2FP.E4M3 samples in the dyn module rose 1.1 -> 2.0 %), while the
+  // static modules' call vote gained.  Both forms are bit-exact (same bodies, same per-span bound).
+  float const gFold8 = fp8GlobalScale * 0x1p120f;
+  float const gFold4 = fp4GlobalScale * 0x1p126f;
+  bool const foldOk8 = fabsf(fp8GlobalScale) >= 0x1p-117f;
+  bool const foldOk4 = fabsf(fp4GlobalScale) >= 0x1p-117f;
+#if MIXED_DYN_CALL_VOTE
+  // Pre-vote pass (unrolled: nbSpans scale words, each span's (g 2^k, foldOk) SELECTED by its tag
+  // byte from the register word; A16 / BAD spans (tag 0) contribute "finite" by select - their
+  // scale rows are never written by the copy, so a stale word must not reach the compare).
+  bool finite = true;
+  bool foldOk = true;
+#pragma unroll
+  for (uint32_t s = 0; s < nbSpans; ++s) {
+    uint32_t const localPage = (sourceHeadOffset + s * headsPerSpan) / tokensPerPage;
+    uint8_t const fmt = mixedPageTagOfSpan(formatWord, localPage);
+    bool const isFP8 = fmt == fp8Format;
+    bool const isFP4 = fmt == fp4Format;
+    uint32_t const s01 = ldsU16(scaleAddr + s * spanScaleBytes);  // stale for A16 / BAD spans
+    bool const compressedFinite = spanFinite(s01, isFP8 ? gFold8 : gFold4);
+    finite = finite && ((isFP8 || isFP4) ? compressedFinite : true);
+    foldOk = foldOk && (isFP8 ? foldOk8 : (isFP4 ? foldOk4 : true));
+  }
+  bool const fold = foldScalesFinite(finite, foldOk);  // one VOTE.ALL per call, warp-uniform
+#endif
+  // One span (page) of one format.  MIXED_DYN_CALL_VOTE 1: fold is the call-level flag (uniform
+  // branch, no vote); 0: the span's own chain and VOTE.ALL after its loads ([44] order).  The
+  // scale word is read here: the rolled loop cannot index a register array by span.
+  auto const expandSpan = [&](uint32_t span, auto formatTag) {
+    constexpr bool spanIsFP8 = decltype(formatTag)::value == fp8Format;
+    uint32_t const tileOff = span * spanTileBytes;
+    uint32_t const s01 = ldsU16(scaleAddr + span * spanScaleBytes);
+    LdGrain packed[2];
+    loadBlock(formatTag, addr0 + tileOff, packed[0]);
+    loadBlock(formatTag, addr2 + tileOff, packed[1]);
+#if !MIXED_DYN_CALL_VOTE
+    bool const fold = foldScalesFinite(spanFinite(s01, spanIsFP8 ? gFold8 : gFold4),
+                                       spanIsFP8 ? foldOk8 : foldOk4);
+#endif
     auto const body = [&](auto foldTag) {
-      constexpr bool kFold = decltype(foldTag)::value;
-      uint32_t const sf2_0 = kFold ? bf16x2Broadcast(f0) : bf16x2Broadcast(r0 * g);
-      uint32_t const sf2_1 = kFold ? bf16x2Broadcast(f1) : bf16x2Broadcast(r1 * g);
-      // One block: packed[i] came from grain a; outputs go to grains a, b (logical 2b, 2b+1).
-      auto const block = [&](LdGrain const& p, uint32_t a, uint32_t b, uint32_t sf2) {
-        LdGrain out[2];
-        if constexpr (isFP8) {
-          expandE4M3Block16BF16Placed<kFold>(p, sf2, out);
-        } else {
-          expandE2M1Block16BF16Placed<kFold>(p[0], p[1], sf2, out);
-        }
-        stsGrain(a, out[0]);
-        stsGrain(b, out[1]);
-      };
-      block(packed[0], addr0 + tileOff, addr1 + tileOff, sf2_0);  // block 2h   (grains 4h, 4h+1)
-      block(packed[1], addr2 + tileOff, addr3 + tileOff, sf2_1);  // block 2h+1 (grains 4h+2, 4h+3)
+      uint32_t sf2_0, sf2_1;
+      scalePair(formatTag, foldTag, s01, sf2_0, sf2_1);
+      block(formatTag, foldTag, packed[0], addr0 + tileOff, addr1 + tileOff, sf2_0);
+      block(formatTag, foldTag, packed[1], addr2 + tileOff, addr3 + tileOff, sf2_1);
     };
     if (fold) {
       body(MixedFoldTag<true>{});
@@ -1143,24 +1354,12 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
       body(MixedFoldTag<false>{});
     }
   };
-
-#if MIXED_PAGE_STATIC_FORMAT == 0
-  unused(formats);
-  unused(expandSpan);
-  unused(sourceHeadOffset);
-  unused(a16Format);
-#else
 #pragma unroll(pageLoopUnroll)
   for (uint32_t span = 0; span < nbSpans; ++span) {
-#if MIXED_PAGE_STATIC_FORMAT > 0
-    unused(formats);
-    unused(sourceHeadOffset);
-    unused(a16Format);
-    expandSpan(span, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
-#else
+    // [45c]: the span's tag is a byte of the register word (was LDS.U8 [UR] from smem.kFormats).
     uint32_t const localPage = (sourceHeadOffset + span * headsPerSpan) / tokensPerPage;
-    assert(localPage < nbPages);
-    uint8_t const format = selectByIndex(formats.values, localPage);
+    assert(localPage < 4);
+    uint8_t const format = mixedPageTagOfSpan(formatWord, localPage);
     if (format == fp8Format) {
       expandSpan(span, MixedFormatTag<fp8Format>{});
     } else if (format == fp4Format) {
@@ -1168,7 +1367,6 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
     } else {
       assert(format == a16Format);
     }
-#endif
   }
 #endif
   __syncwarp();
@@ -1219,8 +1417,8 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, PageTransport const& transport,
-    Vec<KVCachePageIndex, nbPages> const& pages, MixedPageFormats<nbPages> const& formats,
-    uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
+    Vec<KVCachePageIndex, nbPages> const& pages, uint32_t formatWord, uint32_t headIdx,
+    uint32_t idxPart, uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
   // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
@@ -1320,10 +1518,11 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
   for (uint32_t span = 0; span < nbSpans; ++span) {
     KVCachePageIndex const page = selectByIndex(pages, span);
 #if MIXED_PAGE_STATIC_FORMAT >= 0
-    unused(formats);
+    unused(formatWord);
     copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
-    uint8_t const format = selectByIndex(formats.values, span);
+    // [45c]: byte span of the register tag word (was a byte of the shuffled struct).
+    uint8_t const format = mixedPageTagOfSpan(formatWord, span);
     if (format == a16Format) {
       copySpan(span, page, MixedFormatTag<a16Format>{});
     } else if (format == fp8Format) {
@@ -1351,7 +1550,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 #if MIXED_PAGE_STATIC_FORMAT >= 0
         pageValid ? MIXED_PAGE_STATIC_FORMAT : a16Format;
 #else
-        pageValid ? selectByIndex(formats.values, localPage) : a16Format;
+        pageValid ? mixedPageTagOfSpan(formatWord, localPage) : a16Format;
 #endif
     bool const compressed = format != a16Format;
     if (compressed) {
@@ -1470,7 +1669,10 @@ struct KVCacheList<true> {
   PageTransport transport;
 #endif
   KVCachePageIndex const*
-      kvCachePageList;  // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
+      kvCachePageList;  // shape: KVCachePageIndex[batchSize][maxNbPagesPerSeq] (Layout 1: one
+                        // row per request shared by K and V; what getPage / getPageUngated /
+                        // getPageLaneUngated index).  loadPagesForBeamSearchAsync still spells the
+                        // Layout-0 [batchSize][beamWidth][2][maxNbPagesPerSeq] form.
   SeqLenDataType const* seqLenList;  // shape: [batchSize][beamWidth] (for compatibility)
   uint32_t maxNbPagesPerSeq;
 };
@@ -1518,6 +1720,44 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
     uint32_t const idxPage = idxPageBeg + i;
     ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]
                                 : kBAD_PAGE_INDEX);
+  }
+  return ret;
+}
+
+// [45f] (Track S step 7, sm90 SPEC_DEC compact build): the page-list read does not need the
+// sequence length.  kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage] is in bounds for every
+// idxPage < maxNbPagesPerSeq (the row stride getPage indexes with; a kernel parameter), so the
+// load is predicated on that alone and BAD is selected on idxPage < nbPages after both the list
+// entry and the sequence length have landed.  LAYOUT DEPENDENCE: the ungated read is in bounds
+// only under Layout 1 (kvCachePageList[batchSize][maxNbPagesPerSeq], one row per request, K and
+// V sharing it; maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage) = page_table.shape[-1],
+// flashinfer/xqa.py), which is the layout the stock getPage above already assumes (it ignores
+// isK / idxBeam).  Reintroducing Layout 0 ([batchSize][beamWidth][2][maxNbPagesPerSeq], the
+// loadPagesForBeamSearchAsync form below) changes the row base and stride: revisit this read
+// (and getPage) with it.  Chain: the per-CTA prologue seqLen -> list -> (tag ->) copy loses one
+// dependent round trip.  The load is an asm volatile ld.global.nc so the compiler cannot fold the nbPages select back into the load predicate (a plain load whose only consumer
+// is the select may legally be predicated on both conditions).  Values are identical to getPage:
+// idxPage < nbPages <= maxNbPagesPerSeq -> the list entry, else BAD; cacheSeqLen == 0 gives
+// nbPages == 0 and every entry BAD, as today.  Data flow: idxPageBeg + i, maxNbPagesPerSeq,
+// idxReq -> (predicated) LDG -> loaded; nbPages -> SEL.  Control flow: none (predication).
+__device__ inline KVCachePageIndex ldgNcPageIndex(KVCachePageIndex const* p) {
+  KVCachePageIndex v;
+  asm volatile("ld.global.nc.b32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+template <uint32_t nbLoadedPages>
+__device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPageUngated(
+    KVCacheList<true> const& cacheList, uint32_t idxReq, uint32_t idxPageBeg, uint32_t nbPages) {
+  auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
+  Vec<KVCachePageIndex, nbLoadedPages> ret;
+#pragma unroll
+  for (uint32_t i = 0; i < nbLoadedPages; i++) {
+    uint32_t const idxPage = idxPageBeg + i;
+    KVCachePageIndex loaded = kBAD_PAGE_INDEX;
+    if (idxPage < maxNbPagesPerSeq) {
+      loaded = ldgNcPageIndex(&cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]);
+    }
+    ret[i] = (idxPage < nbPages ? loaded : kBAD_PAGE_INDEX);
   }
   return ret;
 }

@@ -138,8 +138,12 @@ void launchMHA(
 #endif
 
     KVCachePageIndex const*
-        kvCachePageList,  // device pointer. shape:
-                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+        kvCachePageList,  // device pointer. shape: KVCachePage[batchSize][maxNbPagesPerSeq]
+                          // (Layout 1, maxNbPagesPerSeq = maxSeqLen / tokensPerPage = the
+                          // page table's last dim; the kernels' getPage* index this layout and the
+                          // sm90 compact build's getPageUngated reads every idxPage <
+                          // maxNbPagesPerSeq of a row unconditionally).  Layout 0
+                          // [batchSize][beamWidth][2][maxNbPagesPerSeq] is not launched here.
     uint32_t maxSeqLen, uint32_t const* seqLen,
 #if BEAM_WIDTH > 1
     BeamSearchParams const& beamSearchParams,
@@ -205,8 +209,8 @@ void launchHopperF8MHA(
     PageTransport const& pageTransport,
 #endif
     KVCachePageIndex const*
-        kvCachePageList,  // device pointer. shape:
-                          // KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
+        kvCachePageList,  // device pointer. shape: KVCachePageIndex[batchSize][maxNbPagesPerSeq]
+                          // (Layout 1; see launchMHA above).
     uint32_t maxSeqLen, uint32_t const* seqLen,
 #if BEAM_WIDTH > 1
     BeamSearchParams const& beamSearchParams,
