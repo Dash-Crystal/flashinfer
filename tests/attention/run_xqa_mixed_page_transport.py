@@ -1,7 +1,9 @@
 """Plain runner for the XQA mixed-page conformance matrix (no test framework).
 
-Runs the 32 register-expansion cases and the 2 native block-FP8 cases on
-sm90 / sm12x.  Exit code is the number of failing cases.
+Runs the 32 register-expansion cases, the 2 native block-FP8 cases and the 18
+tail / value-range cases (short and odd sequence tails, 35-tile CTAs, E4M3
+subnormal payloads and maximal block scales) on sm90 / sm12x.  Exit code is the
+number of failing cases.
 """
 
 import importlib.util
@@ -46,6 +48,13 @@ def main() -> int:
         n += 1
         failures += _run(f"[native_fp8-{q_len}]",
                          _mod.test_xqa_native_block_fp8_matches_a16_expansion, q_len)
+    # Tails, 35-tile CTAs and extreme E4M3 value ranges (q=1, the sm90 GMMA host).
+    for seq_len, nb_sub_seq, regime in _mod.TAIL_CASES:
+        for mode in ("fp8", "fp4", "mixed"):
+            n += 1
+            failures += _run(f"[tail-{mode}-{seq_len}-sub{nb_sub_seq}-{regime}]",
+                             _mod.test_xqa_mixed_page_transport_tails_and_value_ranges,
+                             mode, seq_len, nb_sub_seq, regime)
     print(f"{n - failures} passed, {failures} failed")
     return failures
 
