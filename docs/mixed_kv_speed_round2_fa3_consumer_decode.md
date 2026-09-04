@@ -974,3 +974,165 @@ tile per operand) and inside the rolled expansion loops (`FLO`/`POPC` for
 well below the pre-[22] 5263.  Static modules: SASS identical to the F24b
 build (the `PagePos` refactor is a pure re-spelling of the same immediates —
 verify by `cuobjdump -sass` diff, expected empty for all three).
+
+---
+
+## Results (2026-09-04, nkcut2 H200, worktree F24 @ 35706f8a)
+
+**SASS (`cuobjdump -sass`, persistent kernel of the `*_paged_sm90_kernel_mask_1`
+object, producer region = `USETMAXREG.DEALLOC .. EXIT`; artifacts
+`nkcut2:/tmp/mixedkv-wtF24-art/sf{-1,0,1,2}_mask1.sass`, `counts4.log`,
+`dynmap4.log`, `ptxas_*.log`, `sass_all4.log`).**
+
+| module | region instr | STACK (ptxas) | USETMAXREG | LDGSTS | STS.128 | LDS | VOTE.ALL | F2FP.E4M3 | FMUL / .FTZ | HMUL2 | BAR.SYNC | FENCE | LDL/STL in pair loop |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fp8 (`static_format_1`) | **2093** (2687 at [23]) | 0 B, 0 spills | DEALLOC 0x48 + TRY_ALLOC 0xB8 | 18 x .128 + 18 x .64 (= 6 + 6 per thread per pair over 3 copy sites; [23] 36 + 36) | 30 (2 per block site, 15 sites; [23] 60) | .64 30, .32 63, .128 6 | 15 (one per block site) | 15 (one per site: the cold recompute is CSE'd with the hot scale, so ~15 not the ~24 written) | 30 / 2 (the two `.FTZ` are `g x 2^120` in make_bases) | 240 (8 hot + 8 cold x 2^120 per site) | 4 = 3 x (id 0xe, **256**) + 1 x (id 0x8, **512**) | 3 | **0** |
+| fp4 (`static_format_2`) | 2058 | 0 B | 0x48 / 0xB8 | 36 x .64 (payload 8 B + scale) | 30 | .32 93, .128 6 | 0 (no fold) | 15 | 15 / 0 | 120 | 4 | 3 | **0** |
+| dynamic (`static_format_-1`) | **3235** (7271 at [23]) | 32 B (32 B stores / 52 B loads) | 0x48 / 0xB8 | 24 x .128 + 18 x .64 | 20 (5 FP8 + 5 FP4 sites) | .64 20, .32 172 | 5 | 10 | 15 / 2 | 120 | 4 | 3 | **4 LDL per pair** (2 per operand) + 5 STL in the item prologue |
+| a16 (`static_format_0`) | 12-warp, 0x48 / 0xD8 | 0 B | | | | | | | | | | | byte-identical to `5cc416fd` (2 kernels x 4 mask objects) |
+| stock paged (`batch_prefill_with_kv_cache_*_sm90`) | | | | | | | | | | | | | byte-identical to `5cc416fd` (2 kernels x 4 mask objects) |
+
+`ptxas -v` (replayed nvcc commands, `ptxas_{-1,0,1,2}.log`): **no C7507** in any
+module; 128 registers at launch for the 16-warp modules (512 threads), 168 for
+the 12-warp a16; `USETMAXREG` pairs as designed.  `LD.E/ST.E` 0 in every
+producer region.  fp8 protocol counts: `LDG.E` 33 = 18 ([23]) + 15 cold-path
+global-scale reloads (one per block site); `UTMALDG` 2 sites; `WARPSYNC.ALL` 4
+plus **`BRA.DIV` 22**: ptxas guards every `__syncwarp()` it cannot prove
+converged with `UMOV UR, -1; BRA.DIV UR, <out-of-line WARPSYNC>` - +2
+instructions per block site over the one `WARPSYNC` budgeted;
+**`BSSY`/`BSYNC` 24** (2 at [23]): the `pending` conditionals of the finish
+step and the FULL / partial copy arms, **none around the vote** - the vote is
+`FSETP.GEU.FTZ |v|, 255.5 x 2^120; VOTE.ALL P0, !P0; @P0 BRA hot` (3
+instructions, as budgeted); the cold body (`LDG`, 8 `HMUL2` by `2^120`, `FMUL`,
+`F2FP.PACK`, `BRA`) is the not-taken fall-through and the hot path takes one
+branch - the mirror of the design's wording, same cost.  Per FP8 block, hot
+path, read from the SASS: `LDS.64 x2, LDS.32, PRMT, F2FP.E4M3, HADD2.F32, FMUL,
+FSETP, 8 x (PRMT, IMAD.SHL, LOP3), VOTE.ALL, BRA, F2FP.PACK, UMOV, 8 HMUL2,
+BRA.DIV, 2 STS.128` plus two `IMAD` stage-address folds (`STS.128` forms 26
+`[R+imm]` / 10 `[R]`, [23]: 56 / 10 over 60).
+
+**Correctness.**  `run_fa3_mixed_page_transport.py`: **88 / 88 bit-exact** (64
+matrix + 2 many-items + 6 parity-tail + 4 parity-tail-extremes + 12 extremes)
+on objects rebuilt after the run's start (`.o` mtimes checked).  Two findings
+were fixed on the way (design doc, "as written" F24a / F24c): the f32 scale
+product was `FMUL.FTZ` under `-use_fast_math` and flushed `f32(s) g = 1.1 x
+2^-127` to 0 (`[extremes-fp8-64-g3.31e-36]`, V side, 400 outputs one ulp off;
+`mul.rn.f32` without `.ftz` now); the dynamic module's pair loop had 10
+`LDL/STL` per pair (four hoisted landing half addresses per operand spilled +
+a 16-bit `"h"` asm operand through the frame), now 4 (the two landing bases
+per operand; `STACK` 40 -> 32).
+
+**Bench** (us, q=1 / q=64, min / median / max, `--repeats 1 --trials 5`, lock):
+
+| mode (us) | [23] fa13ad89, q=1 / q=64 (medians) | F24a only (d6539806), q=1 ; q=64 | **F24a+b+c (35706f8a)** q=1 min / med / max | q=64 min / med / max | design row (section 5) |
+|---|---|---|---|---|---|
+| stock_a16 | 299.8 / 309.4 | 299.1 / 299.7 / 300.3 ; 308.7 / 309.1 / 309.6 | 299.5 / 299.8 / 301.3 | 308.6 / 310.5 / 311.6 | 297-303 / 306-312: control holds, no session offset |
+| transport_a16 | 283.4 / 286.9 | - | 282.0 / 282.5 / 285.3 | 286.7 / 288.4 / 289.0 | 281-290 / 284-292: holds (module byte-identical) |
+| fp8 | 474.0 / 483.0 | **493.9 / 494.6 / 495.3 ; 510.7 / 511.5 / 513.7** (slower than [23]) | **459.7 / 460.2 / 460.7** | **472.2 / 475.6 / 477.6** | accept <= 330 (band 290-345): **reject**, and outside the 331-360 re-derive band |
+| fp4 | 507.2 / 517.5 | - | 491.6 / 495.7 / 504.9 | 509.3 / 512.4 / 518.3 | accept <= 330 (band 295-350): **reject** |
+| mixed | 880.1 / 906.9 | - | 715.9 / 718.1 / 718.5 | 726.7 / 728.2 / 733.2 | recorded against gate 2E (-18 %) |
+
+Clocks 1980 MHz (nvidia-smi during the runs); the co-tenant `VLLM::EngineCore`
+resident; single-kernel bursts (`--repeats 1`), spreads <= 2.5 % except fp4
+q=1 (2.7 %).
+
+**Trace** (q = 1, us per pair):
+
+| mode (trace build, q=1, 44 pairs per item, w0 / w1 = thread 0 of producer WG0 / WG1) | us per pair | acq | bar | gat | iss | fin = wait / expK / expV / fence+commits | gap (trace overhead) |
+|---|---|---|---|---|---|---|---|
+| transport_a16 (12 warps) | 2.02-2.04 | **1.00-1.05** | 0.04-0.05 | 0.05 | 0.73-0.75 | 0 | 0.14-0.20 |
+| fp8 | 2.59-2.89 | **0.10** | 0.14-0.19 | 0.12-0.18 | **0.62-0.69** | **1.00-1.16** = 0.03 / 0.43-0.59 / 0.40-0.44 / 0.06 | 0.54-0.67 |
+| fp4 | 2.75-2.94 | 0.10 | 0.04 | 0.17-0.22 | 0.69-0.70 | 1.27-1.32 = 0.03 / 0.62-0.66 / 0.51-0.53 / 0.05 | 0.47-0.57 |
+| mixed (dynamic) | 4.59-5.17 | 0.35-0.39 | 0.21-0.24 | 0.16-0.22 | **1.71-2.15** | 1.19-1.27 = 0.03 / 0.56-0.63 / 0.49-0.54 / 0.05 | 0.93-1.09 |
+
+[23] for comparison: fp8 3.3 = acq 0.2 + iss 0.85 + fin 1.2 (expK 0.57-0.63,
+expV 0.48-0.53) + gap 0.7; fp4 fin 1.27-1.36; mixed 5.6 (iss 2.0-2.2, fin
+1.85); transport_a16 2.03 (acq 1.05).  Predicted for F24b: iss <= 0.45, fin <=
+0.6, acq >= 0.25.  Measured: each producer thread now issues half the copies
+and expands half the blocks, but `iss` fell only 0.85 -> 0.66 and `fin` only
+1.2 -> 1.0-1.16 - the per-warp rate roughly halved as the warps doubled - and
+`acq` stayed ~0.1: **the producer still paces**.  The 16-warp module's
+chunk-table segments (`bar` + `gat` 0.26-0.37 us) are 3x the 12-warp module's
+(0.10): the 256-thread named barrier with the gather by threads < 128.
+
+**ncu** (fp8, q = 1):
+
+| metric (fp8, q=1, third launch, `--clock-control none`, 1980 MHz) | [23] (`ncu_fp8e`) | F24 (`ncu_fp8`) | design (section 5) |
+|---|---|---|---|
+| `gpu__time_duration` | 468.0 us | 456.9 us | |
+| producer-region `inst_executed` | 81.8 M = **3417 / pair** (854 / warp) | 106.1 M = **4432 / pair** (554 / warp) | ~3600 / pair, <= 500 / warp |
+| `smsp__issue_active` | 44.6 % | 52.9 % | 70-80 % |
+| warps active per SMSP | 3.0 | 4.0 | |
+| producer stall mix (pc sampling, region) | wait 27.5, selected 22.8, dispatch 14.9, not_selected 9.9, short_sb 8.9, long_sb 8.8, no_inst 3.4, math 3.1 | wait 25.5, **dispatch 18.6**, **not_selected 15.6**, selected 15.2, **math 8.1**, long_sb 6.3, branch_resolving 4.0, short_sb 3.8 | dispatch down, selected >= 18 |
+| dispatch stalls per issue-active | 0.876 | 1.252 | |
+| LSU shared wavefronts, total / per pair | 61.5 M / 2570 | 47.3 M / **1974** | <= ~2050 (C11): met |
+| by class: op_gmma / op_st / op_ld / ldgsts (remainder) | 23.95 M / 19.28 M / 8.70 M / 9.6 M | 23.95 M / 10.00 M / 10.89 M / 2.4 M | ~1000 / <= 450 / ~365 / <= 250 per pair -> 1001 / 418 / 455 / 101 |
+| `STS.128` wavefronts per instruction (bank conflicts st) | 8.0 (9.76 M) | **4.41** (0.58 M) | 4.0 |
+| `LDGSTS` bank conflicts | 8.84 M | 0.29 M | scale copies <= 4 wf |
+| `LDS` instructions | 3.58 M | 7.15 M (two half loads per block) | |
+| LSU pipe % of peak | 55.7 | 43.8 | |
+| ALU / FMA / XU pipe % of peak (SM) | 30.9 / 20.3 / 20.8 | 33.5 / 23.9 / 21.4 | ALU <= ~70 % of producer share |
+| tensor pipe active | 39.9 % | 41.1 % | within 3 % of transport_a16 (not measured this round) |
+
+Top producer PCs by stall samples (region): the copy-issue address chain
+(`IADD3.X`, `VIADD R, UR`, `IMAD.WIDE.U32`, `ISETP.NE`) with `dispatch` /
+`math` stalls, the chunk-table `valid` extraction (`LOP3 R, R19, 0xff0000`,
+`short_sb` behind the LDS.128), and the acquire / commit waits (`@!P0 BRA`
+loops, `SYNCS.ARRIVE`, `long_sb`).  The expansion body itself is not among the
+top 28.
+
+**Verdict (section 5 rows, section 6 gates):**
+
+- **fp8 / fp4: reject.**  460 / 476 and 496 / 512 us against <= 330; the
+  trace's `acq` is ~0.1 us (< 0.25) - the producer still paces - so by the
+  design's own row the finding is "per-warp IPC did not hold; re-attribute
+  (pipe classes, ALU) before any further step".  The re-attribution from this
+  round's counters: (i) the executed count per pair rose 30 % (4432 vs 3417;
+  the model allowed +5 %): the per-warp protocol (chunk-table row reads and
+  `valid` decode, pipeline acquire / commit, pending bookkeeping, the 256-thread
+  barrier + gather, item loop) is duplicated across 8 warps, and the 16-warp
+  module's `bar` + `gat` segments are 3x the 12-warp module's; (ii) the
+  producer's per-warp IPC fell from 0.13 to 0.10 (554 warp-instr in ~2.7 us):
+  `not_selected` 9.9 -> 15.6 %, `dispatch` 14.9 -> 18.6 %, `math` 3.1 -> 8.1 %
+  - issue-slot sharing among four warps per SMSP and ALU / FMA dispatch
+  contention, not F2FP (XU 21 %) and not the smem pipe (C11 met, LSU 43.8 %);
+  (iii) `iss` barely moved (0.85 -> 0.66 with half the copies): the copy
+  phase is a latency chain (table LDS -> valid -> predicates -> IMAD.WIDE ->
+  LDGSTS -> arrive), not an issue-count problem.
+- **Gate 6.3 fails retroactively.**  F24a alone (decode floor, 12 warps) is
+  slower than [23]: fp8 494.6 / 511.5 vs 474.0 / 483.0 in the same session
+  (stock control equal).  The [23] SASS had no `WARPSYNC` / `BRA.DIV` (ptxas
+  proved the `__syncwarp` converged); the vote's data-dependent branch makes it
+  unprovable and every block site carries `UMOV + BRA.DIV` plus the taken
+  branch over the cold body.  `branch_resolving` appears in the stall mix
+  (4.0 %, was 0.5 %).  The decode floor's -5 instructions per block did not pay
+  for the guard; the design's step order (F24a's trace and ncu before F24b)
+  would have stopped here.
+- **Gate 6.4 (vote structure): passes** - no `BSSY/BSYNC` around the votes, the
+  guard is 3 instructions; the cold body is the fall-through and the hot path
+  takes the branch (mirror layout, same cost).
+- **Gate 6.1 (registers): passes** - no C7507, `STACK 0` for fp8 / fp4 / a16
+  at 72 / 184 (and 72 / 216), two `USETMAXREG` per kernel; the dynamic module
+  keeps a 32 B frame with 4 `LDL` per pair (2 per operand: the landing bases),
+  not the 0 the F24c gate asked for.
+- **Gate 6.5 (C11): passes** - 1974 wavefronts per pair, `STS.128` 4.41.
+- **Gate 6.2 (16-warp consumer control, `SKIP_EXPAND`): not run** - with `acq`
+  ~0.1 the consumer is not the pacing side, so the control decides nothing
+  yet; it is the first measurement once the producer is below the cadence.
+- **mixed: 718 / 728 (from 880 / 907).**  The dynamic module's `iss` 2.0-2.2 ->
+  1.7-2.1 and `fin` 1.85 -> 1.2 per pair; the F24c pc-sampling gate (2E) was
+  not run in isolation (the F24b-only dynamic build was not built); recorded,
+  not accepted.
+- **Correctness: 88 / 88 bit-exact**, a16 module and stock paged kernel
+  byte-identical to `5cc416fd`, and C9 now holds down to bf16 subnormal scale
+  factors (FTZ fix).
+- **What the numbers say to do next (not done here, per the rules):** the
+  lever is the per-warp protocol and the copy-issue latency chain, not the
+  decode: (a) one chunk-table row read and one `valid` decode per warp per
+  pair shared by the 8 blocks (the `LOP3 0xff0000 / short_sb` PC), (b) the
+  copy addresses as one `IMAD.WIDE` per page from a per-item 64-bit base
+  instead of the `IADD3.X / VIADD` chains, (c) the vote hoisted per operand
+  (one `VOTE` per pair per operand, block bodies branch-free so the
+  `__syncwarp` is provably converged again and the 22 `BRA.DIV` guards
+  disappear), (d) the a16-style 12-warp layout re-measured with (a)-(c) before
+  deciding whether the second warp group pays for its protocol duplication.
