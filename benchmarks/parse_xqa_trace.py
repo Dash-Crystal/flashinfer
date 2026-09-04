@@ -23,6 +23,18 @@ SLOT_NAMES = [
 PAT = re.compile(r"TRACE tile (\d+) (.*)")
 PAT_CTA = re.compile(
     r"TRACE ctarec (\d+) start (\d+) firstk (\d+) last (\d+) end (\d+) tiles (\d+)")
+# 9ce501fe appends " smid <n> range <c>"; the fields above are unchanged.
+
+
+def _launch_end(line):
+    """Mode name if this line ends a launch group: a bench JSON result line
+    (bench_xqa_mixed_page_transport.py) or an '=== END <mode> ===' marker
+    (xqa_mixed_trace_once.py); else None."""
+    if line.startswith("{\"q_len\""):
+        import json
+        return json.loads(line)["mode"]
+    m = re.match(r"=== END (\S+) ===", line)
+    return m.group(1) if m else None
 
 
 def parse(path, mode=None):
@@ -32,10 +44,9 @@ def parse(path, mode=None):
     cur = None
     last_tile = None
     for line in open(path, errors="replace"):
-        if line.startswith("{\"q_len\""):
-            import json
-            rec = json.loads(line)
-            if mode is None or rec["mode"] == mode:
+        m_end = _launch_end(line)
+        if m_end is not None:
+            if mode is None or m_end == mode:
                 launches.extend(pending)
             pending = []
             cur = None
@@ -61,13 +72,18 @@ def parse_cta_records(path, mode=None):
     records are attributed to the JSON result line that follows them."""
     launches = []
     pending = []
+    cur_mode = None  # set by the '=== MODE <mode> ...' markers of xqa_mixed_trace_once.py
     for line in open(path, errors="replace"):
-        if line.startswith("{\"q_len\""):
-            import json
-            rec = json.loads(line)
-            if pending and (mode is None or rec["mode"] == mode):
+        m_end = _launch_end(line)
+        m_beg = re.match(r"=== MODE (\S+) ", line)
+        if m_end is not None or m_beg is not None:
+            # one launch per MODE marker; a bench JSON line closes the group too
+            group_mode = m_end if m_end is not None else cur_mode
+            if pending and (mode is None or group_mode == mode):
                 launches.append(pending)
             pending = []
+            if m_beg is not None:
+                cur_mode = m_beg.group(1)
             continue
         m = PAT_CTA.search(line)
         if m:

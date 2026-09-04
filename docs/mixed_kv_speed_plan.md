@@ -170,6 +170,7 @@ Predicted effect at converter-paced cadence after Phase 2: -15% of steady state 
 - Model: tile-times 39 -> 33; fills per slot 3 -> 1. Calibrated first by P0.3's `XQA_NB_SUB_SEQ=3` ratio (1.13 predicted).
 - Verify: per-CTA %globaltimer start/end histogram (slot idle + tail), ncu sm__cycles_active.max vs .avg, launch stats 264 CTAs; duration vs 33 x T_tile + f.
 - Accept: -12% or better on every converter-paced mode at unchanged T_tile (trace). If the histogram shows tail slots finishing early anyway (J1: lone CTAs run faster), the upper bound was 9 us; take what the histogram gives and stop.
+- Status 2026-09-04 (r2p8 @ 9ce501fe, `mixed_kv_speed_round2_lever8.md` section 10): built and confirmed, 60/60; a16 78.8 / fp8 67.8 / fp4 60.5 / mixed 64.4 (-3.7 / -11.8 / -14.4 / -19.0 %); gate met on fp4, mixed, a16, missed by 0.1 us on fp8. Histogram: every SM runs one CTA at 46.5 us and one at 57.1 us (fp8) for identical work (not range-, not SM-dependent; a16 unaffected) -> the design's dynamic-pull fallback is triggered; fill 8.5 us (start burst + 4-5 us prologue) is the second item.
 
 **[36a][36b] Ramp cuts** (both do; 1 d): defer metadata chunk 1 fill to iteration ~12 (first needed at 14, `:1845-1850`); move the Q load off warp 0 (currently both Q loader and K loader, so the first K TMA waits behind the Q round trip). Model: -2..-4 us (2-4 us ramp x 2.58 lifetimes half-hidden). Verify: per-CTA start-to-first-kBar.produced stamp shrinks by one DRAM round trip.
 

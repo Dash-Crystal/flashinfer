@@ -1354,3 +1354,165 @@ nbSubSeq 5, grid 1 x 5 x 136 = 680 CTAs = 2.58 waves at 264 slots):
   8840 tile-iterations / 264 CTAs = 33.5 tiles per CTA -> fp8 ~47 + fill ~
   53 us, fp4 ~39 + fill ~ 45 us at unchanged periods.
 
+
+### Round 2, lever [8] — persistent balanced CTA scheduling: confirmation (2026-09-04, nkcut2 H200, worktree r2p8 @ 9ce501fe)
+
+Design: `docs/mixed_kv_speed_round2_lever8.md` (sections 2, 8, 9; results in
+section 10).  Kernel: grid `{264, 1, 1}` (2 CTAs/SM x 132 SMs), CTA c owns
+tiles `[ceil(cT/264), ceil((c+1)T/264))` of the linear (req, head, tile) space
+(T = 8704 for the bench: 256 CTAs x 33 tiles, 8 x 32), items walked by four IO
+warps with a register cursor, 32 B tile records, Q double-buffered, in-loop
+finalize, merge warp with the `2c + isCtaLast` scratch rule.  Review fixes
+before this run: `nbPartials = min(c1 - c0 + 1, tiles)` and the division-free
+owner recurrence for T < P (empty CTAs never arrive on the semaphore);
+`MIXED_KV_TRACE_REVERSE_RANGES` and `smid`/`range` in the per-CTA trace record
+were added for the attribution below.
+
+**Build facts** (`ptxas -v` on the TU with the real ninja flags, all four q=1
+modules static 0 / 1 / 2 / -1): no C7507, 0 bytes stack, 0 spill stores, 0
+spill loads, 48 registers (launch cap), 5 named barriers; SASS `USETMAXREG` = 2
+(`DEALLOC.CTAPOOL 0x28`, `TRY_ALLOC.CTAPOOL 0x38`), `LDL` = `STL` = 0, no
+generic `LD.E`/`ST.E`, exactly one `ATOMG.E.INC.STRONG.GPU`, no `ATOMS`,
+`HGMMA` 16, `UTMALDG` 8 in the a16 and mixed modules (16 before: one loader
+code path for K and V) and 0 in fp8/fp4, `LDGSTS` 30 / 18 / 42 (fp8 / fp4 /
+mixed).  `CALL.REL.NOINC` 9 vs 4 at fe2e9a33: the 4 `rcp_rn_ftz_f32_slowpath`
+calls of the finalize (unchanged) plus 5 calls to the ptxas `div_u64`
+subroutine (68 straight-line SASS, no loop): prologue scan x0 / x1, merge warp
+c0 / c1 / x_{c1+1} — once per CTA / once per partial item, accepted.  Kernel
+totals PHASECHK 71 -> 60, ARRIVE 43 -> 31/33, BAR.SYNC 7 -> 4 (deleted
+`MultiBlockSMem` epilogue, merged loader).  Per-role split (nvdisasm line info,
+instructions attributed by their outermost `mha_sm90.cu` frame inside each
+`warpIdx.z` block; fp4 module, baseline fe2e9a33 in parentheses):
+
+| role | PHASECHK | ARRIVE | BAR.SYNC | HGMMA | CALL | LDGSTS | total SASS |
+|---|---|---|---|---|---|---|---|
+| gemm0 | 8 (9) | 11 (10) | 1 (1) | 8 (8) | 0 | 0 | 281 (259) |
+| gemm1 | 17 (17) | 13 (13) | 1 (1) | 8 (8) | 4 (4) | 0 | 455 (497) |
+| IO (4 warps) | 5 (9) | 5 (10) | 0 | 0 | 3 (0) | 0 | 1705 (522) |
+| K conv | 9 (15) | 1 (1) | 0 | 0 | 0 | 6 (9) | 603 (721) |
+| V conv | 15 (15) | 0 (1) | 0 | 0 | 0 | 9 (9) | 297 (718) |
+| other (prologue, epilogue, shared helpers) | 6 (6) | 1 (4) | 2 (5) | 0 | 2 (0) | 3 (2) | 1171 (547) |
+
+gemm0/gemm1 keep their barrier sites (the +1 gemm0 ARRIVE is the per-item
+`qBar.consumed` arrive, executed once per item; the converters' shared copy
+helper moved some of their sites into "other").  `cuobjdump -res-usage`: REG 48
+STACK 0; `sizeof(SharedMem)` 113 664 B (ncu `launch__shared_mem_per_block_dynamic`
+113.66 KB); ncu occupancy limits registers 2, shared memory 2; `launch__grid_size`
+264, `sm__ctas_launched.sum` 264.
+
+**Conformance**: `python tests/attention/run_xqa_mixed_page_transport.py` ->
+**60 passed, 0 failed** (32 + 2 + 24 + 2; the 24 tail cases include T < P with
+empty CTAs at seq 50 / 100 / 130, P = 1, P = 3, P = 5, subnormal / maxscale).
+
+**Locked bench** (5 x 5, B=17 S=4096 8 KV heads GQA 4 D=128, min / median / max us):
+
+| q | mode | fe2e9a33 baseline | r2p8 [8] | change | accept gate (-12 %) | target |
+|---|---|---|---|---|---|---|
+| 1 | transport_a16 | 81.2 / **81.8** / 81.9 | 78.6 / **78.8** / 79.2 | -3.7 % | <= 82 pass | parity |
+| 1 | fp8 | 76.6 / **76.9** / 77.1 | 67.7 / **67.8** / 68.0 | -11.8 % | <= 67.7 **miss by 0.1 us** (inside the 0.3 us run spread) | <= 58 fail |
+| 1 | fp4 | 70.2 / **70.7** / 70.8 | 60.3 / **60.5** / 60.8 | -14.4 % | <= 62.2 pass | <= 36 fail |
+| 1 | mixed | 79.3 / **79.5** / 80.5 | 63.8 / **64.4** / 65.0 | -19.0 % | <= 70.0 pass | <= 62 fail (2.4 us short) |
+| 4 | transport_a16 | 93.4 / 94.1 / 94.7 | 93.7 / 93.9 / 95.1 | 0 | untouched SPEC_DEC path | |
+| 4 | fp8 | 118.8 / 120.1 / 120.9 | 119.6 / 120.2 / 121.4 | 0 | | |
+| 4 | fp4 | 138.3 / 139.0 / 141.1 | 137.8 / 138.5 / 139.7 | 0 | | |
+| 4 | mixed | 135.3 / 136.6 / 136.9 | 134.7 / 137.8 / 138.5 | 0 | | |
+
+Effective KV bandwidth q=1: a16 3618 GB/s, fp8 2234, fp4 1326, mixed 2676.
+ncu (one launch): `dram__bytes_read.sum` fp8 156 MB, fp4 84 MB, a16 286 MB
+(bytes unchanged); `sm__cycles_active.avg / .max` fp8 0.948, fp4 0.962, a16
+0.916 (design cross-check (iv) >= 0.9 met: no wave tail).
+
+**Same-launch trace** (`MIXED_KV_TRACE 1`, 3 launches per mode, 1.98 GHz;
+role period = slot(t+1) - slot(t), median over tiles and launches):
+
+| mode / window | gemm0 | gemm1 | K load issue | V load issue | K conv done | V conv done |
+|---|---|---|---|---|---|---|
+| fp8 baseline (CTA 0, tiles 3-7, old grid) | 1.38 | 1.46 | 1.43 | 1.39 | 1.62 | 1.02 |
+| fp8 CTA 0 tiles 3-7 | 1.21 | 1.20 | 1.18 | 1.22 | 1.19 | 1.14 |
+| fp8 CTA 0 tiles 11-18 (chunk-1 use at 16) | 1.35 | 1.34 | 1.27 | 1.34 | 1.32 | 1.40 |
+| fp8 CTA 1 tiles 27-32 (item boundary 30 -> 31) | 1.33 | 1.41 | 1.19 | 1.26 | 1.08 | 1.12 |
+| fp4 baseline | 1.14 | 1.15 | 1.13 | 1.17 | 1.18 | 1.12 |
+| fp4 CTA 0 tiles 3-7 | 1.22 | 1.20 | 1.23 | 1.25 | 1.20 | 1.25 |
+| fp4 CTA 0 tiles 11-18 | 1.24 | 1.23 | 1.25 | 1.20 | 1.21 | 1.18 |
+| fp4 CTA 1 tiles 27-32 | 1.21 | 1.23 | 1.14 | 1.18 | 1.07 | 1.10 |
+| a16 baseline | 2.52 | 2.42 | 2.38 | 2.68 | 2.88 | 2.51 |
+| a16 CTA 0 tiles 3-7 | 1.85 | 2.06 | 2.98 | 3.12 | 2.57 | 2.65 |
+
+On the traced CTAs the per-tile pipeline is at or below the baseline periods
+(fp8 1.2-1.35 vs 1.38-1.62; fp4 1.2-1.25 vs 1.13-1.18, +5-8 %); `kc_ready(16)`
+and `kc_ready(32)` are at the steady-state period (chunk fills at lead 4 are
+not exposed); the item boundary shows no first-K latency (`g0_kwait` delta
+30 -> 31 normal, `kc_ready(31)` normal) but gemm0's K-wait -> mma segment on the
+item's first tile is 1869 / 1808 cyc (fp8 / fp4) against ~1050 on other tiles:
+**+0.4 us per item on gemm0's path**, between the K wait and the HGMMA (the
+`qBar` wait or the overlap with gemm1's finalize of the previous tile; not
+separated by the current stamps).
+
+**Per-CTA `%globaltimer` histogram** (264 records per launch; fill = start ->
+first K ready in gemm0, body = first K ready -> last tile consumed, tail =
+last tile -> CTA end; medians of 3 launches):
+
+| mode | start spread | fill med (min / max) | body med (min / max) | body / tile | tail med | end med | end max excl. co-tenant outliers |
+|---|---|---|---|---|---|---|---|
+| fp8 | 0.3 us | 8.5 (5.9 / 9.9) | 52.5 (44.4 / 59.1) | 1.59 | 2.8 | 64.3 | ~71 |
+| fp4 | 0.3 | 7.4 (5.0 / 9.5) | 49.2 (42.5 / 57.1) | 1.49 | 2.6 | 59.6 | ~67 |
+| a16 | 0.3 | 6.6 (4.4 / 9.5) | 70.3 (52.7 / 74.5) | 2.13 | 3.0 | 79.4 | 83.5 |
+
+Predicted (design 8.10): fill 3.5, body 33 x 1.62 = 53.5 (fp8) / 33 x 1.18 =
+39 (fp4), finalizes 0.8, tail 3 -> 60.8 / 46.2.  Measured 67.8 / 60.5.  The
+difference is three structural items, none of them the per-tile pipeline:
+
+1. **Pair asymmetry: on every SM one of the two co-resident CTAs runs 20-23 %
+   slower for identical work.**  fp8 body is bimodal: 46.5 us (CTA ids 0-139) vs 57.1 us (ids 140-263),
+   fp4 44.7 vs 53.8; no CTA in between (the dispatcher places ids 0-131 one
+   per SM, then ids 132-263 as the second CTA of each SM in a different SM
+   order, so the 140 boundary is a dispatch-order artefact, not a slot count).
+   With `smid` in the record: all 132 SMs hold exactly one fast and one slow
+   CTA (0 both-slow, 0 both-fast pairs in every launch), body median by SM is
+   flat (52.0-53.0 in every 16-SM bucket), and with
+   `MIXED_KV_TRACE_REVERSE_RANGES` (CTA c takes range 263-c) the slow set is
+   still ids >= 140 while the 32-tile CTAs move — so the effect follows the CTA
+   dispatch slot, not the tile range and not the SM.  a16 (TMA, DRAM-bound,
+   idle converters) has no such split (both-slow 40-47 / both-fast 42-48 /
+   mixed 37-50 pairs; its body spread is by SM: buckets 32-47 and 80-95 at 58
+   vs 70 elsewhere).  Mechanism not yet attributed (the co-tenant
+   `VLLM::EngineCore` shows 100 % `utilization.gpu` during these runs; issue
+   or LSU arbitration between the two CTAs' converter warps is the candidate).
+   Consequence for a static partition: the wall follows the slow member (57.1
+   + 8.5 + 2.8 = 68.4 ~ 67.8 measured).  The old 680-CTA grid hid the same
+   asymmetry by giving slow slots fewer CTAs.  This is the design's own
+   fallback trigger ("dynamic tile-range pull if the per-CTA spread exceeds
+   5 us"): body spread is 14 us.  Balanced by pull, body -> 2 x 33 / (33/46.5
+   + 33/57.1) = 51.3 us (-6 us fp8, -4.5 us fp4); with the asymmetry removed,
+   46.5 (-10.6 us).
+2. **Fill 8.5 / 7.4 / 6.6 us instead of 3.5.**  Two parts.  (a) Start burst:
+   264 CTAs issue their first three K and V tiles within ~1 us (13.5 MB fp8,
+   7 MB fp4); copy latency `kl_iss -> kc_ready` for tiles 1 and 2 is 3.1 and
+   4.3 us (fp8) / 1.8 and 3.6 us (fp4) against 1.2-2.0 us in steady state —
+   the fill is bandwidth-bound while all CTAs start together (the old grid's
+   later waves started staggered).  (b) Prologue start -> `kl_start(0)`: 4.3
+   us fp8, 5.4 fp4, 4.1 a16 for three dependent round trips (scan `seqLen`
+   load, chunk-0 page-table pair) plus the two `div_u64` calls (~0.15 us);
+   the baseline's CTA 0 reached `kl_start(0)` at 2.1 us with the same round
+   trip count.  Needs prologue stamps (scan done, chunk 0 filled, first copy
+   issued) before any change.
+3. **End spread** (max excluding outliers - median) ~7 us fp8 / fp4 is item 1
+   seen from the other side (slow CTAs end at ~71, fast at ~60).
+
+Tail = last tile -> end 2.6-3.0 us median (design ~3: one atomic + merge).
+Co-tenant time-slice outliers: 1-8 CTAs per launch with tail 25-280 us
+(fp8 all launches, fp4 all, a16 launch 0 only); they are the co-tenant
+preempting the kernel's tail and do not appear in the locked bench (spread
+0.3-1.2 us over 25 samples); histogram statistics above exclude the top 8.
+
+**Verdict vs the design's accept / reject** (section 6 / 8.10): fp4 and mixed
+pass the -12 % gate (-14.4 %, -19.0 %), a16 at parity (-3.7 %), fp8 misses it by
+0.1 us (-11.8 %, gate 67.7, measured 67.7 / 67.8 / 68.0).  The premise
+"unchanged periods" holds for the traced CTAs (fast members) and fails for the
+slow member of every SM pair, which sets the wall; the design's spread
+fallback (dynamic tile-range pull) is triggered.  None of the three targets
+is met (fp8 67.8 vs 58, fp4 60.5 vs 36, mixed 64.4 vs 62).  Kept: the change
+is correct (60/60), structurally as designed (build facts above), and -9 to
+-15 us on the compressed modes.  Next levers in order of measured size: pair
+asymmetry (-6 to -10.6 us fp8), fill (-4 to -5 us), item boundary (-0.8 us
+per CTA).

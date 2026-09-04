@@ -980,3 +980,51 @@ this phase (review by reading first): `ptxas -v` (no C7507, 0 stack / spill,
 IO group at 40 with the cursor), `USETMAXREG` = 2, `LDL`/`STL` = 0, the
 60-case matrix, the locked bench, the same-launch trace with TILE0 = 0 / 11 /
 27 and the per-CTA histogram.
+
+## 10. Confirmation results (2026-09-04, nkcut2 H200, worktree r2p8 @ 9ce501fe)
+
+Full numbers, tables and the attribution experiments are in
+`mixed_kv_page_transport_backends.md`, section "Round 2, lever [8] —
+persistent balanced CTA scheduling: confirmation".  Summary against sections
+4-8 of this document:
+
+- **Build checks (section 6 items 1-3)**: all met on the four modules — no
+  C7507, 0 stack / spill, `USETMAXREG` = 2, `LDL` = `STL` = 0, one `ATOMG.INC`,
+  no `ATOMS`, HGMMA 8 + 8, `UTMALDG` 8 (a16, mixed) / 0 (fp8, fp4), gemm0 /
+  gemm1 barrier sites unchanged per role (gemm0 PHASECHK 8 / ARRIVE 11 /
+  BAR.SYNC 1, gemm1 17 / 13 / 1; the +1 gemm0 arrive is the per-item
+  `qBar.consumed`), 5 accepted `div_u64` call sites (68 straight-line SASS
+  each).  `sizeof(SharedMem)` 113 664 B (8.9 predicted 113 664), 2 CTAs/SM by
+  registers and by shared memory.  Section 4 fallbacks (smem cursor, IO at 48)
+  unused.
+- **Conformance**: 60 / 60 (the T < P cases exercise the review fix).
+- **Timing** (medians, 5 x 5 locked): a16 78.8 (81.8), fp8 67.8 (76.9), fp4
+  60.5 (70.7), mixed 64.4 (79.5); q=4 rows unchanged.  Gate (-12 %): fp4 and
+  mixed pass, a16 parity, **fp8 misses by 0.1 us** (-11.8 %).  Targets not met.
+- **Trace, periods (8.10)**: on the traced CTAs (0 and 1) every role period is
+  at or below the baseline (fp8 1.2-1.35 us, fp4 1.2-1.25, tiles 3-7 / 11-18 /
+  27-32); `kc_ready(16)`, `kc_ready(32)` at steady state (lead 4 holds, no
+  fallback to 6-8); item boundary without first-K latency but +0.4 us on
+  gemm0's K-wait -> mma segment on the item's first tile.
+- **Trace, histogram (section 6)**: start spread 0.3 us (i); body 33 x T holds
+  only for half the CTAs — **every SM has one CTA at 46.5 us and one at 57.1
+  us (fp8; fp4 44.7 / 53.8) for identical work**, independent of the tile range
+  (`MIXED_KV_TRACE_REVERSE_RANGES`) and of the SM (`smid`); a16 is unaffected.
+  (ii) therefore fails for the slow member, (iii) end spread ~7 us > 5 us, (iv)
+  `sm__cycles_active.avg/.max` 0.95-0.96 holds.  The section-2.1 fallback
+  condition (per-CTA spread > 5 us -> dynamic tile-range pull) is triggered.
+- **Fill**: 8.5 / 7.4 / 6.6 us (fp8 / fp4 / a16) against the 3.5 us assumed in
+  section 5: a start burst (the first three tiles of all 264 CTAs, copy
+  latency 3-4 us for tiles 1-2) plus a 4.3-5.4 us prologue to `kl_start(0)`
+  (three dependent round trips; baseline CTA 0 needed 2.1 us for the same
+  count) — to be stamped before any change.
+- **Tail**: 2.6-3.0 us as modelled.  Co-tenant time-slice outliers (25-280 us
+  on 1-8 CTAs per launch) are excluded from the histogram statistics and do not
+  appear in the bench.
+
+Wall model as measured (fp8): 8.5 fill + 57.1 slow-member body + 2.8 tail =
+68.4 (bench 67.8).  Verdict: correct and structurally as designed; -9 to -15 us
+on the compressed modes; accept gate met on fp4 / mixed / a16, missed by 0.1 us
+on fp8; the lever's "unchanged periods" premise is broken by the co-resident
+CTA pair asymmetry, which is the next item (dynamic pull: -6 us fp8 / -4.5 fp4;
+removing the asymmetry: -10.6 / -9), followed by the fill (-4 to -5 us).
