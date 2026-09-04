@@ -199,18 +199,18 @@ struct mixed_variant_static_format<Variant, std::void_t<decltype(Variant::kMixed
     : std::integral_constant<int, Variant::kMixedStaticFormat> {};
 
 // Same traits with the mixed-page shared storage.  The producer issues cp.async
-// copies itself, so USE_TMA_LOAD_KV is false (PipelineAsync).
+// copies itself, so USE_TMA_LOAD_KV is false (PipelineAsync, 128 producer
+// threads: one producer warp group for every module - [24b]'s second warp group
+// was measured and rejected, docs/mixed_kv_speed_round3_fa3_f25.md 2D / 7.4).
 //
-// [24b] Producer warp groups.  The compressed (E4M3, E2M1) and dynamic modules
-// run TWO producer warp groups (16 warps, 512 threads): thread t = 128 h + u
-// applies the [23] ownership formulas to u on the tile pages i = h + 2 j.  The
-// static-A16 module has no expansion and keeps ONE producer warp group (12
-// warps): its SASS is the transport control and stays byte-identical.
-// Register pool (C3): __launch_bounds__(NUM_THREADS, 1) gives 65536 / 512 = 128
-// registers per thread at launch; setmaxnreg then moves them so that
-// NUM_PRODUCER_THREADS x PRODUCER_REGS + NUM_MMA_THREADS x CONSUMER_REGS <= 65536:
-// 256 x 72 + 256 x 184 = 65536 exactly (12 warps: 128 x 72 + 256 x 216 = 64512).
-// The consumer's fit at 184 is proven by ptxas -v (no C7507, STACK 0), not here.
+// Register split (C3, [25]).  __launch_bounds__(384, 1) gives the CTA 65536 /
+// 384 = 168 registers per thread = 64512 in total; setmaxnreg moves them so
+// that 128 x PRODUCER_REGS + 256 x CONSUMER_REGS <= 64512 (P + 2 C <= 504).
+// The a16 module keeps the stock 72 / 216 (its SASS is the transport control
+// and stays byte-identical); the compressed (E4M3, E2M1) and dynamic modules
+// take 136 / 184 = 64512 exactly (whole-operand decode in flight per producer
+// warp; the consumer's fit at 184 is proven by ptxas -v: no C7507, STACK 0).
+// 128 / 192 = 65536 is NOT admissible: the CTA never holds those registers.
 template <int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
           typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
@@ -222,17 +222,15 @@ struct MixedAttentionKernelTraits
       AttentionKernelTraits<false, HEAD_DIM_QK_, HEAD_DIM_VO_, CTA_Q_, CTA_KV_, NUM_STAGES_,
                             DTypeQ_, DTypeKV_, DTypeO_, IdType_, AttentionVariant_>;
   static constexpr int kMixedStaticFormat = mixed_variant_static_format<AttentionVariant_>::value;
-  static constexpr int NUM_PRODUCER_WGS = kMixedStaticFormat == 0 ? 1 : 2;
-  static constexpr int NUM_WARPS = ((CTA_Q_ / 64) + NUM_PRODUCER_WGS) * 4;
-  static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
-  static constexpr int NUM_PRODUCER_THREADS = NUM_PRODUCER_WGS * cutlass::NumThreadsPerWarpGroup;
-  static constexpr int PRODUCER_REGS = 72;
-  static constexpr int CONSUMER_REGS = NUM_PRODUCER_WGS == 2 ? 184 : 216;
-  static_assert(NUM_PRODUCER_WGS == 1 || NUM_PRODUCER_WGS == 2, "one or two producer warp groups");
+  static constexpr int PRODUCER_REGS = kMixedStaticFormat == 0 ? 72 : 136;
+  static constexpr int CONSUMER_REGS = kMixedStaticFormat == 0 ? 216 : 184;
+  static_assert(BaseTraits::NUM_WARPS == 12, "one producer warp group + two consumer warp groups");
   static_assert(PRODUCER_REGS % 8 == 0 && CONSUMER_REGS % 8 == 0, "setmaxnreg takes multiples of 8");
-  static_assert(NUM_PRODUCER_THREADS * PRODUCER_REGS + BaseTraits::NUM_MMA_THREADS * CONSUMER_REGS <=
-                    65536,
-                "register pool: producer + consumer allocations must fit the SM (C3)");
+  static_assert(BaseTraits::NUM_PRODUCER_THREADS * PRODUCER_REGS +
+                        BaseTraits::NUM_MMA_THREADS * CONSUMER_REGS <=
+                    (65536 / BaseTraits::NUM_THREADS) * BaseTraits::NUM_THREADS,
+                "register pool: the setmaxnreg split must fit what __launch_bounds__ gives the CTA "
+                "(384 x 168 = 64512), not the SM's 65536 (C3)");
   using SharedStorage =
       SharedStorageQKVOMixed<typename BaseTraits::MainloopPipeline, DTypeQ_, DTypeKV_, DTypeO_,
                              IdType_, CTA_KV_, NUM_STAGES_, typename BaseTraits::SmemLayoutQ,

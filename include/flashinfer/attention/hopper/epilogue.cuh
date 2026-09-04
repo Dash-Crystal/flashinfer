@@ -74,12 +74,7 @@ struct CollectiveEpilogue {
   static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
 
-  // Producer (copy) threads: one warp group unless the traits declare more
-  // ([24b] mixed compressed modules: two), so that NUM_MMA_THREADS - the arrival
-  // count of kValueEmpty and the EpilogueBarrier and the O store partition -
-  // stays the consumers' count for a 16-warp CTA.
-  static constexpr int NUM_COPY_THREADS =
-      producer_warp_groups_v<Ktraits> * cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
   static constexpr int NUM_MMA_THREADS = NUM_THREADS - NUM_COPY_THREADS;
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<

@@ -60,11 +60,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using AttentionVariant = typename Ktraits::AttentionVariant;
 
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
-  // Producer warp groups: 1 (stock, mixed a16 module) or 2 ([24b] mixed
-  // compressed / dynamic modules).  Role test, PipelineAsync producer arrival
-  // count, consumer thread index and the register split all derive from it.
-  static constexpr int NUM_PRODUCER_WGS = producer_warp_groups_v<Ktraits>;
-  static constexpr int NUM_COPY_THREADS = NUM_PRODUCER_WGS * cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
@@ -91,11 +87,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   PipelineParams pipeline_params;
   int warp_group_idx = cutlass::canonical_warp_group_idx();
-  // (the `== 0` form is kept textually for one producer warp group)
-  bool const is_producer_wg = NUM_PRODUCER_WGS == 1 ? warp_group_idx == 0
-                                                    : warp_group_idx < NUM_PRODUCER_WGS;
-  pipeline_params.role = is_producer_wg ? MainloopPipeline::ThreadCategory::Producer
-                                        : MainloopPipeline::ThreadCategory::Consumer;
+  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
+                                             : MainloopPipeline::ThreadCategory::Consumer;
   if constexpr (use_tma_load_kv) {
     pipeline_params.is_leader = warp_group_thread_idx == 0;
     pipeline_params.num_consumers = NUM_MMA_THREADS;
@@ -157,11 +150,13 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
   }
 
-  // The mixed-page producer (sparse_mixed_mainloop.cuh) uses the stock 72/216
-  // register split of the gather producer (P0.7: the producer fits 72 with STACK 0)
-  // in its 12-warp module, and the traits' 72/184 split in the 16-warp modules
-  // ([24b]: 256 x 72 + 256 x 184 = 65536; kernel_traits.cuh checks the pool).
-  if (is_producer_wg) {  // Producer
+  // Register split.  Stock traits: the gather producer's 72/216 (P0.7: the
+  // producer fits 72 with STACK 0).  Mixed-page traits (kMixedTraits, the only
+  // shared-file hook the mixed producer needs): PRODUCER_REGS / CONSUMER_REGS
+  // from kernel_traits.cuh - 72/216 for the a16 module (byte-identical SASS),
+  // 136/184 for the compressed and dynamic modules ([25]: 128 x 136 + 256 x 184
+  // = 64512 = 384 x 168, the pool the CTA owns; the traits assert it).
+  if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else if constexpr (Ktraits::kMixedTraits) {

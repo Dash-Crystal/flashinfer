@@ -1015,3 +1015,52 @@ budget (3.5).  The mixed module's re-derived count (~790) puts its centre at
 
 ## 11. As written (filled per step; F25a-d in this worktree, F25e not run)
 
+### As written: F25a (layout, registers, shared-file revert)
+
+Files: `include/flashinfer/attention/hopper/{kernel_traits,prefill_sm90,
+named_barrier,epilogue,sparse_mainloop,sparse_mixed_mainloop}.cuh`.  Not built
+or run in this worktree (review by reading; the remote gates are F25e's).
+
+**Shared files (3.2, C4).**  `named_barrier.cuh`, `epilogue.cuh`,
+`sparse_mainloop.cuh`: `git checkout 5cc416fd --` (byte-identical to the [23]
+text; `producer_warp_groups_v`, `kFirstConsumerWG` and the relaxed
+`static_assert` are gone).  `prefill_sm90.cuh`: `NUM_COPY_THREADS =
+cutlass::NumThreadsPerWarpGroup`, `pipeline_params.role` by `warp_group_idx ==
+0` and `if (warp_group_idx == 0)` are the `5cc416fd` text again; the only
+remaining difference against `5cc416fd` is the register hook (`else if
+constexpr (Ktraits::kMixedTraits) warpgroup_reg_dealloc<Ktraits::PRODUCER_REGS>()
+/ warpgroup_reg_alloc<Ktraits::CONSUMER_REGS>()`) plus its comment - 10 lines,
+discarded at compile time for stock traits (`kMixedTraits = false` in
+`AttentionKernelTraits`, unchanged).  `kernel_traits.cuh`
+(`MixedAttentionKernelTraits`, mixed-only): `NUM_PRODUCER_WGS` and the
+`NUM_WARPS` / `NUM_THREADS` / `NUM_PRODUCER_THREADS` overrides removed (the base
+traits' 12 warps / 128 producer threads apply); `PRODUCER_REGS =
+kMixedStaticFormat == 0 ? 72 : 136`, `CONSUMER_REGS = kMixedStaticFormat == 0 ?
+216 : 184`; `static_assert(BaseTraits::NUM_WARPS == 12)`; the pool assert is
+against `(65536 / NUM_THREADS) * NUM_THREADS = 64512`, which is what
+`__launch_bounds__(384, 1)` gives the CTA (128 x 136 + 256 x 184 = 64512
+passes; 128 x 128 + 256 x 192 = 65536 would fail to compile).  The
+`MixedTileMeta` mask comment stays (the masks stay, 3.5).
+
+**`sparse_mixed_mainloop.cuh` (one warp group).**  `NUM_COPY_THREADS =
+cutlass::NumThreadsPerWarpGroup`, `PAGES_PER_THREAD = PAGES_PER_TILE` (6),
+`PAGE_STEP_BYTES` / `SCALE_PAGE_STEP_BYTES` removed (page `j` is at `j *
+PAGE_REGION_BYTES` / `j * SCALE_PAGE_BYTES`, immediates), `own_u` / `own_h` /
+`parity_mask` / `page_tok0` removed (`u = t`, `h = 0` everywhere:
+`make_bases` has no parity offsets, `static_page(j)`, `TileRegs::page(j)`),
+the chunk-table gather and the Q issue are the [23] text again (all 128
+threads gather; `warp_idx_in_warpgroup == 0` issues Q).  The dynamic arms
+keep F24c's shape with the parity restriction removed (`ma = 0x3F & ~(m8 |
+m4)`, `page_of(i)` selects `pg[i]`): F25d replaces them.
+`static_assert(NUM_STAGES <= 4)` is staged for the 32-bit pending word (F25c).
+Bodies, copies, pending records and finish protocol are F24's, now running six
+pages per thread at 136 registers - this intermediate state is bit-exact by
+construction (the same code that ran three pages per thread per warp group).
+
+**Expected artifacts.**  a16 module and stock paged kernel byte-identical to
+`5cc416fd`: the a16 module's `load()` text after constant folding is the [23]
+text (no `own_u`, no gather predicate, no Q-issuer select), its `USETMAXREG`
+immediates are `0x48 / 0xD8` from `PRODUCER_REGS / CONSUMER_REGS = 72 / 216`;
+fp8 / fp4 / dynamic `USETMAXREG 0x88 / 0xB8`, `ptxas -v` no C7507, `STACK 0`
+(fp8, fp4; the dynamic module's F24 32 B frame may persist until F25d).
+`BAR.SYNC` counts back to [23]'s: `kProducerWG` 128, `kQueryEmpty` 384.
