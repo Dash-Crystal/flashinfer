@@ -82,6 +82,34 @@ def main() -> int:
             for q_len in (1, 64):
                 cases.append((q_len, "NHD", mode))
                 failures += _run_dynamic_uniform(mode, q_len)
+        # [26] the dynamic module's per-slot predicated exact form on whole
+        # operands: six pages of one format per tile with the extremes payload /
+        # scale set, at a global scale that fails the fold for some blocks and
+        # passes it for others (fp8, g = 1: the 448 / 256 blocks exceed 255.5,
+        # the {1, 2^-6, 2^-7, 2^-9} blocks fold; fp4, g = 0.5: 448 x 0.5 = 224
+        # exceeds 3.99, 1 x 0.5 folds), so the per-operand vote fails in some
+        # warps and passes in others while every slot of the tile runs the same
+        # format's body (C9 / C16 term for term through the predicated form).
+        for mode, gs in (("fp8", 1.0), ("fp4", 0.5)):
+            cases.append((1, "NHD", mode))
+            failures += _run_dynamic_uniform(mode, 1, extremes_gs=gs)
+        # [26] multi-chunk items, stated in tiles (CTA_KV = 96 tokens, a chunk is
+        # 16 tiles, the chunk table a 32-row ring).  Every case above has
+        # pages_per_req <= 18 = at most 3 tiles per item, i.e. rows 0..2 of
+        # buffer 0: buffer 1, the ring wrap, the j == 0 gather, the j == 8 store +
+        # group barrier and the next-chunk countdown were never bit-checked.
+        #  * 193 pages, kv_len 3085 -> 33 tiles (entries 0..32): chunk 0 = rows
+        #    0..15, chunk 1 = rows 16..31 (buffer 1), chunk 2 = entry 32 -> row 0
+        #    (the wrap; the pair with V at entry 31 reads its K row at row 0);
+        #    two gathers (entries 0, 16), two stores (8, 24), countdown 0 at 32.
+        #  * 130 pages, kv_len 2075 -> 22 tiles (entries 0..21): buffer 1 without
+        #    a wrap, one gather / store, countdown 0 at entry 16.
+        # Run on the F25 kernel first (the tests' own baseline), then per step.
+        for pages_per_req, kv_len, tiles in ((193, 193 * 16 - 3, 33), (130, 130 * 16 - 5, 22)):
+            for mode in ("fp8", "fp4", "mixed"):
+                for q_len in (1, 64):
+                    cases.append((q_len, "NHD", mode))
+                    failures += _run_multi_chunk(mode, q_len, pages_per_req, kv_len, tiles)
         # [23] decode corner cases: E4M3 subnormal payload values (and -0), the
         # maximal block scale 448 and subnormal block scales, FP8 and FP4 pages.
         # [24a] the same payloads under three FP8 global scales (C9): g = 1 (the
@@ -268,18 +296,24 @@ def _run_parity_tail(mode: str, q_len: int, extremes: bool = False, nan_tail: bo
         return 1
 
 
-def _run_dynamic_uniform(mode: str, q_len: int) -> int:
+def _run_dynamic_uniform(mode: str, q_len: int, extremes_gs=None) -> int:
     """A pure fp8 / fp4 transport run through the DYNAMIC module (static_format
-    None): 6 pages of one format per tile, the other format's mask 0."""
+    None): 6 pages of one format per tile, the other format's mask 0.
+    ``extremes_gs``: use the extremes payload / block-scale set with that global
+    scale ([26]: the per-slot predicated exact form on whole operands)."""
     import torch
     from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    name = f"[dynamic-uniform-{mode}-{q_len}]"
+    tag = "" if extremes_gs is None else f"-extremes-g{extremes_gs:.3g}"
+    name = f"[dynamic-uniform-{mode}-{q_len}{tag}]"
     try:
         dev, dtype = torch.device("cuda"), torch.bfloat16
         B, H, D, P, pages_per_req = 2, 2, 128, 16, 18
         shape = (B * pages_per_req, P, H, D)
-        ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+        if extremes_gs is None:
+            ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+        else:
+            ck, cv, rk, rv, t = _extreme_transport(shape, dtype, dev, mode, extremes_gs)
         kv_len = pages_per_req * P - 3
         qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)
         kv_indptr = torch.arange(0, (B + 1) * pages_per_req, pages_per_req, dtype=torch.int32, device=dev)
@@ -299,6 +333,53 @@ def _run_dynamic_uniform(mode: str, q_len: int) -> int:
         a16 = t._replace(page_format=torch.zeros_like(t.page_format))
         ref = w_ref.run(q, (rk, rv), *mixed_page_prefill_run_args(a16, D ** -0.5, 0, "NHD"))
         out = w.run(q, (ck, cv), *mixed_page_prefill_run_args(t, D ** -0.5, None, "NHD"))
+        torch.cuda.synchronize()
+        assert not torch.isnan(ref).any(), "reference has NaN"
+        assert torch.equal(out, ref), "not bit-exact"
+        print(f"PASS {name}", flush=True)
+        return 0
+    except BaseException:  # noqa: BLE001
+        print(f"FAIL {name}", flush=True)
+        traceback.print_exc()
+        return 1
+
+
+def _run_multi_chunk(mode: str, q_len: int, pages_per_req: int, kv_len: int, tiles: int) -> int:
+    """One item of ``tiles`` KV tiles (CTA_KV = 96): pages_per_req pages, kv_len
+    tokens with a partial tail page.  33 tiles cross both chunk-table buffers and
+    wrap the 32-row ring (entry 32 -> row 0); 22 tiles use buffer 1 without a
+    wrap.  Compressed (static fp8 / fp4 or dynamic mixed) against the a16
+    module's expansion of the same stream, bit-exact."""
+    import torch
+    from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+    name = f"[multi-chunk-{mode}-{q_len}-t{tiles}]"
+    try:
+        dev, dtype = torch.device("cuda"), torch.bfloat16
+        B, H, D, P = 2, 2, 128, 16
+        assert (kv_len + 95) // 96 == tiles, "case is stated in tiles"
+        assert (pages_per_req - 1) * P < kv_len <= pages_per_req * P, "partial tail page"
+        shape = (B * pages_per_req, P, H, D)
+        ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+        qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+        kv_indptr = torch.arange(0, (B + 1) * pages_per_req, pages_per_req, dtype=torch.int32, device=dev)
+        kv_indices = torch.arange(B * pages_per_req, dtype=torch.int32, device=dev)
+        last = torch.full((B,), kv_len - (pages_per_req - 1) * P, dtype=torch.int32, device=dev)
+        q = torch.randn(B * q_len, H * 4, D, dtype=dtype, device=dev)
+        ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
+        static = {"fp8": 1, "fp4": 2}.get(mode)
+        w_ref = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=0))
+        w = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=static))
+        for x in (w_ref, w):
+            x.plan(qo_indptr, kv_indptr, kv_indices, last, H * 4, H, D, P, causal=q_len > 1,
+                   q_data_type=dtype, kv_data_type=dtype)
+        a16 = t._replace(page_format=torch.zeros_like(t.page_format))
+        ref = w_ref.run(q, (rk, rv), *mixed_page_prefill_run_args(a16, D ** -0.5, 0, "NHD"))
+        out = w.run(q, (ck, cv), *mixed_page_prefill_run_args(t, D ** -0.5, static, "NHD"))
         torch.cuda.synchronize()
         assert not torch.isnan(ref).any(), "reference has NaN"
         assert torch.equal(out, ref), "not bit-exact"
