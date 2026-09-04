@@ -106,6 +106,9 @@ constexpr uint32_t nbIOThrds = warp_size * nbIOWarps;
 #ifndef MIXED_KV_TRACE
 #define MIXED_KV_TRACE 0
 #endif
+#ifndef MIXED_KV_TRACE_TILES
+#define MIXED_KV_TRACE_TILES 8
+#endif
 // Stage depths in whole 64-token tiles; two of each keeps two CTAs per SM.
 #ifndef MIXED_KV_KDEPTH
 #define MIXED_KV_KDEPTH 3
@@ -350,7 +353,10 @@ struct alignas(128) SharedMem {
   alignas(16) TileScales kScales[nbScaleTiles];
   alignas(16) TileScales vScales[nbScaleTiles];
 #if MIXED_KV_TRACE
-  static constexpr uint32_t nbTraceTiles = 8;
+  // Number of leading tiles of CTA 0 whose per-role stamps are recorded
+  // (-DMIXED_KV_TRACE_TILES=n; 13 covers a whole sub-sequence at the bench's
+  // default split, +128 B of shared memory per extra tile).
+  static constexpr uint32_t nbTraceTiles = MIXED_KV_TRACE_TILES;
   long long trace[nbTraceTiles][16];
   // SM residency probe: this CTA's %smid and the number of CTAs of this kernel
   // resident on that SM when tile 4's slot 0 stamp is taken (includes self).
