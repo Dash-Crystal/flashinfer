@@ -45,6 +45,13 @@ def main() -> int:
         for mode in ("fp8", "mixed"):
             cases.append((1, "NHD", mode))
             failures += _run_many_items(mode)
+        # [24b] page-parity ownership meets the src-size-0 tail on an odd page:
+        # kv_len = 96 + 3 x 16 + 5 = 149 -> the last tile has three full pages
+        # (0, 1, 2) and a 5-token page 3, owned by the odd-parity warp group.
+        for mode in ("fp8", "fp4", "mixed"):
+            for q_len in (1, 64):
+                cases.append((q_len, "NHD", mode))
+                failures += _run_parity_tail(mode, q_len)
         # [23] decode corner cases: E4M3 subnormal payload values (and -0), the
         # maximal block scale 448 and subnormal block scales, FP8 and FP4 pages.
         # [24a] the same payloads under three FP8 global scales (C9): g = 1 (the
@@ -127,6 +134,49 @@ def _run_extremes(mode: str, q_len: int, gs: float = 1.0) -> int:
         q = torch.randn(B * q_len, H * 4, D, dtype=dtype, device=dev)
         ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
         static = {"fp8": 1}.get(mode)
+        w_ref = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=0))
+        w = BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", backend="fa3",
+            jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=static))
+        for x in (w_ref, w):
+            x.plan(qo_indptr, kv_indptr, kv_indices, last, H * 4, H, D, P, causal=q_len > 1,
+                   q_data_type=dtype, kv_data_type=dtype)
+        a16 = t._replace(page_format=torch.zeros_like(t.page_format))
+        ref = w_ref.run(q, (rk, rv), *mixed_page_prefill_run_args(a16, D ** -0.5, 0, "NHD"))
+        out = w.run(q, (ck, cv), *mixed_page_prefill_run_args(t, D ** -0.5, static, "NHD"))
+        torch.cuda.synchronize()
+        assert not torch.isnan(ref).any(), "reference has NaN"
+        assert torch.equal(out, ref), "not bit-exact"
+        print(f"PASS {name}", flush=True)
+        return 0
+    except BaseException:  # noqa: BLE001
+        print(f"FAIL {name}", flush=True)
+        traceback.print_exc()
+        return 1
+
+
+def _run_parity_tail(mode: str, q_len: int) -> int:
+    """kv_len 149 = one full tile + 3 full pages + 5 tokens of page 3 (odd parity)."""
+    import torch
+    from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+    name = f"[parity-tail-{mode}-{q_len}]"
+    try:
+        dev, dtype = torch.device("cuda"), torch.bfloat16
+        B, H, D, P, pages_per_req = 3, 2, 128, 16, 10
+        shape = (B * pages_per_req, P, H, D)
+        ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
+        kv_len = 96 + 3 * P + 5
+        assert kv_len <= pages_per_req * P
+        qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+        kv_indptr = torch.arange(0, (B + 1) * pages_per_req, pages_per_req, dtype=torch.int32, device=dev)
+        kv_indices = torch.arange(B * pages_per_req, dtype=torch.int32, device=dev)
+        last = torch.full((B,), kv_len - (pages_per_req - 1) * P, dtype=torch.int32, device=dev)
+        q = torch.randn(B * q_len, H * 4, D, dtype=dtype, device=dev)
+        ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
+        static = {"fp8": 1, "fp4": 2}.get(mode)
         w_ref = BatchPrefillWithPagedKVCacheWrapper(
             ws, "NHD", backend="fa3",
             jit_args=mixed_page_prefill_jit_args(dtype, dtype, dtype, D, static_format=0))

@@ -782,3 +782,82 @@ bit-exact.
 
 **Deviation from revision 1.**  The E2M1 placement variant is not built (LUT
 kept); fp4 is unchanged by this commit.
+
+---
+
+## As written: F24b (second producer warp group + C11 reductions)
+
+Files: `include/flashinfer/attention/hopper/{kernel_traits,named_barrier,
+prefill_sm90,epilogue,sparse_mainloop,sparse_mixed_mainloop}.cuh`,
+`tests/attention/run_fa3_mixed_page_transport.py`.  `mainloop_mma.cuh`,
+`variants.cuh`, `mixed_page_prefill.py` untouched.  Not built or run here.
+
+**Traits and thread counts (data flow of the constants).**
+`MixedAttentionKernelTraits` reads `kMixedStaticFormat` from the variant
+(`mixed_variant_static_format`) and defines `NUM_PRODUCER_WGS` (1 for format 0,
+2 otherwise), `NUM_WARPS = (CTA_Q/64 + NUM_PRODUCER_WGS) * 4`, `NUM_THREADS`,
+`NUM_PRODUCER_THREADS = 128 * NUM_PRODUCER_WGS`, `PRODUCER_REGS = 72`,
+`CONSUMER_REGS = 184 | 216`, and static-asserts the pool.  `named_barrier.cuh`
+gains `producer_warp_groups_v<Ktraits>` (1 when the traits do not define
+`NUM_PRODUCER_WGS`: stock and quantization traits), which `prefill_sm90.cuh:63`
+(`NUM_COPY_THREADS`, hence `producer_arv_count` and the consumer thread index),
+`epilogue.cuh:77` (`NUM_COPY_THREADS`, hence `NUM_MMA_THREADS` = 256 for the
+barriers and the O store partition) and `WarpScheduler` (`kFirstConsumerWG`)
+consume.  `prefill_sm90.cuh` role test `is_producer_wg` (`wg == 0` textually
+for one WG), register split from `PRODUCER_REGS / CONSUMER_REGS` under
+`if constexpr (kMixedTraits)`.  Ping-pong ids: `get_warp_group_barrier_idx<F>`
+= `kWarpSchedulerWG1 + wg - F`, next WG `2F + 1 - wg`, `mma_init` test `> F`
+(F = 1 folds to the stock text).  `sparse_mainloop.cuh:90`'s static_assert
+(`NUM_PRODUCER_THREADS == 128`) is relaxed for mixed traits: the mixed mainloop
+derives from it for its Q TMA / layout types only.  (This file was not in
+revision 2's list; it was found because the assert is evaluated when the base
+class is instantiated.)
+
+**Mainloop.**  `NUM_COPY_THREADS = 128 * NUM_PRODUCER_WGS`, `OWNER_THREADS =
+128`, `PAGES_PER_THREAD = 6 / NUM_PRODUCER_WGS`, `PAGE_STEP_BYTES =
+NUM_PRODUCER_WGS * PAGE_REGION_BYTES`, `SCALE_PAGE_STEP_BYTES`; `own_u(t) = t &
+127`, `own_h(t) = t >> 7` (both fold for one WG); `TileRegs::page(h, j)` = SEL
+between `pages[2j]`, `pages[2j+1]`; `TileRegs::tag_of(h, j)` (dynamic module,
+F24b only) picks the word at compile time and the byte by `8 (base + h)`.
+`make_bases`: `page_off = h * PAGE_REGION_BYTES` folded into `out0 / out1 /
+land8 / land4 / a16_dst`, `sc_rd = sc_base + h * 512 + r * 8 + 4 (k >> 2)`,
+`out0 / out1` at chunks `2k + swap`, `2k + 1 - swap` with `swap = ((k >> 2) ^
+r) & 1` (`out_swap(u)`).  `expand_bases`: `l8a = land8 + so + 8 swap`, `l8b =
+l8a ^ 8`, `l4a / l4b` likewise (+4 / ^4).  `load_packed`: two `LDS.64` (FP8) /
+two `LDS.32` (FP4) in store order.  `copy_compressed_page`: payload copy by
+every lane; the row's 8 B scale copy (`cp8` / `cp8_zfill`) by `blk_blk(u) == 0`
+only, destination `sc_rd` (the leader's word offset is 0), source
+`compressed_src().scales` = the row's scale bytes (the `+ 4 (blk / 4)` is gone).
+`issue_tile_copies` / `expand_operand` iterate `j < PAGES_PER_THREAD` with
+immediates `j * PAGE_STEP_BYTES` / `j * SCALE_PAGE_STEP_BYTES`; the static
+expansion handles the odd count 3 (`if (j + 1 < N)` on constants); the dynamic
+expansion's tag is `(tv >> 8 (h + 2 j)) & 0xFF`.  `load()`: `gather_thread =
+NUM_PRODUCER_WGS == 1 || t < 128` guards `chunk_load` / `chunk_store` (the
+group barrier is met by all 256); `q_issuer = t < 32` for two WGs
+(`warp_idx_in_warpgroup == 0` textually for one); `__syncwarp()` after
+`cp_async_wait` in `finish_pending_pair` (the A8 ordering for the scale slot);
+host check: scale rows 8 B aligned.  Control flags `MIXED_FA3_CONTROL_SKIP_EXPAND`
+and `MIXED_FA3_CONTROL_RAW_STS` in `expand_block` (off by default).
+
+**Deviation from revision 2: the scale slot size is not shrunk.**
+`kMixedScaleStageBytes` stays `6 x 512` B per stage per operand and the rows
+use the first 128 B of each page slot (`SCALE_ROW_BYTES = 8`, `SCALE_PAGE_BYTES
+= 512`).  Shrinking it would move `mixed_meta` in the shared storage and change
+the chunk-table immediates of the a16 module, which must stay byte-identical;
+smem is therefore unchanged (~199.7 KB), not 13.5 KB smaller.  The
+wavefront arithmetic of 2C is unaffected (the LDS.32 of 32 lanes still reads
+32 contiguous bytes with 4-lane broadcast).
+
+**Tests.**  `_run_parity_tail(mode, q_len)`: `kv_len = 149` (`96 + 3 x 16 + 5`)
+for fp8, fp4, mixed at q 1 and 64 — the last tile's partial page 3 is owned by
+the odd-parity warp group; matrix 64 + 2 + 6 + 12 = 84.
+
+**Expected artifacts.**  fp8 / fp4 / dynamic modules: `USETMAXREG.DEALLOC
+0x48` + `TRY_ALLOC 0xB8`, `ptxas -v` without C7507, STACK 0; per thread per
+call `LDGSTS` 6 payload + 6 predicated scale, `STS.128` 12 (all `[R+imm]`),
+`LDS.64` 12 + `LDS.32` 6 + chunk table 4 `LDS.128`; one `UTMALDG` under the
+warp-0 predicate; `BAR.SYNC` counts 256 (kProducerWG) and 512 (kQueryEmpty);
+one `WARPSYNC`/`BAR.WARP.SYNC` more per call than [23]; a16 module byte-identical
+to `5cc416fd`; stock paged kernel byte-identical.  ncu: `STS.128` 4.0
+wavefronts, scale `LDGSTS` <= 4, `op_st` <= ~450, total <= ~2050 per call.
+Bench fp8 290-345, fp4 295-350 (section 3); trace `acq` >= 0.25 us.
