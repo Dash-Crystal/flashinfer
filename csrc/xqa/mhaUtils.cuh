@@ -214,17 +214,6 @@ __device__ inline uint32_t mixedPageTagLane(PageTransport const& transport,
   return value;
 }
 
-// [45d]: the same tag load from the lane-distributed page index (lane s holds page s, BAD past
-// the tile): no selectByIndex, one predicated LDG.E.U8 per lane, 0 (= kA16) for BAD lanes.
-__device__ inline uint32_t mixedPageTagOfLane(PageTransport const& transport,
-                                              KVCachePageIndex pageLane) {
-  uint32_t value = 0;
-  if (pageLane != kBAD_PAGE_INDEX) {
-    value = transport.page_format[pageLane];
-  }
-  return value;
-}
-
 // ... and broadcast it a tile later, when it is needed.
 template <uint32_t nbPages>
 __device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t laneValue) {
@@ -1389,10 +1378,6 @@ __device__ inline void expandMixedPartialHeadsInPlaceBF16Placement(
 //   to [scaleBase + 4 l + 128 i], src-size 4 if the row is valid else 0 (zero scale word ->
 //   the expansion's f = 0: vote-neutral, 0 x payload 0); A16 / bad pages issue nothing (their
 //   scale word is never read: A16 spans are skipped by the expansion) - no pointer select.
-//   [45c] / [45d] inputs: pageLane (lane s = page index of span s, BAD past the tile) -> the span's
-//   page is one SHFL.IDX (source lane = span; scale loop: source lane = the row's page), and
-//   formatWord (byte s = tag of span s; static modules ignore it) -> the span's format is a byte
-//   extract.  Nothing here is read from shared memory or from a uniform-register copy of a load.
 // Control flow: page loop (unrolled in static modules, rolled in the dynamic one) -> warp-uniform
 //   format branch (dynamic) -> two unrolled iterations; then the scale loop (1-2 iterations).
 //   No __syncwarp here: cp.async completion is the caller's wait_group + the expansion's barrier.
@@ -1408,12 +1393,13 @@ __device__ inline void cpAsyncCgShared16(uint32_t dstAddr, void const* src, uint
 }
 
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, bool isK,
-          uint32_t nbPages, uint32_t dstNbHeads, typename _LdGrain>
+          uint32_t dstNbHeads, uint32_t nbPages, typename _LdGrain>
 __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
-    uint8_t* dstScales, PageTransport const& transport, KVCachePageIndex pageLane,
-    uint32_t formatWord, uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
+    uint8_t* dstScales, PageTransport const& transport,
+    Vec<KVCachePageIndex, nbPages> const& pages, uint32_t formatWord, uint32_t headIdx,
+    uint32_t idxPart, uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
   // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
@@ -1511,9 +1497,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 
 #pragma unroll(pageLoopUnroll)
   for (uint32_t span = 0; span < nbSpans; ++span) {
-    // [45d]: the span's page index lives in lane span (getPageLaneUngated); one SHFL.IDX brings
-    // it to every lane as a vector value (no uniform-register parking, no R2UR at the load).
-    KVCachePageIndex const page = __shfl_sync(0xFFFFFFFFu, pageLane, span);
+    KVCachePageIndex const page = selectByIndex(pages, span);
 #if MIXED_PAGE_STATIC_FORMAT >= 0
     unused(formatWord);
     copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
@@ -1541,8 +1525,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     uint32_t const localHead = i * warp_size + lane;
     uint32_t const localPage = i * exactDiv(warp_size, tokensPerPage) + lane / tokensPerPage;
     static_assert(headIterations * exactDiv(warp_size, tokensPerPage) <= nbPages);
-    // [45d]: lane-dependent source lane (this lane's row is in page localPage).
-    KVCachePageIndex const page = __shfl_sync(0xFFFFFFFFu, pageLane, localPage);
+    KVCachePageIndex const page = selectByIndex(pages, localPage);
     bool const pageValid = page != kBAD_PAGE_INDEX;
     uint8_t const format =
 #if MIXED_PAGE_STATIC_FORMAT >= 0
@@ -1758,31 +1741,6 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPageUngated(
     ret[i] = (idxPage < nbPages ? loaded : kBAD_PAGE_INDEX);
   }
   return ret;
-}
-
-// [45d] (Track S step 7, sm90 SPEC_DEC compact build): lane-distributed page indices.  getPage
-// loads the same address in every lane; ptxas proves the value warp-uniform and, at 124-127
-// registers, parks it in a uniform register with an R2UR right after the LDG - the L2 round trip
-// is exposed at the load site whatever the distance to the copy (step-6 PC samples: 173 long_sb
-// on the fp8 module's R2URs, 312 on mixed).  Here lane s (s < nbLoadedPages) loads page
-// idxPageBeg + s: one predicated LDG per warp (one 16 B sector), one KVCachePageIndex per lane
-// (BAD for lanes past the tile and pages past nbPages), never uniform-provable, so it stays in a
-// vector register until the copy reads it with one SHFL.IDX per span.  Same [45f] predicate
-// split as getPageUngated.  Data flow: lane, idxPageBeg, maxNbPagesPerSeq, idxReq -> (predicated)
-// LDG -> loaded; nbPages -> SEL.  Control flow: predication only; convergent call.
-template <uint32_t nbLoadedPages>
-__device__ inline KVCachePageIndex getPageLaneUngated(KVCacheList<true> const& cacheList,
-                                                      uint32_t idxReq, uint32_t idxPageBeg,
-                                                      uint32_t nbPages) {
-  static_assert(nbLoadedPages <= warp_size);
-  auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
-  uint32_t const lane = laneId();
-  uint32_t const idxPage = idxPageBeg + lane;
-  KVCachePageIndex loaded = kBAD_PAGE_INDEX;
-  if (lane < nbLoadedPages && idxPage < maxNbPagesPerSeq) {
-    loaded = ldgNcPageIndex(&cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]);
-  }
-  return (idxPage < nbPages ? loaded : kBAD_PAGE_INDEX);
 }
 
 template <uint32_t nbWarps, uint32_t nbLoadedPages>
