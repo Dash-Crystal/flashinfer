@@ -1123,3 +1123,71 @@ per block and one `LDC`/`LDG` of the global scale; `BRA.DIV` 0, `UMOV` 0 in the
 bodies.  fp4 body: 12 `LDS.32` + 6 `LDS.32`, 26 integer ops per block
 (`SHL`, 4 x {`PRMT`, `SHL`, `LOP3`} x 2), `HMUL2` 8 hot / 16 cold, no `PRMT`
 LUT constants (`0xC0800000`, `0x3F3F3F00` gone from the bf16 module).
+
+### As written: F25c (copies and protocol: per-item bases, the peel, unconditional loop finish, 32-bit pending words)
+
+Files: `include/flashinfer/attention/hopper/sparse_mixed_mainloop.cuh`,
+`tests/attention/run_fa3_mixed_page_transport.py`.  Not built or run here.
+
+**Data flow (copies, C13).**  `OperandBases` gains `p8, s8, p4, s4` (64-bit:
+span pointer + `head * hs + row * ts + blk * BLOCK_BYTES`, computed once per
+work item by `compressed_base`) and `p8_ps, s8_ps, p4_ps, s4_ps` (32-bit page
+strides); `CompressedSrc` / `compressed_src` (per-tile recomputation) are
+gone.  `copy_compressed_page<FORMAT, FULL>(b, page, pp, stage, valid, t)`:
+`src = page_src(base, page, stride)` = `base + page * stride` (one
+`IMAD.WIDE.U32`) for the block and for the scale row; FULL: `cp16` (fp8) /
+`cp8` (fp4) + `@leader cp8`; partial: `cp16_zfill(land, src, v)` /
+`cp8_zfill` + `@leader cp8_zfill(sdst, ssrc, v)` with `v = tok0_j + row <
+valid` and the **unmodified** source (no `v ? src : base` select: the address
+is in bounds for every (page, row) and src-size 0 reads nothing).  All copy
+forms are the existing ones (16 B fp8 blocks, 8 B fp4 blocks, 8 B scale rows).
+`copy_a16_page` is untouched (a16 byte-identity).
+
+**Control flow (C13 / C14).**  `issue_operand<PARTIAL>`: `STATIC_A16` keeps the
+[23] runtime `valid == CTA_KV` test; the compressed and dynamic modules compile
+`issue_tile_copies<!PARTIAL>` only.  `produce_pair(kpart, vpart, tK, tV)` is a
+generic lambda over `FullTag` / `PartialTag` (`std::integral_constant<bool>`):
+`issue_operand<PARTIAL_K>` / `<PARTIAL_V>`, and `if constexpr (FINISH)
+finish_pending_pair()` with `FINISH = !(PARTIAL_K || PARTIAL_V)` - the two
+partial calls compile no finish.  Call sites: `produce_pair(PartialTag{},
+FullTag{}, kv_tile_idx, -1)` (K(last) alone) then `finish_one(K)` (C7);
+`pair_step(t, kpart, vpart)` carries the chunk-table gather / store / barrier
+and the prefetch and calls `produce_pair(kpart, vpart, t-1 | -1, t)`; the
+compressed modules run `pair_step(kv_tile_idx, FullTag{}, PartialTag{})`
+(peeled: V(last) partial, K(last-1) full) and then `for t = kv_tile_idx - 1 ..
+swa_begin: pair_step(t, FullTag{}, FullTag{})`; the a16 module runs `for t =
+kv_tile_idx ..` with the same body (its text after folding is the [23] loop);
+drain `finish_one(V)`.  `finish_pending_pair()`: `cp_async_wait<1>`,
+`expand_pending<true, DYNAMIC>(K)`, `(V)`, `fence_view_async_shared`,
+`commit_pending<DYNAMIC>(K)`, `(V)` - no pending test in the static modules
+(every pair it finishes is a (K, V) pair issued one iteration earlier), one
+warp-uniform `if (op.pending == 0) return` per operand in the dynamic module.
+`finish_one(op)`: `cp_async_wait<0>`, `expand_pending<false, DYNAMIC>` (the
+exact body, no vote), fence, `commit_pending<DYNAMIC>`.  Pending words:
+`TileRegs::pending_word(stage) = (w7 & 0x03FFFFFF) | stage << 30`
+(`Operand::pending / staged` are `uint32_t`; `pending_stage`, `pending_mask8 /
+4` read the fields; `static_assert(NUM_STAGES <= 4)` from F25a).
+
+**Why the loop finish is safe without a test (10.2).**  K(last) is finished by
+`finish_one(K)` before `barrier_O.wait`; the peeled pair issues (K(last-1),
+V(last)) and finishes nothing; loop iteration `t` finishes the pair issued at
+`t + 1` (or the peeled pair), whose `tK = t >= swa_begin` and `tV = t + 1` were
+both issued, so both pending words are nonzero in the static compressed
+modules (`kFlagFilled`).  A single-tile item (`kv_tile_idx == swa_begin`) has
+the peeled pair with `tK = -1`, zero loop iterations and `finish_one(V)` at
+the drain; K is never pending at the drain because the last pair always has
+`tK = -1`.
+
+**Tests.**  `_run_parity_tail(mode, q_len, nan_tail=True)`: shape gains one
+physical page, `kv_indices = arange(1, ...)` (page 0 unreferenced), page 0 and
+rows 5..15 of every request's last page are filled with `0xFF` payload bytes
+(E4M3 NaN), `0x7F` scale bytes (E4M3 NaN) for both formats and `0x7FC0` (bf16
+NaN) in the A16 reference rows; fp8 / fp4 / mixed x q 1, 64 = 6 cases.  Matrix:
+94 + 6 = 100.
+
+**Expected artifacts (6.1 copy / protocol rows).**  fp8 loop site: 24
+`IMAD.WIDE.U32`, 12 `LDGSTS.E.128` + 12 `@P LDGSTS.E.64`, no `ISETP` on
+`valid`, no `BSSY/BSYNC` around the finish, `LDGDEPBAR`, `DEPBAR.LE SB0, 0x1`,
+one `FENCE.VIEW.ASYNC.S`, two `SYNCS.ARRIVE`; K(last) site and drain site:
+`DEPBAR.LE SB0, 0x0`, one operand's exact body (6 x 51), one `SYNCS.ARRIVE`;
+`VOTE.ALL` 2 in the region; `IADD3.X` / `VIADD` <= 4 in the loop.

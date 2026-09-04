@@ -58,7 +58,13 @@
  * are format-outer and page-rolled over the masks - one body per format, the
  * page index read from the table by LDS.32, no per-page format branch.
  *
- * K(t-1) and V(t) are issued as a pair.  The consumer (mma_f16) is unchanged.
+ * K(t-1) and V(t) are issued as a pair ([25], C13 / C14): K(last) alone first
+ * (finished before barrier_O, C7), then the peeled first pair (K(last-1),
+ * V(last)) - the only two calls that compile the partial-tile copy arm, since
+ * only tile kv_tile_idx can have valid < CTA_KV - then the loop over full pairs,
+ * whose finish is unconditional in the static modules (every pair it finishes
+ * is a (K, V) pair issued one iteration earlier), and the drain (V alone).  The
+ * consumer (mma_f16) is unchanged.
  */
 #ifndef FLASHINFER_ATTENTION_HOPPER_SPARSE_MIXED_MAINLOOP_CUH_
 #define FLASHINFER_ATTENTION_HOPPER_SPARSE_MIXED_MAINLOOP_CUH_
@@ -684,16 +690,18 @@ struct SparseMixedCollectiveMainloop {
     CUTLASS_DEVICE uint32_t mask4() const { return (w7 >> 8) & 0x3Fu; }
     CUTLASS_DEVICE uint32_t valid() const { return (w7 >> 16) & 0xFFu; }
     CUTLASS_DEVICE bool any_compressed() const { return (w7 >> 24) & kFlagCompressed; }
-    // Pending record: w7 (masks / tags, valid, flags), w6 and the stage index in
-    // one word; nonzero whenever the row is filled.
-    CUTLASS_DEVICE uint64_t pending_word(uint32_t stage) const {
-      return (uint64_t(w7) << 32 | uint64_t(w6)) | (uint64_t(stage) << 60);
+    // Pending record ([25] C14): one 32-bit word = w7's bits 0..25 (dynamic:
+    // masks; static: tags 4, 5; both: valid at 16..23, flag bits 0-1 at 24, 25)
+    // | stage << 30.  Nonzero whenever the row is filled (kFlagFilled = bit 25);
+    // the flags byte's bits 6-7 are masked off so the stage cannot alias them.
+    CUTLASS_DEVICE uint32_t pending_word(uint32_t stage) const {
+      return (w7 & 0x03FFFFFFu) | (stage << 30);
     }
   };
-  static_assert(NUM_STAGES <= 16, "stage index lives in bits 60..63 of the pending word");
-  // Masks of a pending word (dynamic module).
-  CUTLASS_DEVICE static uint32_t pending_mask8(uint64_t tv) { return uint32_t(tv >> 32) & 0x3Fu; }
-  CUTLASS_DEVICE static uint32_t pending_mask4(uint64_t tv) { return uint32_t(tv >> 40) & 0x3Fu; }
+  // Fields of a pending word.
+  CUTLASS_DEVICE static uint32_t pending_stage(uint32_t tv) { return tv >> 30; }
+  CUTLASS_DEVICE static uint32_t pending_mask8(uint32_t tv) { return tv & 0x3Fu; }
+  CUTLASS_DEVICE static uint32_t pending_mask4(uint32_t tv) { return (tv >> 8) & 0x3Fu; }
 
   CUTLASS_DEVICE static TileRegs read_meta(TileMeta const (*meta)[CHUNK_TILES], int entry) {
     TileMeta const& e = meta[(entry / CHUNK_TILES) & 1][entry % CHUNK_TILES];
@@ -758,8 +766,14 @@ struct SparseMixedCollectiveMainloop {
     uint32_t out1;            // chunk 2b + 1 - swap (second output)
     uint32_t land8;           // FP8 landing (cp.async dst, 16 B aligned): logical chunk 8+b of row r (D-block 1 line, see land_row_line)
     uint32_t land4;           // FP4 landing (cp.async dst, 8 B aligned): 8 B in chunk 8 + b/2 + 4*(r&1), half b&1
-    uint32_t sc_rd;           // smem address of this thread's 4 B scale word in the row's 8 B slot, page h, stage 0
-    float gs8, gs4;           // global scales of this operand (FP8 bf16: x 2^120 or the +inf sentinel, C9)
+    uint32_t sc_rd;           // smem address of this thread's 4 B scale word in the row's 8 B slot, stage 0
+    float gs8, gs4;           // global scales of this operand (bf16: x 2^120 / x 2^126 or the +inf sentinel, C9 / C16)
+    // [25] C13: per-item 64-bit source bases of the compressed formats (this
+    // thread's block of page 0: + head * hs + row * ts + blk * BLOCK_BYTES; its
+    // row's scale line: + head * shs + row * sts) and the 32-bit page strides
+    // (bytes).  A page's source is base + page * stride: one IMAD.WIDE.U32.
+    uint64_t p8, s8, p4, s4;
+    uint32_t p8_ps, s8_ps, p4_ps, s4_ps;
   };
   // Landing (land_row_line): a row's eight packed blocks land in the row's
   // D-block 1 line, FP8 block b at physical chunk b ^ (r&7) (logical chunk 8+b),
@@ -816,6 +830,12 @@ struct SparseMixedCollectiveMainloop {
     }
     if constexpr (HAS_FP8) {
       auto const& span = p.transport.formats[kTagFP8];
+      b.p8 = compressed_base(isK ? span.k_payload : span.v_payload, span.payload_stride, kv_head_idx,
+                             blk_row(u), blk_blk(u) * 16u);
+      b.s8 = compressed_base(isK ? span.k_scales : span.v_scales, span.scale_stride, kv_head_idx,
+                             blk_row(u), 0u);
+      b.p8_ps = span.payload_stride.page;
+      b.s8_ps = span.scale_stride.page;
       float const g = *(isK ? span.k_global_scale : span.v_global_scale);
       if constexpr (mixed_detail::kFp8FoldsPow2<DTypeKV>) {
         // [24a] C9: the placed decode is x * 2^-120; the fold 2^120 goes into the
@@ -833,6 +853,12 @@ struct SparseMixedCollectiveMainloop {
     }
     if constexpr (HAS_FP4) {
       auto const& span = p.transport.formats[kTagFP4];
+      b.p4 = compressed_base(isK ? span.k_payload : span.v_payload, span.payload_stride, kv_head_idx,
+                             blk_row(u), blk_blk(u) * 8u);
+      b.s4 = compressed_base(isK ? span.k_scales : span.v_scales, span.scale_stride, kv_head_idx,
+                             blk_row(u), 0u);
+      b.p4_ps = span.payload_stride.page;
+      b.s4_ps = span.scale_stride.page;
       float const g = *(isK ? span.k_global_scale : span.v_global_scale);
       if constexpr (mixed_detail::kFp8FoldsPow2<DTypeKV>) {
         // [25] C16: the placed E2M1 decode is x * 2^-126; the fold 2^126 goes
@@ -851,30 +877,20 @@ struct SparseMixedCollectiveMainloop {
     return b;
   }
 
-  // Per-tile source bases of a compressed format (recomputed per tile: a few
-  // IMAD.WIDE per operand, cheaper than holding them across the pair loop).
-  struct CompressedSrc {
-    uint8_t const* payload;  // this thread's packed block of page 0
-    uint8_t const* scales;   // this thread's row's 8 scale bytes, page 0 (copied by lane b == 0)
-    uint32_t payload_ps, scale_ps;
-  };
-  template <uint8_t FORMAT>
-  CUTLASS_DEVICE CompressedSrc compressed_src(Params const& p, bool isK, int kv_head_idx,
-                                              int thread_idx) const {
-    uint32_t const u = static_cast<uint32_t>(thread_idx);
-    KVPageFormatSpan const& span = p.transport.formats[FORMAT];
-    uint32_t const row = blk_row(u), blk = blk_blk(u);
-    constexpr uint32_t BLOCK_BYTES = FORMAT == kTagFP8 ? 16 : 8;
-    CompressedSrc s;
-    s.payload = static_cast<uint8_t const*>(isK ? span.k_payload : span.v_payload) +
-                uint64_t(kv_head_idx) * span.payload_stride.head +
-                uint64_t(row) * span.payload_stride.token + blk * BLOCK_BYTES;
-    s.scales = (isK ? span.k_scales : span.v_scales) +
-               uint64_t(kv_head_idx) * span.scale_stride.head +
-               uint64_t(row) * span.scale_stride.token;
-    s.payload_ps = span.payload_stride.page;
-    s.scale_ps = span.scale_stride.page;
-    return s;
+  // [25] C13: a compressed format's per-item 64-bit base for this thread: the
+  // span pointer + head * hs + row * ts + blk_off (bytes), computed once per work
+  // item in make_bases (F24 recomputed it per tile: the IADD3.X / VIADD chains
+  // that topped the producer's stall samples).
+  template <typename Ptr>
+  CUTLASS_DEVICE static uint64_t compressed_base(Ptr ptr, KVPageByteStrides const& st,
+                                                 int kv_head_idx, uint32_t row, uint32_t blk_off) {
+    return reinterpret_cast<uint64_t>(ptr) + uint64_t(kv_head_idx) * uint64_t(st.head) +
+           uint64_t(row) * uint64_t(st.token) + uint64_t(blk_off);
+  }
+  // Page `page` of a per-item base: one IMAD.WIDE.U32 (the host bounds the page
+  // stride to 32 bits of bytes).
+  CUTLASS_DEVICE static void const* page_src(uint64_t base, uint32_t page, uint32_t page_stride) {
+    return reinterpret_cast<void const*>(base + uint64_t(page) * uint64_t(page_stride));
   }
 
   // Page placement of one copy / expansion: the byte offset of the page's region
@@ -918,19 +934,29 @@ struct SparseMixedCollectiveMainloop {
   // copying four distinct 8 B sources into 32 contiguous bytes, instead of
   // eight 4 B copies per row at 7.95 wavefronts per warp instruction).  The
   // predicated-off lanes issue nothing (the instruction count is unchanged).
-  // D4: rows past `valid` copy with src-size 0, zero-filling block and slot.
+  // Data flow ([25] C13): src = base + page * stride (one IMAD.WIDE.U32 each for
+  // the block and for the scale row) from the per-item OperandBases; the
+  // destinations are thread constants + stage * STAGE_BYTES + pp.off (immediate).
+  // FP8 blocks are 16 B copies (16 B aligned by the host check), FP4 blocks and
+  // scale rows 8 B copies (8 B aligned only: odd blocks / odd heads are not 16 B
+  // aligned, so no 16 B form with src-size 8 - design 3.4).
+  // D4 (partial arm, !FULL): rows past `valid` copy with src-size 0, zero-filling
+  // block and slot.  The source is passed unmodified: base + page * stride is an
+  // in-bounds address of the transport tensor for every (page, row) (pages past
+  // kv_len are page 0), and with src-size 0 no byte is read - the discipline of
+  // CUTLASS's cp_async_zfill, which never touches the pointer.
   template <uint8_t FORMAT, bool FULL>
-  CUTLASS_DEVICE void copy_compressed_page(OperandBases const& b, CompressedSrc const& s,
-                                           uint32_t page, PagePos const& pp, uint32_t stage,
-                                           uint32_t valid, int thread_idx) const {
+  CUTLASS_DEVICE void copy_compressed_page(OperandBases const& b, uint32_t page, PagePos const& pp,
+                                           uint32_t stage, uint32_t valid, int thread_idx) const {
     uint32_t const u = static_cast<uint32_t>(thread_idx);
     bool const scale_leader = blk_blk(u) == 0;
-    uint8_t const* src = s.payload + uint64_t(page) * uint64_t(s.payload_ps);
-    uint32_t const land = (FORMAT == kTagFP8 ? b.land8 : b.land4) + stage * STAGE_BYTES + pp.off;
+    constexpr bool FP8 = FORMAT == kTagFP8;
+    void const* src = page_src(FP8 ? b.p8 : b.p4, page, FP8 ? b.p8_ps : b.p4_ps);
+    void const* ssrc = page_src(FP8 ? b.s8 : b.s4, page, FP8 ? b.s8_ps : b.s4_ps);
+    uint32_t const land = (FP8 ? b.land8 : b.land4) + stage * STAGE_BYTES + pp.off;
     uint32_t const sdst = b.sc_rd + stage * SCALE_STAGE_BYTES + pp.sc_off;
-    uint8_t const* ssrc = s.scales + uint64_t(page) * uint64_t(s.scale_ps);
     if constexpr (FULL) {
-      if constexpr (FORMAT == kTagFP8) {
+      if constexpr (FP8) {
         mixed_detail::cp16(land, src);
       } else {
         mixed_detail::cp8(land, src);
@@ -938,12 +964,12 @@ struct SparseMixedCollectiveMainloop {
       if (scale_leader) mixed_detail::cp8(sdst, ssrc);
     } else {
       bool const v = pp.tok0 + blk_row(u) < valid;
-      if constexpr (FORMAT == kTagFP8) {
-        mixed_detail::cp16_zfill(land, v ? src : s.payload, v);
+      if constexpr (FP8) {
+        mixed_detail::cp16_zfill(land, src, v);
       } else {
-        mixed_detail::cp8_zfill(land, v ? src : s.payload, v);
+        mixed_detail::cp8_zfill(land, src, v);
       }
-      if (scale_leader) mixed_detail::cp8_zfill(sdst, v ? ssrc : s.scales, v);
+      if (scale_leader) mixed_detail::cp8_zfill(sdst, ssrc, v);
     }
   }
 
@@ -957,9 +983,7 @@ struct SparseMixedCollectiveMainloop {
       // Static modules: unrolled over the six tile pages - the body is a handful
       // of instructions per page with immediate destinations; rolled loop
       // control cost as much as the copies.
-      CompressedSrc s8{}, s4{};
-      if constexpr (STATIC_FP8) s8 = compressed_src<kTagFP8>(p, isK, kv_head_idx, thread_idx);
-      if constexpr (STATIC_FP4) s4 = compressed_src<kTagFP4>(p, isK, kv_head_idx, thread_idx);
+      (void)p; (void)isK; (void)kv_head_idx;
 #pragma unroll
       for (uint32_t j = 0; j < PAGES_PER_THREAD; ++j) {
         uint32_t const page = m.page(j);
@@ -967,9 +991,9 @@ struct SparseMixedCollectiveMainloop {
         if constexpr (STATIC_A16) {
           copy_a16_page<FULL>(b, page, pp, a16_dst_stage, valid, thread_idx);
         } else if constexpr (STATIC_FP8) {
-          copy_compressed_page<kTagFP8, FULL>(b, s8, page, pp, stage, valid, thread_idx);
+          copy_compressed_page<kTagFP8, FULL>(b, page, pp, stage, valid, thread_idx);
         } else {
-          copy_compressed_page<kTagFP4, FULL>(b, s4, page, pp, stage, valid, thread_idx);
+          copy_compressed_page<kTagFP4, FULL>(b, page, pp, stage, valid, thread_idx);
         }
       }
     } else {
@@ -982,9 +1006,8 @@ struct SparseMixedCollectiveMainloop {
       // chain); destinations base + i * PAGE_REGION_BYTES (one IMAD).  Control
       // flow: per format one rolled loop over the set bits, three warp-uniform
       // loops (FP8, FP4, A16) with one copy body each and no per-page format
-      // branch; each format's source set-up (compressed_src) runs only if its
-      // mask is nonzero.  Every quantity here is warp-uniform data from smem, so
-      // the loops never diverge.  ([25d] replaces this arm.)
+      // branch.  Every quantity here is warp-uniform data from smem, so the
+      // loops never diverge.  ([25d] replaces this arm.)
       uint32_t const m8 = m.mask8();
       uint32_t const m4 = m.mask4();
       uint32_t const ma = 0x3Fu & ~(m8 | m4);
@@ -999,21 +1022,20 @@ struct SparseMixedCollectiveMainloop {
         for (uint32_t k = 1; k < PAGES_PER_THREAD; ++k) r = (i == k) ? pg[k] : r;
         return r;
       };
+      (void)p; (void)isK; (void)kv_head_idx;
       if (m8) {
-        CompressedSrc const s8 = compressed_src<kTagFP8>(p, isK, kv_head_idx, thread_idx);
 #pragma unroll 1
         for (uint32_t mm = m8; mm; mm &= mm - 1) {
           uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP8, FULL>(b, s8, page_of(i), dynamic_page(i), stage, valid,
+          copy_compressed_page<kTagFP8, FULL>(b, page_of(i), dynamic_page(i), stage, valid,
                                               thread_idx);
         }
       }
       if (m4) {
-        CompressedSrc const s4 = compressed_src<kTagFP4>(p, isK, kv_head_idx, thread_idx);
 #pragma unroll 1
         for (uint32_t mm = m4; mm; mm &= mm - 1) {
           uint32_t const i = __ffs(mm) - 1;
-          copy_compressed_page<kTagFP4, FULL>(b, s4, page_of(i), dynamic_page(i), stage, valid,
+          copy_compressed_page<kTagFP4, FULL>(b, page_of(i), dynamic_page(i), stage, valid,
                                               thread_idx);
         }
       }
@@ -1263,7 +1285,7 @@ struct SparseMixedCollectiveMainloop {
   // __syncwarp before its stores.  Replaced by F25d.
   template <bool VOTE>
   CUTLASS_DEVICE void expand_operand(Params const& prm, bool isK, OperandBases const& b,
-                                     uint64_t tv, int stage, uint32_t t) const {
+                                     uint32_t tv, int stage, uint32_t t) const {
     ExpandBases const e = expand_bases(b, uint32_t(stage), t);
     if constexpr (!DYNAMIC) {
       constexpr bool FP8 = STATIC_FP8;
@@ -1378,26 +1400,39 @@ struct SparseMixedCollectiveMainloop {
   //  * otherwise: the operand becomes *pending*; one pair later each thread waits
   //    for its own copies of that commit group, expands its blocks, fences (D5)
   //    and arrives.  No group barrier: a thread reads only bytes it copied.
-  // A pending record is one word: the tile's tags / valid / flags and the stage
-  // index (TileRegs::pending_word); 0 means inactive (a filled row always has
-  // kFlagFilled set).
+  // A pending record is one 32-bit word: the tile's masks / tags, valid, flag
+  // bits and the stage index (TileRegs::pending_word); 0 means inactive (a
+  // filled row always has kFlagFilled set).
   struct Operand {
     MainloopPipeline* pipeline;
     PipelineState* state;
     uint8_t (*scales)[SCALE_STAGE_BYTES];
     bool isK;
     OperandBases bases;
-    uint64_t pending;  // finished (waited, expanded, committed) this iteration
-    uint64_t staged;   // issued this iteration; becomes `pending` after the finish
+    uint32_t pending;  // finished (waited, expanded, committed) this iteration
+    uint32_t staged;   // issued this iteration; becomes `pending` after the finish
   };
 
+  // [25] C13: PARTIAL is a compile-time tag.  Only tile kv_tile_idx can have
+  // valid < CTA_KV (valid = min(CTA_KV, kv_len - tile * CTA_KV) and kv_tile_idx *
+  // CTA_KV < kv_len since num_kv_tiles <= ceil(kv_len / CTA_KV)); its K is issued
+  // by the K(last)-alone call and its V by the peeled first pair, which are the
+  // two PARTIAL call sites; the loop compiles the FULL arm only.  The a16 module
+  // keeps the [23] runtime test (its SASS is the transport control).
+  template <bool PARTIAL>
   CUTLASS_DEVICE void issue_operand(Params const& p, Operand& op, TileRegs const& m,
                                     int kv_head_idx, int thread_idx) const {
     uint32_t const stage = op.state->index();
-    if (m.valid() == uint32_t(CTA_KV)) {
-      issue_tile_copies<true>(p, op.bases, m, stage, op.isK, kv_head_idx, thread_idx);
-    } else {
+    if constexpr (STATIC_A16) {
+      if (m.valid() == uint32_t(CTA_KV)) {
+        issue_tile_copies<true>(p, op.bases, m, stage, op.isK, kv_head_idx, thread_idx);
+      } else {
+        issue_tile_copies<false>(p, op.bases, m, stage, op.isK, kv_head_idx, thread_idx);
+      }
+    } else if constexpr (PARTIAL) {
       issue_tile_copies<false>(p, op.bases, m, stage, op.isK, kv_head_idx, thread_idx);
+    } else {
+      issue_tile_copies<true>(p, op.bases, m, stage, op.isK, kv_head_idx, thread_idx);
     }
     bool const compressed = HAS_COMPRESSED && (!DYNAMIC || m.any_compressed());
     if (compressed) {
@@ -1430,20 +1465,30 @@ struct SparseMixedCollectiveMainloop {
   // Caller guarantees this thread's copies of the operand landed (cp.async wait).
   // `op` is always the K or the V local (explicit call sites), so op.isK is a
   // constant after inlining; it selects the cold path's global-scale reload only.
+  // CHECK ([25] C14): the static compressed modules never call this with an
+  // inactive operand (every issued tile is pending; the call sites are chosen by
+  // the peel), so the test is compiled only for the dynamic module, whose
+  // A16-only tiles are not pending; the word is warp-uniform data from smem.
+  template <bool VOTE, bool CHECK>
   CUTLASS_DEVICE void expand_pending(Params const& prm, Operand const& op, int thread_idx) const {
     if constexpr (HAS_COMPRESSED) {
-      if (op.pending == 0) return;
-      expand_operand<true>(prm, op.isK, op.bases, op.pending, int(op.pending >> 60),
+      if constexpr (CHECK) {
+        if (op.pending == 0) return;
+      }
+      expand_operand<VOTE>(prm, op.isK, op.bases, op.pending, int(pending_stage(op.pending)),
                            uint32_t(thread_idx));
     }
   }
   // After the fence: arrive on the pending stage's full barrier.
+  template <bool CHECK>
   CUTLASS_DEVICE void commit_pending(Operand& op) const {
     if constexpr (HAS_COMPRESSED) {
-      if (op.pending == 0) return;
+      if constexpr (CHECK) {
+        if (op.pending == 0) return;
+      }
       // PipelineAsync::producer_commit arrives on full_barrier[state.index()]; only the
       // index of the pending stage matters.
-      op.pipeline->producer_commit(PipelineState(int(op.pending >> 60), 0, 0));
+      op.pipeline->producer_commit(PipelineState(int(pending_stage(op.pending)), 0, 0));
       op.pending = 0;
     }
   }
@@ -1499,41 +1544,51 @@ struct SparseMixedCollectiveMainloop {
     FinTrace ft{false, {0, 0, 0, 0, 0, 0}};
 #endif
 
-    // Wait for this thread's copies of the previous pair (all groups but the
-    // newest), expand its blocks of both operands, fence once (D5) and commit.
-    // No group barrier: the expansion reads only bytes this thread copied (D3).
+    // [25] C14 finish sites.  Data flow: cp.async.wait_group (this thread's own
+    // copies), the operands' expansions (each with its own warp barrier between
+    // its landing loads and its scale-slot loads, A9), one fence.proxy.async
+    // (D5), the full-barrier arrivals.  Control flow: three sites per work item -
+    //  * finish_pending_pair, in the loop: the pair issued one iteration earlier.
+    //    By the peel below that is always a (K, V) pair, so in the static
+    //    compressed modules both operands are pending and nothing is tested
+    //    (CHECK = false: no BSSY/BSYNC); the dynamic module tests each operand
+    //    (A16-only tiles are not pending).  wait_group 1: this pair's group may
+    //    stay in flight.
+    //  * finish_one(K) after K(last) alone (C7: before barrier_O.wait) and
+    //    finish_one(V) at the drain: the other operand is never pending there
+    //    (V has not been issued yet / the last pair always has tK = -1), so only
+    //    the named operand is finished, with wait_group 0 and the exact body
+    //    (VOTE = false: no vote, half the code of a hot + cold site).
     // Explicit K/V call sites: selecting an Operand by a runtime reference would
     // force both structs into local memory (C2).
-    auto finish_pending_pair = [&](bool allow_newest_group) {
+    auto finish_pending_pair = [&]() {
       if constexpr (HAS_COMPRESSED) {
-      if (K.pending != 0 || V.pending != 0) {
-        if (allow_newest_group) {
-          cutlass::arch::cp_async_wait<1>();
-        } else {
-          cutlass::arch::cp_async_wait<0>();
-        }
-        // [25] A9: the warp barrier that orders lane 0's landed scale slot
-        // before the other lanes' LDS.32 of it is inside each operand's
-        // expansion (after its landing loads, before its scale loads), so the
-        // pair has no barrier here.
+        cutlass::arch::cp_async_wait<1>();
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[0] = ft.t[1] = mixed_detail::globaltimer_ns();
 #endif
-        expand_pending(mainloop_params, K, thread_idx);
+        expand_pending<true, DYNAMIC>(mainloop_params, K, thread_idx);
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[2] = ft.t[3] = mixed_detail::globaltimer_ns();
 #endif
-        expand_pending(mainloop_params, V, thread_idx);
+        expand_pending<true, DYNAMIC>(mainloop_params, V, thread_idx);
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[4] = mixed_detail::globaltimer_ns();
 #endif
         cutlass::arch::fence_view_async_shared();  // D5, once per pair
-        commit_pending(K);
-        commit_pending(V);
+        commit_pending<DYNAMIC>(K);
+        commit_pending<DYNAMIC>(V);
 #ifdef MIXED_FA3_TRACE
         if (ft.on) ft.t[5] = mixed_detail::globaltimer_ns();
 #endif
       }
+    };
+    auto finish_one = [&](Operand& op) {
+      if constexpr (HAS_COMPRESSED) {
+        cutlass::arch::cp_async_wait<0>();
+        expand_pending<false, DYNAMIC>(mainloop_params, op, thread_idx);
+        cutlass::arch::fence_view_async_shared();  // D5
+        commit_pending<DYNAMIC>(op);
       }
     };
 
@@ -1563,9 +1618,18 @@ struct SparseMixedCollectiveMainloop {
     V.bases = make_bases(mainloop_params, false, kv_head_idx, sV, shared_storage.mixed_scales_v,
                          thread_idx);
 
-    // --- pairs.  tK or tV may be -1 (absent).  One inlined copy serves K(last)
-    // alone, the steady-state pairs (K(t-1), V(t)) and the final V(swa_begin).
-    auto produce_pair = [&](int tK, int tV) {
+    // --- pairs.  tK or tV may be -1 (absent).  The partial-tile copy arm is a
+    // compile-time tag per operand (C13): PartialTag for the operand that can be
+    // tile kv_tile_idx - K in the K(last)-alone call, V in the peeled first pair
+    // - FullTag everywhere else.  Those two calls have nothing pending (K(last)
+    // is finished by its own finish_one before Q), so they compile no finish;
+    // the loop's pairs finish the previous (K, V) pair unconditionally (C14).
+    using FullTag = std::integral_constant<bool, false>;
+    using PartialTag = std::integral_constant<bool, true>;
+    auto produce_pair = [&](auto kpart, auto vpart, int tK, int tV) {
+      constexpr bool PARTIAL_K = decltype(kpart)::value;
+      constexpr bool PARTIAL_V = decltype(vpart)::value;
+      constexpr bool FINISH = !(PARTIAL_K || PARTIAL_V);
 #ifdef MIXED_FA3_TRACE
       uint64_t tr0 = 0, tr0b = 0, tr1 = 0, tr3 = 0, tr4 = 0, tr5 = 0;
       if (trace) tr0 = mixed_detail::globaltimer_ns();
@@ -1580,11 +1644,11 @@ struct SparseMixedCollectiveMainloop {
 #endif
       if (tK >= 0) {
         TileRegs const mK = read_meta(meta, kv_tile_idx - tK);
-        issue_operand(mainloop_params, K, mK, kv_head_idx, thread_idx);
+        issue_operand<PARTIAL_K>(mainloop_params, K, mK, kv_head_idx, thread_idx);
       }
       if (tV >= 0) {
         TileRegs const mV = read_meta(meta, kv_tile_idx - tV);
-        issue_operand(mainloop_params, V, mV, kv_head_idx, thread_idx);
+        issue_operand<PARTIAL_V>(mainloop_params, V, mV, kv_head_idx, thread_idx);
       }
       cutlass::arch::cp_async_fence();  // this pair's copies form one commit group
 #ifdef MIXED_FA3_TRACE
@@ -1596,7 +1660,7 @@ struct SparseMixedCollectiveMainloop {
 #endif
       // Previous pair's compressed tiles: their group is complete once at most
       // one group (this pair's) is outstanding.  Then this pair becomes pending.
-      finish_pending_pair(/*allow_newest_group=*/true);
+      if constexpr (FINISH) finish_pending_pair();
       rotate_pending(K);
       rotate_pending(V);
 #ifdef MIXED_FA3_TRACE
@@ -1615,13 +1679,13 @@ struct SparseMixedCollectiveMainloop {
     };
 
     // --- K(last) alone (the consumer starts on it before the first V) ---
-    produce_pair(kv_tile_idx, -1);
+    produce_pair(PartialTag{}, FullTag{}, kv_tile_idx, -1);
     // C7: K(last) must be committed *before* barrier_O.wait below.  The consumer
     // arrives on barrier_O (work_idx > 0) only after it has received K(last) and
     // run the first QK GEMM (mainloop_mma.cuh), so a K(last) left pending across
     // that wait deadlocks the second work item of a CTA.  Finishing it here
     // exposes one copy latency per work item, once.
-    finish_pending_pair(/*allow_newest_group=*/false);
+    finish_one(K);
 
     // --- Q (unchanged from the gather producer) ---
     cutlass::arch::NamedBarrier::sync(Ktraits::NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
@@ -1646,8 +1710,11 @@ struct SparseMixedCollectiveMainloop {
     // Pair j of chunk c (j = (kv_tile_idx - t) % 16) loads chunk c+1's rows at
     // j == 0 and stores them + synchronises at j == CHUNK_STORE_PAIR (see the
     // constant); pair 15 of chunk c is the first to read chunk c+1 (its K tile).
-#pragma unroll 1
-    for (int t = kv_tile_idx; t >= swa_begin_kv_tile_idx; --t) {
+    // [25] The compressed modules peel the first pair (t = kv_tile_idx: V(last)
+    // is the partial tile, K(last-1) is full) so that the loop compiles the FULL
+    // copy arm for both operands and finishes the previous pair unconditionally;
+    // the a16 module runs the [23] loop text unchanged (byte-identical).
+    auto pair_step = [&](int t, auto kpart, auto vpart) {
       int const entry = kv_tile_idx - t;
       int const j = entry % CHUNK_TILES;
       int const chunk = entry / CHUNK_TILES;
@@ -1679,10 +1746,18 @@ struct SparseMixedCollectiveMainloop {
       }
 #endif
       if (t == swa_begin_kv_tile_idx) scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-      produce_pair(t - 1 >= swa_begin_kv_tile_idx ? t - 1 : -1, t);
+      produce_pair(kpart, vpart, t - 1 >= swa_begin_kv_tile_idx ? t - 1 : -1, t);
+    };
+    if constexpr (HAS_COMPRESSED) {
+      pair_step(kv_tile_idx, FullTag{}, PartialTag{});
     }
-    // Drain: the last pair's compressed tiles (nothing newer to overlap with).
-    finish_pending_pair(/*allow_newest_group=*/false);
+#pragma unroll 1
+    for (int t = HAS_COMPRESSED ? kv_tile_idx - 1 : kv_tile_idx; t >= swa_begin_kv_tile_idx; --t) {
+      pair_step(t, FullTag{}, FullTag{});
+    }
+    // Drain: the last pair's V (nothing newer to overlap with; K is never pending
+    // here: the last pair always has tK = -1).
+    finish_one(V);
     // The trailing group barrier orders the next work item's chunk-0 store after
     // every reader of this item's table.
     group_barrier();

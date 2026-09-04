@@ -61,6 +61,17 @@ def main() -> int:
             for q_len in (1, 64):
                 cases.append((q_len, "NHD", mode))
                 failures += _run_parity_tail(mode, q_len, extremes=True)
+        # [25c] NaN-pattern tail: the same kv_len 149 with page 0 unreferenced by
+        # every request and filled with E4M3 NaN codes (payload and scales), and
+        # rows 5..15 of each request's partial page filled the same way.  Pages
+        # past kv_len are mapped to page 0 by the chunk table and rows past
+        # `valid` must copy with src-size 0 (D4): a FULL copy arm misused on
+        # V(last) (design 10.1) would land NaN scale bytes -> NaN sf2 -> NaN in O,
+        # which the zero-filled buffers of the other cases could not show.
+        for mode in ("fp8", "fp4", "mixed"):
+            for q_len in (1, 64):
+                cases.append((q_len, "NHD", mode))
+                failures += _run_parity_tail(mode, q_len, nan_tail=True)
         # [23] decode corner cases: E4M3 subnormal payload values (and -0), the
         # maximal block scale 448 and subnormal block scales, FP8 and FP4 pages.
         # [24a] the same payloads under three FP8 global scales (C9): g = 1 (the
@@ -176,27 +187,50 @@ def _run_extremes(mode: str, q_len: int, gs: float = 1.0) -> int:
         return 1
 
 
-def _run_parity_tail(mode: str, q_len: int, extremes: bool = False) -> int:
-    """kv_len 149 = one full tile + 3 full pages + 5 tokens of page 3 (odd parity).
+def _run_parity_tail(mode: str, q_len: int, extremes: bool = False, nan_tail: bool = False) -> int:
+    """kv_len 149 = one full tile + 3 full pages + 5 tokens of page 3: the partial
+    tile kv_tile_idx, whose K is issued by the K(last)-alone call and whose V by
+    the peeled first pair ([25c]: the two partial-arm call sites).
     ``extremes``: the payload / block-scale set of _extreme_transport (448 scales
-    among them, g = 1), so the FP8 fold vote fails inside the partial page."""
+    among them, g = 1), so the FP8 fold vote fails inside the partial page.
+    ``nan_tail``: one extra physical page 0 that no request references, filled
+    with E4M3 NaN codes, and rows 5..15 of every request's last page filled the
+    same way (payload, scales and the A16 reference rows), so that any byte copied
+    from past kv_len or from page 0 poisons the output."""
     import torch
     from flashinfer.mixed_page_prefill import mixed_page_prefill_jit_args, mixed_page_prefill_run_args
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    name = f"[parity-tail-{'extremes-' if extremes else ''}{mode}-{q_len}]"
+    tag = "extremes-" if extremes else ("nan-" if nan_tail else "")
+    name = f"[parity-tail-{tag}{mode}-{q_len}]"
     try:
         dev, dtype = torch.device("cuda"), torch.bfloat16
         B, H, D, P, pages_per_req = 3, 2, 128, 16, 10
-        shape = (B * pages_per_req, P, H, D)
+        extra = 1 if nan_tail else 0
+        shape = (B * pages_per_req + extra, P, H, D)
         if extremes:
             ck, cv, rk, rv, t = _extreme_transport(shape, dtype, dev, mode, 1.0)
         else:
             ck, cv, rk, rv, t = _mod._make_transport(shape, dtype, dev, mode)
         kv_len = 96 + 3 * P + 5
         assert kv_len <= pages_per_req * P
+        if nan_tail:
+            tail_rows = slice(kv_len - (pages_per_req - 1) * P, P)  # rows 5..15 of the last page
+            poisoned = [(0, slice(0, P))] + [
+                (extra + r * pages_per_req + pages_per_req - 1, tail_rows) for r in range(B)]
+            for pg, rows in poisoned:
+                for payload, scales in ((t.fp8_k_payload, t.fp8_k_scales),
+                                        (t.fp8_v_payload, t.fp8_v_scales)):
+                    payload[pg, rows].view(torch.uint8).fill_(0xFF)  # E4M3 NaN code
+                    scales[pg, rows].fill_(0x7F)                     # E4M3 NaN scale
+                for payload, scales in ((t.fp4_k_payload, t.fp4_k_scales),
+                                        (t.fp4_v_payload, t.fp4_v_scales)):
+                    payload[pg, rows].fill_(0xFF)
+                    scales[pg, rows].fill_(0x7F)
+                for ref in (rk, rv, ck, cv):
+                    ref[pg, rows].view(torch.int16).fill_(0x7FC0)   # bf16 NaN
         qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=dev)
         kv_indptr = torch.arange(0, (B + 1) * pages_per_req, pages_per_req, dtype=torch.int32, device=dev)
-        kv_indices = torch.arange(B * pages_per_req, dtype=torch.int32, device=dev)
+        kv_indices = torch.arange(extra, B * pages_per_req + extra, dtype=torch.int32, device=dev)
         last = torch.full((B,), kv_len - (pages_per_req - 1) * P, dtype=torch.int32, device=dev)
         q = torch.randn(B * q_len, H * 4, D, dtype=dtype, device=dev)
         ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
