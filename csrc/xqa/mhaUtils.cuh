@@ -226,6 +226,16 @@ __device__ inline bool needsMixedPageExpansion(
 #endif
 }
 
+// MIXED_KV_PROBE_C (measurement build only, plan P0.8 probe (c)): FP8 K-part copies fetch
+// 64 B per token with the same LDGSTS count and the same per-line request pattern.
+//   1: the lane's own 16-B block (sector p of the token's 128-B FP8 row) plus the same
+//      block of the neighbouring part (sector p^1) -> 2x distinct sectors per request.
+//   2: control -- the own block twice (same sector) -> same sectors, 16-B lanes.
+// The shadow copy lands in dead shared memory (SharedMem::probeScratch); K only.
+#ifndef MIXED_KV_PROBE_C
+#define MIXED_KV_PROBE_C 0
+#endif
+
 // Preserve copyPartialHeadsAsync's warp ownership and circular-buffer
 // schedule. Each lane owns one 16-value block. Compressed payload occupies
 // the first A16 grain; its single scale byte is staged in the second grain.
@@ -239,7 +249,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
     Vec<KVCachePageIndex, nbPages> const& pages,
     MixedPageFormats<nbPages> const& formats, uint32_t tokenOffset, uint32_t sourceHeadOffset,
     uint32_t headIdx, bool isK, uint32_t idxPart, uint32_t nbAvailHeads = maxNbCopiedHeads,
-    uint32_t idxWarp = 0) {
+    uint32_t idxWarp = 0, uint8_t* probeScratch = nullptr) {
   static_assert(sizeof(PaddedCacheHead) % 32 == 0);
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytes);
@@ -323,11 +333,34 @@ __device__ inline void copyMixedPartialHeadsAsync(
           &dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2);
       auto* second =
           &dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2 + 1);
-      ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
-      ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(first) + 8,
-                           firstSource + 8, valid && !isFP4 ? 8U : 0U);
-      ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
-                                   valid && isA16 ? grainBytes : 0U);
+      bool probeTaken = false;
+#if MIXED_KV_PROBE_C
+      // Only the K instantiation (4 parts of 64 A16 bytes -> FP8 part = 32 B = one sector
+      // of the token's 128-B row) carries the probe; V instantiations compile it out.
+      if constexpr (nbPartsPerHead == 4 && partBytes == 64) {
+        if (probeScratch != nullptr && isFP8) {
+          probeTaken = true;
+          constexpr uint32_t fp8PartBytes = partBytes / 2;  // 32 B
+          uint8_t const* shadowSource =
+              (MIXED_KV_PROBE_C == 1)
+                  ? firstSource + ((idxPart & 1) ? -ptrdiff_t(fp8PartBytes) : ptrdiff_t(fp8PartBytes))
+                  : firstSource;
+          // Same 3 LDGSTS per lane per block as the production path (2 real + 1 zero-fill);
+          // the 2 real ones are 16 B (.ca) instead of 8 B (.ca).
+          ldgsts::copyAsyncCa16(first, firstSource, valid ? 16U : 0U);
+          ldgsts::copyAsyncCa16(probeScratch + laneId() * 16, shadowSource, valid ? 16U : 0U);
+          ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
+                                       valid && isA16 ? grainBytes : 0U);
+        }
+      }
+#endif
+      if (!probeTaken) {
+        ldgsts::copyAsync<8>(first, firstSource, valid ? 8U : 0U);
+        ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(first) + 8,
+                             firstSource + 8, valid && !isFP4 ? 8U : 0U);
+        ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes,
+                                     valid && isA16 ? grainBytes : 0U);
+      }
     }
   }
 
