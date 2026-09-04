@@ -2179,3 +2179,87 @@ the Q warp must not sit behind the LDGSTS burst (fp4: Q on the path); RT4 did
 not shrink with a smaller burst (start-burst model wrong: ordering, not
 bytes); the arrive-perform latency 0.6-0.7 us is a steady-state item; R4 / R6
 are pure and can be carried by any later change.
+### Round 3 — co-resident pair pool, amendment 2 (protocol warp): confirmation and rejection (2026-09-04, nkcut2 H200, worktree r3pair @ 441d156f)
+
+Design and full record: `docs/mixed_kv_speed_round3_pair.md` (attribution
+section 1, amendments 9 / 12, review fixes 12.7, results 12.8).  Kernel: [8]
+plus a per-SM two-ended tile pool (smid rendezvous with epoch, 8-tile prefix,
+2-tile `atom.add.u64` claims, 6 tagged scratch chunks per range, tile-count
+semaphore arrivals) whose claims, record fills (both operands), Q loads and
+seams run in IO warp 2 (protocol warp); loaders are per-tile only.
+
+**Review fixes before the run** (9560ef7a, abf4cb8d): `XQA_PAIR_FORCE` /
+`XQA_PAIR_DISABLE` read per launch (the process-static cache had left every
+paired conformance case unforced — the pool paths were never executed by the
+matrix before this run); paired cases compared against an fp32 attention
+reference at 3 bf16 ulps of the largest output (the pool closure point is a
+race, so paired launches differ by bf16 ulps between launches and modules; the
+stock bf16 decode deviates more from fp32 than the mixed kernel and the old
+atol 2e-3 was calibrated on |ref| 0.1 data); a16 module added to the pair
+loop (76 cases); `fillLeadTiles + 2 <= 16` (qItems bound), Q drain before the
+rendezvous, dead `MIXED_KV_META_LEAD` removed, `readFilled(nbFilled, final)`,
+stale comments, C18 `finished` requirement.
+
+**Build facts** (`ptxas -v`, four q=1 modules): 48 registers, **112 B stack,
+282 B spill stores / 328 B spill loads**, no C7507, USETMAXREG 2 (0x28 /
+0x38), CALL 14, ATOMG 5 (ADD.64 claim, ADD.32 semaphore, CAS.64 x2
+rendezvous, INC finished; all IO warps 2 / 3), HGMMA 16, UTMALDG 8 / 0,
+LDGSTS 30 / 18 / 0 / 42.  Per role: gemm0 R39 0 STL / 0 LDL, gemm1 R31 0 / 0,
+loaders R5-R12 0 / 0, converters R51 0 / 0, **protocol warp R45 21 / 29
+(per-unit sites: claim 2 / 8, fill 3 / 5, Q 2 / 3)**, merge R45 45 / 45 (per
+item).  Barrier split: gemm0 PHASECHK 8 / ARRIVE 11, gemm1 18 / 13,
+converters 9 / 1 each, loaders 3 / 1, protocol 5 / 8; kernel PHASECHK 53,
+ARRIVE 35, BAR.SYNC 4.  ncu: dynamic smem 114.69 KB, occupancy 2 / 2
+(registers / smem), issue_active 55.6 % (fp4; [8] 62.9 %).  Gate deviation:
+the protocol warp (IO warp 2) spills on its per-unit path; the pool
+(2x40 + 48 + 2x56 = 240 x 128) has no room, gemm0 needs 40 (R39), converters
+56 (R51).
+
+**Conformance**: 76 / 76 after the reference fix (first run 68 / 76: the 8
+paired fp8 / fp4 / mixed cases failed the old atol; isolation showed every
+variant — static, paired, forced, unforced, every module — within 1 bf16
+output ulp of fp32, closer than the stock decode).  Forced pairing verified
+live: 132 leaders + 132 partners, closing claims 132 / 8 / 124 (take 0 / 1 /
+2), 60-96 leaders crossing into an active partner's pool.
+
+**Locked bench** (q=1, B=17 S=4096 8 KV heads GQA 4 D=128, min / median / max us):
+
+| mode | [8] control (same session) | this kernel, `XQA_PAIR_DISABLE=1` | this kernel, paired | 9.6 band |
+|---|---|---|---|---|
+| transport_a16 | 78.5 / **78.7** / 78.9 | 83.9 / **84.1** / 84.8 | 91.3 / **92.2** / 92.7 | reject (> 80) |
+| fp8 | 67.9 / **68.1** / 68.2 | 73.9 / **74.2** / 74.2 | 85.6 / **85.8** / 86.1 | reject (> 67.8) |
+| fp4 | 60.3 / **60.6** / 61.1 | 68.1 / **68.5** / 68.8 | 80.8 / **80.9** / 81.5 | reject (> 60.5) |
+| mixed | 64.4 / **65.0** / 65.2 | 87.4 / **88.0** / 88.2 | 104.4 / **105.1** / 106.0 | reject (> 64.4) |
+
+q=4 unchanged (83.6 / 111.4 / 113.8 / 114.9).  SM clock 1980 MHz throughout
+(sampled); the [8] control reproduces its recorded medians within 0.6 us.
+
+**Trace** (3 launches per mode, tiles 0-7 and 27-34, paired and disabled;
+per-CTA `ctarec` now two printf lines — the single 37-argument line exceeded
+device printf's 32-argument limit, which was the "constant garbage" of the
+amendment-1 counters; canaries intact in 3168 / 3168 records): fp8 paired fill
+8.1-8.5 / body 80.3-81.0 / tail 2.4 / end 91.6 us (disabled 8.7 / 75 / 4.9 /
+88; [8] 8.5 / 46.5-57.1 / 2.8 / 64.3); tiles leader 34 / partner 32; the
+slot asymmetry is gone because both members are equally slow (bodies 80.3 /
+80.7).  Role cadences 1.4-2.3 us everywhere ([8] 1.2); loader own work 0.15-0.21
+us (12.4 met); converter expansion 950-1190 ns / tile (552-742 in [8]); a16
+segments unchanged in cycles.  **New counters: the K loader waits on the
+filled frontier (the protocol warp) 21.5 us median per CTA = 27 % of the fp8
+body (fp4 32 us = 45 %, a16 37 us = 52 %) when paired, 10-12 us = 13-18 %
+(fp8 / fp4) when disabled, 1.6 us = 2.5 % for a16 disabled.**  The protocol
+warp's per-unit chain is serial and dependent (claim `atom.add` -> walker ->
+page-index `LDG` [-> `page_format`] -> STS -> release), 3-5 us per 2-tile unit
+paired / 1.5-2.5 us unpaired under fp8 / fp4 memory saturation against a
+2.4 us unit demand: its throughput paces the pipeline through the frontier
+whatever its lead.  Secondary: a16 fill +5 us in both variants (Q(0) queued
+behind two fill round trips; the [8] Q warp loaded it in parallel); mixed
++23 us unpaired from the second round trip per unit.
+
+**Verdict: rejected** — every band missed, every period > 5 %, and the
+`XQA_PAIR_DISABLE` A/B does not recover [8].  Production stays at [8]
+(`e113026a` / `039ba5c7`); the round-3 branch keeps the attribution (slot
+priority, two-rate model), the correct-but-slow protocol, the fp32 paired
+reference and the trace counters on record.  A future pool must have a
+pipelined producer (several claims in flight, fill loads issued ahead of the
+previous store, or [8]'s 16-tile chunk fill with coarser claims) and Q(0)
+off the fill chain.
