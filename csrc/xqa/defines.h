@@ -84,9 +84,8 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #endif
 
 // 0: half/bf16; 1: int8_t; 2: __nv_fp8_e4m3; 3: block-scaled
-// NVFP4; 4: block-scaled FP8 E4M3; 5: page-routed A16 / block-scaled FP8 / block-scaled FP4.  Enum 5
-// changes storage transport only: shared-memory tiles and attention math are
-// INPUT_ELEM.
+// NVFP4; 4: block-scaled FP8 E4M3; 5: page-routed A16 / block-scaled FP8 / block-scaled FP4.  Enum
+// 5 changes storage transport only: shared-memory tiles and attention math are INPUT_ELEM.
 #ifndef CACHE_ELEM_ENUM
 #define CACHE_ELEM_ENUM 2
 #endif
@@ -206,14 +205,14 @@ static_assert(CACHE_ELEM_ENUM != 0);
 // build (static format 2) is not request-bound on V and pays the group's per-tile syncs
 // (fp4 q=1 57.4 -> 71.7 us measured), so it keeps the per-warp loader; static A16 (0) too.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-#define GRP_LOAD_V                                                                     \
-  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) ||                                   \
+#define GRP_LOAD_V                                                                              \
+  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) ||                                            \
    (CACHE_ELEM_ENUM == 5 && (MIXED_PAGE_STATIC_FORMAT == 1 || MIXED_PAGE_STATIC_FORMAT < 0)) || \
-   (HEAD_ELEMS == 256 && BEAM_WIDTH > 1))
+   (HEAD_ELEMS == 256 && BEAM_WIDTH > 1) || HEAD_ELEMS > 256)
 #else
-#define GRP_LOAD_V \
-  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) || \
-   (HEAD_ELEMS == 256 && BEAM_WIDTH > 1))
+#define GRP_LOAD_V                                                                            \
+  ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1) || \
+   HEAD_ELEMS > 256)
 #endif
 
 // use custom barrier for NVRTC to avoid pulling in many headers

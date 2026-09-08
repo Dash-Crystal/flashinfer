@@ -74,7 +74,9 @@ def gen_xqa_module(
         )
 
     if mixed_page and block_scaled_fp8:
-        raise ValueError("mixed_page and block_scaled_fp8 are distinct XQA specializations")
+        raise ValueError(
+            "mixed_page and block_scaled_fp8 are distinct XQA specializations"
+        )
     if mixed_page_static_format not in (-1, 0, 1, 2):
         raise ValueError("mixed_page_static_format must be -1, 0, 1, or 2")
     if not mixed_page and mixed_page_static_format != -1:
@@ -100,10 +102,22 @@ def gen_xqa_module(
         )
     flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={page_size}"]
 
-    if head_dim % 16 != 0 or head_dim > 256 or head_dim < 16:
+    if head_dim % 16 != 0 or head_dim > 512 or head_dim < 16:
         raise ValueError(
-            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 256]"
+            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 512]"
         )
+    if head_dim > 256:
+        # headElems > 256 uses per-warp head-dim splits in mha.cu (see nbHeadSplits);
+        # the specialized SPEC_DEC/SM90-GMMA paths do not support it, and the
+        # persistent-Q smem budget requires head_group_ratio <= 16.
+        if q_seq_len > 1:
+            raise ValueError(
+                f"head_dim {head_dim} > 256 does not support speculative decoding (q_seq_len > 1)"
+            )
+        if head_group_ratio > 16:
+            raise ValueError(
+                f"head_dim {head_dim} > 256 requires head_group_ratio <= 16, got {head_group_ratio}"
+            )
     flag_head_dim = [f"-DHEAD_ELEMS={head_dim}"]
 
     flag_head_group_ratio = [f"-DHEAD_GRP_SIZE={head_group_ratio}"]
@@ -166,7 +180,7 @@ def gen_xqa_module(
     # layouts.  Block-scaled E4M3 uses the architecture-neutral XQA mainloop
     # until its SM90 RS-GMMA transform is wired from CUTLASS's mixed-input
     # collective; compiling an unsupported GMMA layout is not a fallback.
-    if _has_sm90_target() and not block_scaled_fp8:
+    if _has_sm90_target() and not block_scaled_fp8 and head_dim <= 256:
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]

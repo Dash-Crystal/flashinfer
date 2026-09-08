@@ -558,9 +558,13 @@ def xqa(
                 fp4_k_scales=page_transport.fp4_k_scales.transpose(-3, -2),
                 fp4_v_scales=page_transport.fp4_v_scales.transpose(-3, -2),
             )
-    if get_compute_capability(torch.device(device="cuda"))[0] == 9 and (
-        (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
-        or (mixed_page and q_seq_len == 1)
+    if (
+        head_dim <= 256
+        and get_compute_capability(q.device)[0] == 9
+        and (
+            (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
+            or (mixed_page and q_seq_len == 1)
+        )
     ):
         run_sm90_fp8_mha = True
     else:

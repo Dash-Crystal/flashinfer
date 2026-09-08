@@ -81,11 +81,13 @@ constexpr bool enableMicroFastPath = false;
 #ifndef MIXED_COMPACT_PAGES
 #define MIXED_COMPACT_PAGES 0
 #endif
-#if ENABLE_MIXED_KV_CACHE && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-constexpr bool compactMixedPages = MIXED_COMPACT_PAGES && tokensPerPage == 16;
+#if ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_PAGES && TOKENS_PER_PAGE == 16 && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#define ENABLE_MIXED_COMPACT_PAGES 1
 #else
-constexpr bool compactMixedPages = false;
+#define ENABLE_MIXED_COMPACT_PAGES 0
 #endif
+constexpr bool compactMixedPages = ENABLE_MIXED_COMPACT_PAGES;
 // [40] (Track S step 3): the dynamic module (static format -1) routes every tile
 // through copyMixedPartialHeadsAsync, whose per-page A16 body is the stock two-grain
 // copy, so it carries no separate copyPartialHeadsAsync instantiations (their code
@@ -112,7 +114,11 @@ constexpr uint32_t nbValidRows = headGrpSize * beamWidth;
 constexpr uint2 warpTile = {64, roundUp(nbValidRows, 16U)};
 static_assert(nbValidRows <= warpTile.y);
 
-constexpr uint32_t gemm1WarpsPerGrp = exactDiv(headElems, warpTile.x);
+// For headElems > warpTile.x * ctaShapeInWarps.x (i.e. 512), each gemm1 warp owns
+// nbHeadSplits head-dim slices of warpTile.x elems each (slice idx = warpIdxInGrp +
+// gemm1WarpsPerGrp * split), instead of requiring more warps than the CTA has.
+constexpr uint32_t gemm1WarpsPerGrp = mha::min(exactDiv(headElems, warpTile.x), ctaShapeInWarps.x);
+constexpr uint32_t nbHeadSplits = exactDiv(headElems, warpTile.x* gemm1WarpsPerGrp);
 constexpr uint32_t gemm1NbWarpGrps =
     exactDiv(ctaShapeInWarps.x, gemm1WarpsPerGrp);  // warp groups split along seqLen dim.
 
@@ -121,28 +127,32 @@ constexpr uint2 ctaTile = {
     warpTile.y* ctaShapeInWarps.y};
 
 constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
+constexpr uint32_t smallSmemVTileSeqLen = headElems > 256 && cacheElemSize == 2 ? 16 : 32;
 
+// At HEAD_ELEMS > 256 the group-shared V buffer holds full heads (grpLoadV), so shrink
+// the V tile sequence length to keep smem within budget: on 99KB archs (SM86/89/120/121)
+// 16-bit KV needs 16 tokens per tile (fp8 fits at 32); 227KB archs fit 32 for both.
 #ifndef __CUDA_ARCH__
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
 #else
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
 #elif __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 // Track W [26]: sm120 decode is request-rate-bound (P0.8 (b)/(c)); 128 B K parts make every
 // compressed K copy fetch whole 64 B (FP8) / 32 B (FP4) runs of the token row instead of one
 // 32 B / 16 B fragment (K line requests per SM-tile 1024 -> 512).  cacheVTileSeqLen 16 pays for
 // the 32 KB larger K ring inside the 99 KB SharedMem cap (K 64 KB + V 16 KB + Q 4 KB + X 8 KB).
-// Only the mixed-page transport build (CACHE_ELEM_ENUM 5, A16 tiles) takes it: SPEC_DEC
-// (warpTile.y 32: Q 8 KB + X 16 KB) does not fit, and the native block-scaled builds (3/4)
-// copy 4 B scale grains that need >= 32 V rows per warp pair; those keep 64/32.
-#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC
+// The mixed-page D128 decode tile fits this schedule. D256 doubles Q storage and
+// exceeds the shared-memory budget; wider heads and SPEC_DEC retain 64 B K parts.
+// Native block-scaled builds need >= 32 V rows per warp pair for scale copies.
+#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC && HEAD_ELEMS <= 128
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 16;
 #else
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
 #endif
 #elif __CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM == 5 && SPEC_DEC && M_TILESIZE == 16
 // Track S step 4 [41]: the sm90 SPEC_DEC mixed-page build runs 1 CTA/SM twice over - by
@@ -170,7 +180,7 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #else
 #error "perferedKHeadPartBytes not defined"
 #endif
@@ -202,6 +212,8 @@ constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPa
 // before the group's gemm1 reads the whole tile. A third buffer would only remove the wait, not the
 // protocol.
 constexpr bool grpLoadV = GRP_LOAD_V;
+// Multiple head-dim slices per warp require the group-shared full-head V buffer.
+static_assert(nbHeadSplits == 1 || grpLoadV);
 
 // [44] Track S step 6: the sm90 SPEC_DEC bf16 compact build expands compressed K/V blocks with
 // the bit-placement decode and the block scale folded with 2^k
@@ -457,13 +469,12 @@ struct alignas(128) SharedMem {
   // The sm90 compact build ([43]) takes the 4 B stride (that 1,056 B is what lets the 128 B
   // K ring fit two CTAs); the other builds keep the 8 B layout byte-for-byte (sm120 fp4 q=1
   // measured +1.6 us with the shrunk layout, a smem-layout effect this step does not chase).
-  static constexpr uint32_t mixedVScaleBytes = mha::max(
-      4U, exactDiv(exactDiv(sizeof(PaddedCacheHead),
-                            (kCompactTileLoops && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
-                   2 * grainBytes));
+  static constexpr uint32_t mixedVScaleBytes =
+      mha::max(4U, exactDiv(exactDiv(sizeof(PaddedCacheHead),
+                                     (kCompactTileLoops && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
+                            2 * grainBytes));
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
-  MixedPageFormats<nbPagesPerVTile>
-      vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
+  MixedPageFormats<nbPagesPerVTile> vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   // Row maxNbCopiedHeads of a warp's range is the dump row for its lanes past the tile's
@@ -475,9 +486,9 @@ struct alignas(128) SharedMem {
   // token ranges of the shared V tile; each warp's slot is headsPerWarp rows + its dump row.
   static constexpr uint32_t vScaleRowsPerWarp =
       (grpLoadV ? exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp) : cacheVTileSeqLen) + 1;
-  alignas(4) uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
-                            [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
-                            [mixedVScaleBytes];
+  alignas(16) uint8_t vScales[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers]
+                             [grpLoadV ? gemm1WarpsPerGrp * vScaleRowsPerWarp : vScaleRowsPerWarp]
+                             [mixedVScaleBytes];
 #if MIXED_KV_PROBE_C
   // Dead landing area for the probe's shadow copies (never read). 16 B per lane per gemm0 warp.
   alignas(16) uint8_t probeScratch[ctaShapeInWarps.x][warp_size * 16];
@@ -1001,7 +1012,7 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
 #endif
                                              uint2 dstOffset, SharedMem::XSmemBuffer const& src) {
   static_assert(sizeof(PaddedInputHead) ==
-                grainBytes * SharedMem::XSmemBuffer::cols * gemm1WarpsPerGrp);
+                grainBytes * SharedMem::XSmemBuffer::cols * gemm1WarpsPerGrp * nbHeadSplits);
 #if SPEC_DEC
   static_assert(warpTile.y <= SharedMem::XSmemBuffer::rows);
 #else
@@ -1135,19 +1146,19 @@ loadMatrix(Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint
   return dst;
 }
 
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_COMPACT_PAGES
 // B-fragment ownership is the native mma.m16n8k16 mapping: a quad owns one
 // output column and its four lanes own the two adjacent K pairs at offsets
 // [0, 8].  Compressed pages therefore need only two narrow shared loads per
 // lane; conversion and the block scale stay in registers.
 template <flashinfer::KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadMixedKPageFragment(
-    SharedMem::KSmemBuffer const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart, uint8_t const* scales,
-    float fp8GlobalScale, float fp4GlobalScale) {
+__device__ inline InstInMat<2, 2> loadMixedKPageFragment(SharedMem::KSmemBuffer const& tile,
+                                                         uint32_t pageInTile, uint32_t blockInPart,
+                                                         uint32_t idxPart, uint8_t const* scales,
+                                                         float fp8GlobalScale,
+                                                         float fp4GlobalScale) {
   using flashinfer::KVPageFormat;
-  static_assert(format == KVPageFormat::kA16 ||
-                format == KVPageFormat::kBlockScaledFP8 ||
+  static_assert(format == KVPageFormat::kA16 || format == KVPageFormat::kBlockScaledFP8 ||
                 format == KVPageFormat::kBlockScaledFP4);
   constexpr uint32_t partBytes = kHeadPartBytes;
   constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
@@ -1155,8 +1166,8 @@ __device__ inline InstInMat<2, 2> loadMixedKPageFragment(
   constexpr uint32_t fullCols = exactDiv(partBytes, grainBytes);
   using A16Page = Array2D<LdGrain, tokensPerPage, fullCols>;
 
-  auto const* pageBase = reinterpret_cast<uint8_t const*>(&tile) +
-                         uint64_t(pageInTile) * tokensPerPage * partBytes;
+  auto const* pageBase =
+      reinterpret_cast<uint8_t const*>(&tile) + uint64_t(pageInTile) * tokensPerPage * partBytes;
   auto const& a16Page = *reinterpret_cast<A16Page const*>(pageBase);
   uint32_t const laneInQuad = laneId() & 3U;
   uint32_t const tokenInHalf = laneId() >> 2;
@@ -1167,31 +1178,27 @@ __device__ inline InstInMat<2, 2> loadMixedKPageFragment(
 
   InstInMat<2, 2> fragment;
   if constexpr (format == KVPageFormat::kA16) {
-    return loadInstInMat<2, 2, true, false, false>(
-        this_warp(), a16Page, 0, blockInPart * 2);
+    return loadInstInMat<2, 2, true, false, false>(this_warp(), a16Page, 0, blockInPart * 2);
   }
   if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-    auto const packed = ldmatrix<false, 2>(
-        &a16Page.template at<true>(laneId() % tokensPerPage, blockInPart));
+    auto const packed =
+        ldmatrix<false, 2>(&a16Page.template at<true>(laneId() % tokensPerPage, blockInPart));
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
       uint32_t const token = n * 8 + tokenInHalf;
       uint8_t const scaleBits =
-          scales[(pageInTile * tokensPerPage + token) * scaleLoadBytes +
-                 scaleOffset];
+          scales[(pageInTile * tokensPerPage + token) * scaleLoadBytes + scaleOffset];
       uint32_t const quadBase = laneId() & ~3U;
       uint32_t const pairLane = laneInQuad >> 1;
       uint32_t const halfShift = (laneInQuad & 1U) * 16U;
-      uint32_t const lowWord = __shfl_sync(
-          0xffffffffU, packed[n], quadBase + pairLane);
-      uint32_t const highWord = __shfl_sync(
-          0xffffffffU, packed[n], quadBase + pairLane + 2);
+      uint32_t const lowWord = __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane);
+      uint32_t const highWord = __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane + 2);
       uint16_t const low = static_cast<uint16_t>(lowWord >> halfShift);
       uint16_t const high = static_cast<uint16_t>(highWord >> halfShift);
-      fragment.data[n][0] = scaleA16x2<InputElem>(
-          convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
-      fragment.data[n][1] = scaleA16x2<InputElem>(
-          convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
+      fragment.data[n][0] =
+          scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
+      fragment.data[n][1] =
+          scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
     }
     return fragment;
   }
@@ -1199,35 +1206,36 @@ __device__ inline InstInMat<2, 2> loadMixedKPageFragment(
   for (uint32_t n = 0; n < 2; ++n) {
     uint32_t const token = n * 8 + tokenInHalf;
     if constexpr (format != KVPageFormat::kA16) {
-      auto const* packed = reinterpret_cast<uint8_t const*>(
-          &a16Page.template at<true>(token, blockInPart));
+      auto const* packed =
+          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(token, blockInPart));
       uint8_t const scaleBits =
           scales[(pageInTile * tokensPerPage + token) * scaleLoadBytes + scaleOffset];
       if constexpr (format == KVPageFormat::kBlockScaledFP8) {
         uint16_t const low = *reinterpret_cast<uint16_t const*>(packed + elemInBlock);
         uint16_t const high = *reinterpret_cast<uint16_t const*>(packed + 8 + elemInBlock);
-        fragment.data[n][0] = scaleA16x2<InputElem>(
-            convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
-        fragment.data[n][1] = scaleA16x2<InputElem>(
-            convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
+        fragment.data[n][0] =
+            scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
+        fragment.data[n][1] =
+            scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
       } else {
         uint8_t const low = packed[elemInBlock / 2];
         uint8_t const high = packed[4 + elemInBlock / 2];
-        fragment.data[n][0] = scaleA16x2<InputElem>(
-            convertE2M1x2ToA16<InputElem>(low), scaleBits, fp4GlobalScale);
-        fragment.data[n][1] = scaleA16x2<InputElem>(
-            convertE2M1x2ToA16<InputElem>(high), scaleBits, fp4GlobalScale);
+        fragment.data[n][0] =
+            scaleA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(low), scaleBits, fp4GlobalScale);
+        fragment.data[n][1] =
+            scaleA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(high), scaleBits, fp4GlobalScale);
       }
     }
   }
   return fragment;
 }
 
-__device__ inline void smemQKPartGemmMixed(
-    Warp const& warp, WarpAcc& acc, SharedMem::QSmemBuffer const& q,
-    uint32_t qColBeg, SharedMem::KSmemBuffer const& k,
-    MixedPageFormats<nbPagesPerWarpTile> const& formats, uint8_t const* scales,
-    uint32_t idxPart, float fp8GlobalScale, float fp4GlobalScale) {
+__device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
+                                           SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
+                                           SharedMem::KSmemBuffer const& k,
+                                           MixedPageFormats<nbPagesPerWarpTile> const& formats,
+                                           uint8_t const* scales, uint32_t idxPart,
+                                           float fp8GlobalScale, float fp4GlobalScale) {
   static_assert(tokensPerPage == 16);
   constexpr uint32_t kEx = 2;
   constexpr uint32_t mnEx = 2;
@@ -1236,42 +1244,34 @@ __device__ inline void smemQKPartGemmMixed(
 
 #pragma unroll
   for (uint32_t block = 0; block < blocksPerPart; ++block) {
-    auto const qSlice =
-        loadMatrix<kEx, mnEx, qSliceRows, 1, false, false, false, false>(
-            warp, q, 0, qColBeg + kEx * block);
+    auto const qSlice = loadMatrix<kEx, mnEx, qSliceRows, 1, false, false, false, false>(
+        warp, q, 0, qColBeg + kEx * block);
 #pragma unroll
     for (uint32_t page = 0; page < nbPagesPerWarpTile; ++page) {
       auto const loadPage = [&]() {
         using flashinfer::KVPageFormat;
 #if MIXED_PAGE_STATIC_FORMAT == 0
-        return loadMixedKPageFragment<KVPageFormat::kA16>(
-            k, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+        return loadMixedKPageFragment<KVPageFormat::kA16>(k, page, block, idxPart, scales,
+                                                          fp8GlobalScale, fp4GlobalScale);
 #elif MIXED_PAGE_STATIC_FORMAT == 1
         return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP8>(
-            k, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #elif MIXED_PAGE_STATIC_FORMAT == 2
         return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP4>(
-            k, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #else
         uint8_t const format = formats.values[page];
         if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-          return loadMixedKPageFragment<KVPageFormat::kA16>(
-              k, page, block, idxPart, scales, fp8GlobalScale,
-              fp4GlobalScale);
+          return loadMixedKPageFragment<KVPageFormat::kA16>(k, page, block, idxPart, scales,
+                                                            fp8GlobalScale, fp4GlobalScale);
         }
         if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
           return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP8>(
-              k, page, block, idxPart, scales, fp8GlobalScale,
-              fp4GlobalScale);
+              k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
         }
-        assert(format ==
-               static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
+        assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
         return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP4>(
-            k, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #endif
       };
       auto const matrixB = loadPage();
@@ -1288,13 +1288,13 @@ __device__ inline void smemQKPartGemmMixed(
 }
 
 template <flashinfer::KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadMixedVPageFragment(
-    SharedMem::VSmemBuffer const& tile, uint32_t pageInTile,
-    uint32_t blockInPart, uint32_t idxPart, uint8_t const* scales,
-    float fp8GlobalScale, float fp4GlobalScale) {
+__device__ inline InstInMat<2, 2> loadMixedVPageFragment(SharedMem::VSmemBuffer const& tile,
+                                                         uint32_t pageInTile, uint32_t blockInPart,
+                                                         uint32_t idxPart, uint8_t const* scales,
+                                                         float fp8GlobalScale,
+                                                         float fp4GlobalScale) {
   using flashinfer::KVPageFormat;
-  static_assert(format == KVPageFormat::kA16 ||
-                format == KVPageFormat::kBlockScaledFP8 ||
+  static_assert(format == KVPageFormat::kA16 || format == KVPageFormat::kBlockScaledFP8 ||
                 format == KVPageFormat::kBlockScaledFP4);
   constexpr uint32_t partBytes = SharedMem::VSmemBuffer::rowBytes;
   constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
@@ -1302,8 +1302,8 @@ __device__ inline InstInMat<2, 2> loadMixedVPageFragment(
   constexpr uint32_t fullCols = exactDiv(partBytes, grainBytes);
   using A16Page = Array2D<LdGrain, tokensPerPage, fullCols>;
 
-  auto const* pageBase = reinterpret_cast<uint8_t const*>(&tile) +
-                         uint64_t(pageInTile) * tokensPerPage * partBytes;
+  auto const* pageBase =
+      reinterpret_cast<uint8_t const*>(&tile) + uint64_t(pageInTile) * tokensPerPage * partBytes;
   auto const& a16Page = *reinterpret_cast<A16Page const*>(pageBase);
   uint32_t const laneInQuad = laneId() & 3U;
   uint32_t const headInHalf = laneId() >> 2;
@@ -1315,17 +1315,14 @@ __device__ inline InstInMat<2, 2> loadMixedVPageFragment(
   uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
   uint8_t const scaleOffset = static_cast<uint8_t>(scaleBlock - scaleGroup);
 
-  auto loadPair = [&](uint32_t head, uint32_t firstToken,
-                      uint32_t secondToken) -> uint32_t {
+  auto loadPair = [&](uint32_t head, uint32_t firstToken, uint32_t secondToken) -> uint32_t {
     if constexpr (format == KVPageFormat::kA16) {
       uint32_t const grain = head / (grainBytes / sizeof(InputElem));
       uint32_t const byte = (head % (grainBytes / sizeof(InputElem))) * sizeof(InputElem);
-      auto const* first = reinterpret_cast<uint8_t const*>(
-                              &a16Page.template at<true>(firstToken, grain)) +
-                          byte;
-      auto const* second = reinterpret_cast<uint8_t const*>(
-                               &a16Page.template at<true>(secondToken, grain)) +
-                           byte;
+      auto const* first =
+          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(firstToken, grain)) + byte;
+      auto const* second =
+          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(secondToken, grain)) + byte;
       uint16_t const lo = *reinterpret_cast<uint16_t const*>(first);
       uint16_t const hi = *reinterpret_cast<uint16_t const*>(second);
       return uint32_t(lo) | (uint32_t(hi) << 16);
@@ -1333,10 +1330,10 @@ __device__ inline InstInMat<2, 2> loadMixedVPageFragment(
 
     uint32_t const grain = head / 16;
     uint32_t const elem = head % 16;
-    auto const* first = reinterpret_cast<uint8_t const*>(
-        &a16Page.template at<true>(firstToken, grain));
-    auto const* second = reinterpret_cast<uint8_t const*>(
-        &a16Page.template at<true>(secondToken, grain));
+    auto const* first =
+        reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(firstToken, grain));
+    auto const* second =
+        reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(secondToken, grain));
     uint32_t packedA16;
     if constexpr (format == KVPageFormat::kBlockScaledFP8) {
       uint16_t const fp8x2 = uint16_t(first[elem]) | (uint16_t(second[elem]) << 8);
@@ -1344,16 +1341,15 @@ __device__ inline InstInMat<2, 2> loadMixedVPageFragment(
     } else {
       uint8_t const shift = static_cast<uint8_t>((elem & 1U) * 4U);
       uint8_t const fp4x2 = static_cast<uint8_t>(((first[elem / 2] >> shift) & 0xfU) |
-                                                (((second[elem / 2] >> shift) & 0xfU) << 4));
+                                                 (((second[elem / 2] >> shift) & 0xfU) << 4));
       packedA16 = convertE2M1x2ToA16<InputElem>(fp4x2);
     }
     uint8_t const scale0 =
         scales[(pageInTile * tokensPerPage + firstToken) * scaleLoadBytes + scaleOffset];
     uint8_t const scale1 =
         scales[(pageInTile * tokensPerPage + secondToken) * scaleLoadBytes + scaleOffset];
-    float const globalScale = format == KVPageFormat::kBlockScaledFP8
-                                  ? fp8GlobalScale
-                                  : fp4GlobalScale;
+    float const globalScale =
+        format == KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
     return scaleA16x2Pair<InputElem>(packedA16, scale0, scale1, globalScale);
   };
 
@@ -1368,19 +1364,16 @@ __device__ inline InstInMat<2, 2> loadMixedVPageFragment(
 }
 
 __device__ inline void smemXVPartGemmMixed(
-    Warp const& warp, WarpAcc& acc, bool skipXRowRescale,
-    UniformRescaleMask xRowNeedRescaleMask, ThrdRegRowMax xRowScales,
-    SharedMem::XSmemBuffer const& x, uint32_t idxVTilePerXTile,
-    SharedMem::VSmemBuffer const& v,
-    MixedPageFormats<nbPagesPerVTile> const& formats, uint8_t const* scales,
-    uint32_t idxPart, float fp8GlobalScale, float fp4GlobalScale) {
+    Warp const& warp, WarpAcc& acc, bool skipXRowRescale, UniformRescaleMask xRowNeedRescaleMask,
+    ThrdRegRowMax xRowScales, SharedMem::XSmemBuffer const& x, uint32_t idxVTilePerXTile,
+    SharedMem::VSmemBuffer const& v, MixedPageFormats<nbPagesPerVTile> const& formats,
+    uint8_t const* scales, uint32_t idxPart, float fp8GlobalScale, float fp4GlobalScale) {
   unused(xRowNeedRescaleMask);
   static_assert(tokensPerPage == 16);
   constexpr uint32_t kEx = 2;
   constexpr uint32_t mnEx = 2;
   constexpr uint32_t xSliceRows = exactDiv(warpTile.y, 8 * mnEx);
-  constexpr uint32_t blocksPerPart =
-      exactDiv(SharedMem::VSmemBuffer::rowBytes, 2 * grainBytes);
+  constexpr uint32_t blocksPerPart = exactDiv(SharedMem::VSmemBuffer::rowBytes, 2 * grainBytes);
 
   Vec<InputElem2, QuadRegRowMax::size> xRowScalesQuad;
   if (!enableMicroFastPath || !skipXRowRescale) {
@@ -1398,8 +1391,8 @@ __device__ inline void smemXVPartGemmMixed(
     uint32_t const colBeg =
         SharedMem::XSmemBuffer::cols / nbCacheVTilesPerXTile * idxVTilePerXTile +
         exactDiv(inputElemSize * tokensPerPage, grainBytes) * page;
-    auto xSlice = loadMatrix<kEx, mnEx, xSliceRows, 1, false, false, false, false>(
-        warp, x, 0, colBeg);
+    auto xSlice =
+        loadMatrix<kEx, mnEx, xSliceRows, 1, false, false, false, false>(warp, x, 0, colBeg);
     if (!enableMicroFastPath || !skipXRowRescale) {
 #pragma unroll
       for (uint32_t m = 0; m < xSliceRows; ++m) {
@@ -1420,34 +1413,27 @@ __device__ inline void smemXVPartGemmMixed(
       auto const loadPage = [&]() {
         using flashinfer::KVPageFormat;
 #if MIXED_PAGE_STATIC_FORMAT == 0
-        return loadMixedVPageFragment<KVPageFormat::kA16>(
-            v, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+        return loadMixedVPageFragment<KVPageFormat::kA16>(v, page, block, idxPart, scales,
+                                                          fp8GlobalScale, fp4GlobalScale);
 #elif MIXED_PAGE_STATIC_FORMAT == 1
         return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP8>(
-            v, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #elif MIXED_PAGE_STATIC_FORMAT == 2
         return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP4>(
-            v, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #else
         uint8_t const format = formats.values[page];
         if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-          return loadMixedVPageFragment<KVPageFormat::kA16>(
-              v, page, block, idxPart, scales, fp8GlobalScale,
-              fp4GlobalScale);
+          return loadMixedVPageFragment<KVPageFormat::kA16>(v, page, block, idxPart, scales,
+                                                            fp8GlobalScale, fp4GlobalScale);
         }
         if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
           return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP8>(
-              v, page, block, idxPart, scales, fp8GlobalScale,
-              fp4GlobalScale);
+              v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
         }
-        assert(format ==
-               static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
+        assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
         return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP4>(
-            v, page, block, idxPart, scales, fp8GlobalScale,
-            fp4GlobalScale);
+            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
 #endif
       };
       auto const matrixB = loadPage();
@@ -1486,9 +1472,9 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
                  mha::is_same_v<KElemType, int8_t> || mha::is_same_v<KElemType, __nv_fp8_e4m3>),
                 "not implemented");
 #else
-  static_assert(mha::is_same_v<KElemType, __nv_fp4_e2m1> ||
-                    mha::is_same_v<KElemType, __nv_fp8_e4m3>,
-                "block-scaled XQA supports E2M1 and E4M3 payloads");
+  static_assert(
+      mha::is_same_v<KElemType, __nv_fp4_e2m1> || mha::is_same_v<KElemType, __nv_fp8_e4m3>,
+      "block-scaled XQA supports E2M1 and E4M3 payloads");
 #endif
   constexpr uint32_t nbInstInMatPerSliceInGemmKDim = 1;
   constexpr uint32_t kElemSize = sizeof(KElemType);
@@ -1564,8 +1550,7 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
     constexpr uint32_t kSliceCols = nbInstInMatPerSliceInGemmKDim;
     Array2D<InstInMat<mnExK, kExK>, kSliceRows, kSliceCols> const kSliceOrig =
         loadMatrix<kExK, mnExK, kSliceRows, kSliceCols, false, true, false,
-                   IS_PACKED_4BIT_KV_CACHE>(
-            warp, k, 0, kExK * kSliceCols * s);
+                   IS_PACKED_4BIT_KV_CACHE>(warp, k, 0, kExK * kSliceCols * s);
     auto const kSlice = [&]() -> Array2D<InstInMat<mnExK, kEx>, kSliceRows, kSliceCols> {
       if constexpr (mha::is_same_v<InputElem, KElemType>) {
         return kSliceOrig;
@@ -1583,25 +1568,22 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
                     convertKCacheWordToF16<InputElem, KElemType>(kSliceOrig(m, n).data[i][j]);
 #if ENABLE_BLOCK_SCALED_KV_CACHE
                 uint16_t sf;
-                if constexpr (mha::is_same_v<KElemType,
-                                             __nv_fp8_e4m3>) {
+                if constexpr (mha::is_same_v<KElemType, __nv_fp8_e4m3>) {
                   // Match the native K fragment ownership: each output
                   // column is one eight-token half of a 16-token page.
-                  auto const& kSfPlain = reinterpret_cast<
-                      SharedMem::KSfSmemBufferPlain const&>(kSf);
+                  auto const& kSfPlain =
+                      reinterpret_cast<SharedMem::KSfSmemBufferPlain const&>(kSf);
                   uint32_t const tokenColumn = m * mnExK + i;
                   uint32_t const page = tokenColumn / 2;
                   uint32_t const half = tokenColumn % 2;
-                  uint32_t const token =
-                      page * tokensPerPage + half * 8 + laneId() / 4;
+                  uint32_t const token = page * tokensPerPage + half * 8 + laneId() / 4;
                   auto const scale = kSfPlain(token, s);
                   InputElem const convertedScale = InputElem(scale);
                   sf = reinterpret_cast<uint16_t const&>(convertedScale);
                 }
 #if IS_PACKED_4BIT_KV_CACHE
                 else {
-                  uint32_t const sfPacked =
-                      kSfSlice[s][m][n][i / 2][0];
+                  uint32_t const sfPacked = kSfSlice[s][m][n][i / 2][0];
                   sf = reinterpret_cast<uint16_t const*>(&sfPacked)[i % 2];
                 }
 #endif
@@ -1653,9 +1635,9 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                  mha::is_same_v<VElemType, int8_t> || mha::is_same_v<VElemType, __nv_fp8_e4m3>),
                 "not implemented");
 #else
-  static_assert(mha::is_same_v<VElemType, __nv_fp4_e2m1> ||
-                    mha::is_same_v<VElemType, __nv_fp8_e4m3>,
-                "block-scaled XQA supports E2M1 and E4M3 payloads");
+  static_assert(
+      mha::is_same_v<VElemType, __nv_fp4_e2m1> || mha::is_same_v<VElemType, __nv_fp8_e4m3>,
+      "block-scaled XQA supports E2M1 and E4M3 payloads");
 #endif
 
   constexpr uint32_t kEx = 2;
@@ -1669,7 +1651,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                                      SharedMem::VSmemBuffer::cols ==
                                  headElems);
   if (grpLoadV) {
-    assert(idxNSplit < gemm1WarpsPerGrp);
+    assert(idxNSplit < gemm1WarpsPerGrp * nbHeadSplits);
   } else {
     assert(idxNSplit == 0);
   }
@@ -1725,8 +1707,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
     constexpr uint32_t vSliceRows = nbInstInMatPerSliceInGemmKDim;
     uint32_t const rowBeg = 8 * kEx * nbInstInMatPerSliceInGemmKDim * s;
     Array2D<InstInMat<mnEx, kEx>, vSliceCols, vSliceRows> const vSliceOrig =
-        loadMatrix<mnEx, kEx, vSliceRows, vSliceCols, true, false, true,
-                   IS_PACKED_4BIT_KV_CACHE>(
+        loadMatrix<mnEx, kEx, vSliceRows, vSliceCols, true, false, true, IS_PACKED_4BIT_KV_CACHE>(
             warp, vt, rowBeg, mnEx * vSliceCols * idxNSplit);
 
     // Load and convert SFs for V.
@@ -1807,36 +1788,30 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                   if constexpr (mha::is_same_v<VElemType, __nv_fp4_e2m1>) {
                     // The unpacking ldmatrix atom already supplies FP4 in K
                     // conversion order.
-                    return convertKCacheWordToF16<InputElem, VElemType>(
-                        src.data[i][j]);
+                    return convertKCacheWordToF16<InputElem, VElemType>(src.data[i][j]);
                   } else {
                     // E4M3 retains the native XQA V-fragment permutation.
-                    return convertVCacheWordToF16<InputElem, VElemType>(
-                        src.data[i][j]);
+                    return convertVCacheWordToF16<InputElem, VElemType>(src.data[i][j]);
                   }
                 }();
-                if constexpr (mha::is_same_v<VElemType,
-                                             __nv_fp8_e4m3>) {
-                  auto const& vSfPlain = reinterpret_cast<
-                      SharedMem::VSfSmemBufferPlain const&>(vSf);
+                if constexpr (mha::is_same_v<VElemType, __nv_fp8_e4m3>) {
+                  auto const& vSfPlain =
+                      reinterpret_cast<SharedMem::VSfSmemBufferPlain const&>(vSf);
 #pragma unroll
                   for (uint32_t e = 0; e < cvtExpansion; ++e) {
                     uint32_t const outputColumn = m * mnExV + i * cvtExpansion + e;
                     uint32_t const scaleBlock =
-                        idxNSplit * exactDiv(warpTile.x, 16U) +
-                        outputColumn / 2;
+                        idxNSplit * exactDiv(warpTile.x, 16U) + outputColumn / 2;
                     uint32_t const tokenHalf = j;
-                    uint32_t const token0 =
-                        rowBeg + tokenHalf * 8 + (laneId() & 3U) * 2;
+                    uint32_t const token0 = rowBeg + tokenHalf * 8 + (laneId() & 3U) * 2;
                     uint32_t const token1 = token0 + 1;
                     InputElem const sf0 = InputElem(vSfPlain(token0, scaleBlock));
                     InputElem const sf1 = InputElem(vSfPlain(token1, scaleBlock));
                     uint32_t const sfPair =
                         uint32_t(reinterpret_cast<uint16_t const&>(sf0)) |
                         (uint32_t(reinterpret_cast<uint16_t const&>(sf1)) << 16);
-                    InputElem2 const scaled =
-                        reinterpret_cast<InputElem2 const&>(data[e]) *
-                        reinterpret_cast<InputElem2 const&>(sfPair);
+                    InputElem2 const scaled = reinterpret_cast<InputElem2 const&>(data[e]) *
+                                              reinterpret_cast<InputElem2 const&>(sfPair);
                     data[e] = reinterpret_cast<uint32_t const&>(scaled);
                   }
                 }
@@ -1844,20 +1819,17 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                 else {
                   // Apply the FP4 scale fragment assembled by the native
                   // unpacking path.
-                  InputElem2 scaledData0 =
-                      reinterpret_cast<InputElem2 const&>(data[0]) *
-                      reinterpret_cast<InputElem2&>(vSfSlice[m][n][i][0]);
-                  InputElem2 scaledData1 =
-                      reinterpret_cast<InputElem2 const&>(data[1]) *
-                      reinterpret_cast<InputElem2&>(vSfSlice[m][n][i][1]);
+                  InputElem2 scaledData0 = reinterpret_cast<InputElem2 const&>(data[0]) *
+                                           reinterpret_cast<InputElem2&>(vSfSlice[m][n][i][0]);
+                  InputElem2 scaledData1 = reinterpret_cast<InputElem2 const&>(data[1]) *
+                                           reinterpret_cast<InputElem2&>(vSfSlice[m][n][i][1]);
                   data[0] = reinterpret_cast<uint32_t&>(scaledData0);
                   data[1] = reinterpret_cast<uint32_t&>(scaledData1);
                 }
 #endif
 #pragma unroll
                 for (uint32_t e = 0; e < cvtExpansion; e++) {
-                  if constexpr (mha::is_same_v<VElemType,
-                                               __nv_fp4_e2m1>) {
+                  if constexpr (mha::is_same_v<VElemType, __nv_fp4_e2m1>) {
                     dst.data[i * cvtExpansion + j][e] = data[e];
                   } else {
                     dst.data[i * cvtExpansion + e][j] = data[e];
@@ -2185,8 +2157,7 @@ CUBIN_EXPORT __global__
   }
 #if ENABLE_MIXED_KV_CACHE
   if (ctaThrdId < gemm1NbWarpGrps * nbVBuffers) {
-    init(&smem.mixedVExpandBarriers[0][0] + ctaThrdId,
-         warp_size * gemm1WarpsPerGrp);
+    init(&smem.mixedVExpandBarriers[0][0] + ctaThrdId, warp_size * gemm1WarpsPerGrp);
   }
 #endif
 #endif
@@ -2346,12 +2317,12 @@ CUBIN_EXPORT __global__
   if (warpIdx.z == 0) {
 #if ENABLE_MIXED_KV_CACHE
     float const fp8KGlobalScale =
-        *cacheList.transport.formats[static_cast<uint8_t>(
-             flashinfer::KVPageFormat::kBlockScaledFP8)]
+        *cacheList.transport
+             .formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP8)]
              .k_global_scale;
     float const fp4KGlobalScale =
-        *cacheList.transport.formats[static_cast<uint8_t>(
-             flashinfer::KVPageFormat::kBlockScaledFP4)]
+        *cacheList.transport
+             .formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP4)]
              .k_global_scale;
 #endif
     float const qkScale =
@@ -2541,39 +2512,39 @@ CUBIN_EXPORT __global__
       }
       __syncwarp();
       if (kA16CopyFastPath && !needsExpansion && isFullTile) {
-        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
-                              grainBytes, grainBytesGmemCache, qkSwizzle, true>(
-            warp, dst, dstHeadOffset, src, idxPart);
+        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+                              grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
+                                                                    idxPart);
       } else if (kA16CopyFastPath && !needsExpansion) {
         uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
             (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
-        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead,
-                              grainBytes, grainBytesGmemCache, qkSwizzle, false>(
-            warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
+        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+                              grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
+                                                                     idxPart, nbHeadsAvail);
       } else if (isFullTile) {
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
-            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
-            idxHeadGrp, true, idxPart
+            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
+            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart
 #if MIXED_KV_PROBE_C
-            , warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
+            ,
+            warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
 #endif
-            );
+        );
       } else {
         uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
             (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
-            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
-            idxHeadGrp, true, idxPart, nbHeadsAvail
+            dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
+            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsAvail
 #if MIXED_KV_PROBE_C
-            , 0, &smem.probeScratch[warpIdx.x][0]
+            ,
+            0, &smem.probeScratch[warpIdx.x][0]
 #endif
-            );
+        );
       }
 #endif  // MIXED_HOISTED_COPY
 #else
@@ -2712,27 +2683,26 @@ CUBIN_EXPORT __global__
 #else
             if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
 #endif
-            // Tile origin ctaTile.x * seqIter + warpTile.x * warpIdx.x is page-aligned.
+              // Tile origin ctaTile.x * seqIter + warpTile.x * warpIdx.x is page-aligned.
 #if MIXED_BF16_PLACEMENT_EXPANSION
-            // [44]: the helper begins with __syncwarp() - the waitGroup<1> above completed
-            // this lane's copies only, and the scale word of a row was copied by another lane.
-            expandMixedPartialHeadsInPlaceBF16Placement<warpTile.x, nbPartsPerCacheKHead,
-                                                        qkSwizzle>(
-                smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0],
+              // [44]: the helper begins with __syncwarp() - the waitGroup<1> above completed
+              // this lane's copies only, and the scale word of a row was copied by another lane.
+              expandMixedPartialHeadsInPlaceBF16Placement<warpTile.x, nbPartsPerCacheKHead,
+                                                          qkSwizzle>(
+                  smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0],
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
-                0u,
+                  0u,
 #elif MIXED_HOISTED_COPY
-                kTagWordCurr,
+                  kTagWordCurr,
 #else
-                mixedPageTagsWord(smem.kFormats[warpIdx.x][idxCurrSMemKBuf]),
+                  mixedPageTagsWord(smem.kFormats[warpIdx.x][idxCurrSMemKBuf]),
 #endif
-                0, fp8KGlobalScale, fp4KGlobalScale);
+                  0, fp8KGlobalScale, fp4KGlobalScale);
 #else
-            expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead,
-                                           qkSwizzle>(
-                smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], 0,
-                smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, p, fp8KGlobalScale,
-                fp4KGlobalScale);
+              expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead, qkSwizzle>(
+                  smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], 0,
+                  smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, p, fp8KGlobalScale,
+                  fp4KGlobalScale);
 #endif
             }
           }
@@ -2752,27 +2722,25 @@ CUBIN_EXPORT __global__
           //                     }
           // #endif
           // do computation.
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_COMPACT_PAGES
           if constexpr (compactMixedPages) {
             if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
-              smemQKPartGemmMixed(
-                  warp, acc, smemQ, smemQOffset, smemKPart,
-                  smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
-                  &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p,
-                  fp8KGlobalScale, fp4KGlobalScale);
+              smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
+                                  smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
+                                  &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p,
+                                  fp8KGlobalScale, fp4KGlobalScale);
             } else {
               // Preserve the reference XQA A16 mainloop verbatim when the
               // router selected A16 for every page in this tile.
-              smemQKPartGemm<CacheElem>(warp, acc, smemQ, smemQOffset,
-                                        smemKPart);
+              smemQKPartGemm<CacheElem>(warp, acc, smemQ, smemQOffset, smemKPart);
             }
           } else
 #endif
           {
             smemQKPartGemm<KElemType>(warp, acc, smemQ, smemQOffset, smemKPart
 #if ENABLE_4BIT_KV_CACHE
-                                    ,
-                                    smemKSfPart
+                                      ,
+                                      smemKSfPart
 #endif
             );
           }
@@ -2889,12 +2857,12 @@ CUBIN_EXPORT __global__
     assert(warpIdx.z == 1);
 #if ENABLE_MIXED_KV_CACHE
     float const fp8VGlobalScale =
-        *cacheList.transport.formats[static_cast<uint8_t>(
-             flashinfer::KVPageFormat::kBlockScaledFP8)]
+        *cacheList.transport
+             .formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP8)]
              .v_global_scale;
     float const fp4VGlobalScale =
-        *cacheList.transport.formats[static_cast<uint8_t>(
-             flashinfer::KVPageFormat::kBlockScaledFP4)]
+        *cacheList.transport
+             .formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP4)]
              .v_global_scale;
 #endif
 #if CTA_ROW_MAX_BACKWARD_METHOD == 3
@@ -2967,8 +2935,7 @@ CUBIN_EXPORT __global__
 #if MIXED_COMPACT_TILE_LOOPS
       // [45f]: see the K loader.
       unused(idxBeam);
-      pageIdxNext =
-          getPageUngated<VCachePageIndices::size>(cacheList, idxReq, idxPageBeg, nbPages);
+      pageIdxNext = getPageUngated<VCachePageIndices::size>(cacheList, idxReq, idxPageBeg, nbPages);
 #else
       pageIdxNext =
           getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
@@ -2987,6 +2954,20 @@ CUBIN_EXPORT __global__
           grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages);
 #endif
     };
+    auto nextStep = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter, uint32_t idxBeam) {
+      uint32_t vIterNext, isNextBeam;
+      mha::tie(vIterNext, isNextBeam) = carryLE<nbVItersPerXIter>(vIter + 1, 0);
+
+      uint32_t idxBeamNext, xIterNext, nNextBias;
+      mha::tie(idxBeamNext, xIterNext, nNextBias) =
+          isConvergedTile(seqIter)
+              ? carryLE<1, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0)
+              : carryLE<beamWidth, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0);
+
+      uint32_t const seqIterNext = seqIter + seqStrideIters * nNextBias;
+      return mha::tuple<uint32_t, uint32_t, uint32_t, uint32_t>(seqIterNext, xIterNext, vIterNext,
+                                                                idxBeamNext);
+    };
     uint32_t idxPageBeg =
         nbPagesPerCtaTile * seqIterInit + cacheVTileSeqLen * warpGrpIdx / tokensPerPage;
     // Advance the V page window after the V tile (seqIter, xIter, vIter, idxBeam)
@@ -2995,7 +2976,7 @@ CUBIN_EXPORT __global__
                              uint32_t idxBeam) mutable -> bool {
       constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
       if constexpr (xIterSeqStride <= tokensPerPage) {
-        uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
+        uint32_t const nbXItersPerPage = divUp(tokensPerPage, xIterSeqStride);
         assert(nbXItersPerPage <= nbXItersPerCtaTile);
         if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1 &&
             (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
@@ -3010,6 +2991,30 @@ CUBIN_EXPORT __global__
           return true;
         }
         return false;
+      } else if constexpr (cacheVTileSeqStride % tokensPerPage != 0) {
+        uint32_t seqIterNext, xIterNext, vIterNext, idxBeamNext;
+        mha::tie(seqIterNext, xIterNext, vIterNext, idxBeamNext) =
+            nextStep(seqIter, xIter, vIter, idxBeam);
+        unused(idxBeamNext);
+        uint32_t const seqOffsetNext =
+            ctaTile.x * seqIterNext + warpTile.x * nbXTilesPerXIter * xIterNext +
+            cacheVTileSeqStride * vIterNext + cacheVTileSeqLen * warpGrpIdx;
+#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1
+        uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
+                                   cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
+        if (seqOffsetNext / tokensPerPage == seqOffset / tokensPerPage) {
+          return false;
+        }
+        // idxPageBeg already names the prefetched window. Advance that window,
+        // including the interleaved split-KV jump, only when this tile crosses a page.
+        idxPageBeg += idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
+                          ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + 1
+                          : 1;
+#else
+        idxPageBeg = seqOffsetNext / tokensPerPage;
+#endif
+        loadPages(idxPageBeg);
+        return true;
       } else {
         constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
         bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
@@ -3030,20 +3035,7 @@ CUBIN_EXPORT __global__
       }
     };
     loadPages(idxPageBeg);
-    auto nextStep = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter, uint32_t idxBeam) {
-      uint32_t vIterNext, isNextBeam;
-      mha::tie(vIterNext, isNextBeam) = carryLE<nbVItersPerXIter>(vIter + 1, 0);
 
-      uint32_t idxBeamNext, xIterNext, nNextBias;
-      mha::tie(idxBeamNext, xIterNext, nNextBias) =
-          isConvergedTile(seqIter)
-              ? carryLE<1, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0)
-              : carryLE<beamWidth, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0);
-
-      uint32_t const seqIterNext = seqIter + seqStrideIters * nNextBias;
-      return mha::tuple<uint32_t, uint32_t, uint32_t, uint32_t>(seqIterNext, xIterNext, vIterNext,
-                                                                idxBeamNext);
-    };
 #if BEAM_WIDTH == 1 && ENABLE_MIXED_KV_CACHE
     {
       // Prime the two-deep prefetch: step the V iteration state forward until the
@@ -3079,10 +3071,9 @@ CUBIN_EXPORT __global__
       // broadcast, no lane-0 stores, no __syncwarp; static modules carry no tag at all, the
       // dynamic module packs pageTagLane into tagWord (copy) = vTagWordNext (expansion, one V
       // iteration later, rotated at idxCurrSMemVBuf++).
-      static_assert(ctaTile.x % tokensPerPage == 0 &&
-                    (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
-                    cacheVTileSeqStride % tokensPerPage == 0 &&
-                    cacheVTileSeqLen % tokensPerPage == 0);
+      static_assert(
+          ctaTile.x % tokensPerPage == 0 && (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
+          cacheVTileSeqStride % tokensPerPage == 0 && cacheVTileSeqLen % tokensPerPage == 0);
       assert(tokenOffset == 0);
 #if MIXED_PAGE_STATIC_FORMAT >= 0
       constexpr uint32_t tagWord = 0;  // static modules: the copy ignores the word
@@ -3093,17 +3084,13 @@ CUBIN_EXPORT __global__
 #elif ENABLE_MIXED_KV_CACHE
       auto const pageFormats = broadcastMixedPageTags<nbPagesPerVTile>(pageTagLane);
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
-      // Page-aligned V tile origin (see loadKTilePart): no token offset for the helpers.
+      // Sub-page V tiles retain the physical token offset in payload and scale loads.
       static_assert(ctaTile.x % tokensPerPage == 0 &&
-                    (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
-                    cacheVTileSeqStride % tokensPerPage == 0 &&
-                    cacheVTileSeqLen % tokensPerPage == 0);
-      assert(tokenOffset == 0);
+                    (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0);
+      static_assert(tokensPerPage % cacheVTileSeqLen == 0 || cacheVTileSeqLen % tokensPerPage == 0);
       if (laneId() == 0) {
-        smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] =
-            needsExpansion;
-        smem.vFormats[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] =
-            pageFormats;
+        smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] = needsExpansion;
+        smem.vFormats[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] = pageFormats;
       }
       __syncwarp();
 #endif
@@ -3152,20 +3139,16 @@ CUBIN_EXPORT __global__
                      : 0U);  // may also be full but it can be handled correctly anyway
 #if ENABLE_MIXED_KV_CACHE
       if (kA16CopyFastPath && !needsExpansion) {
-        copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp,
-                       grainBytes, grainBytesGmemCache, vSwizzle, false>(
-            warpIdxInGrp, dst, src, nbHeadsAvail);
+        copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
+                       grainBytesGmemCache, vSwizzle, false>(warpIdxInGrp, dst, src, nbHeadsAvail);
       } else {
-        constexpr uint32_t headsPerWarp =
-            exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp);
+        constexpr uint32_t headsPerWarp = exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp);
         uint32_t const sourceHeadOffset = headsPerWarp * warpIdxInGrp;
         uint32_t const warpHeadsAvail =
             sourceHeadOffset < nbHeadsAvail ? nbHeadsAvail - sourceHeadOffset : 0U;
-        copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false,
-                                   compactMixedPages>(
-            dst, getSmemVScales(idxNextSMemVBuf),
-            sourceHeadOffset, cacheList.transport, pageIdx, pageFormats,
-            sourceHeadOffset, idxHeadGrp, false, 0,
+        copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false, compactMixedPages>(
+            dst, getSmemVScales(idxNextSMemVBuf), sourceHeadOffset, cacheList.transport, pageIdx,
+            pageFormats, tokenOffset + sourceHeadOffset, idxHeadGrp, false, 0,
             mha::min(warpHeadsAvail, headsPerWarp));
       }
 #else
@@ -3191,8 +3174,8 @@ CUBIN_EXPORT __global__
       // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
       unused(dstHeadOffset);
       copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
-          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, tagWord,
-          idxHeadGrp, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, tagWord, idxHeadGrp,
+          warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
                     "a16 static module: every page is A16, the stock A16 copy is the only body");
@@ -3203,22 +3186,18 @@ CUBIN_EXPORT __global__
 #endif
 #else
       if (kA16CopyFastPath && !needsExpansion && isFullTile) {
-        copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
-                              gemm1WarpsPerGrp, grainBytes, grainBytesGmemCache,
-                              vSwizzle, true>(warp, dst, dstHeadOffset, src,
-                                              warpIdxInGrp);
+        copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
+                              grainBytesGmemCache, vSwizzle, true>(warp, dst, dstHeadOffset, src,
+                                                                   warpIdxInGrp);
       } else if (kA16CopyFastPath && !needsExpansion) {
-        copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen,
-                              gemm1WarpsPerGrp, grainBytes, grainBytesGmemCache,
-                              vSwizzle, false>(
-            warp, dst, dstHeadOffset, src, warpIdxInGrp,
-            mha::min(nbHeadsAvail, cacheVTileSeqLen));
+        copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
+                              grainBytesGmemCache, vSwizzle, false>(
+            warp, dst, dstHeadOffset, src, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
       } else {
-        copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp,
-                                   vSwizzle, false, compactMixedPages>(
-            dst, getSmemVScales(idxNextSMemVBuf),
-            dstHeadOffset, cacheList.transport, pageIdx, pageFormats, 0,
-            idxHeadGrp, false, warpIdxInGrp,
+        copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false,
+                                   compactMixedPages>(
+            dst, getSmemVScales(idxNextSMemVBuf), dstHeadOffset, cacheList.transport, pageIdx,
+            pageFormats, tokenOffset, idxHeadGrp, false, warpIdxInGrp,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       }
 #endif  // MIXED_HOISTED_COPY
@@ -3309,8 +3288,8 @@ CUBIN_EXPORT __global__
     globalRowMax.fill(safeInitRowMax);
     ThrdRegRowMax globalRowSum;
     globalRowSum.fill(0);
-    // the accumulator
-    WarpAcc acc{};
+    // the accumulators, one per head-dim slice owned by this warp
+    Vec<WarpAcc, nbHeadSplits> accs{};
     if (grpLoadV) {
       unused(pWarpGrpBar->arrive());
     }
@@ -3431,7 +3410,10 @@ CUBIN_EXPORT __global__
                   ThrdRegRowMax const accRowScales = expf(globalRowMaxOld - globalRowMax);
                   globalRowSum = globalRowSum * accRowScales;
                   // @fixme: when tmpAcc is used, this can be delayed.
-                  rescaleAcc(warp, acc, accRowNeedRescaleMask, accRowScales);
+#pragma unroll
+                  for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+                    rescaleAcc(warp, accs[hs], accRowNeedRescaleMask, accRowScales);
+                  }
                 }
                 if (!enableMicroFastPath || !skipXRowRescale) {
                   xRowScales = skipXRowRescale ? xRowScales : expf(xTileRowMax - globalRowMax);
@@ -3463,48 +3445,44 @@ CUBIN_EXPORT __global__
 #endif
             if constexpr (!compactMixedPages) {
               if (needsExpansion) {
-              // The V tile origin is page-aligned (static_assert in loadVTilePart).
-              if constexpr (grpLoadV) {
-                constexpr uint32_t headsPerWarp =
-                    exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp);
-                uint32_t const sourceHeadOffset = headsPerWarp * warpIdxInGrp;
-                expandMixedPartialHeadsInPlace<headsPerWarp, 1, true>(
-                    smemVTile,
-                    getSmemVScales(idxCurrSMemVBuf),
-                    sourceHeadOffset,
-                    smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    sourceHeadOffset, 0, fp8VGlobalScale, fp4VGlobalScale);
-              } else {
+                uint32_t const tokenOffset =
+                    (ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
+                     cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx) %
+                    tokensPerPage;
+                if constexpr (grpLoadV) {
+                  constexpr uint32_t headsPerWarp = exactDiv(cacheVTileSeqLen, gemm1WarpsPerGrp);
+                  uint32_t const sourceHeadOffset = headsPerWarp * warpIdxInGrp;
+                  expandMixedPartialHeadsInPlace<headsPerWarp, 1, true>(
+                      smemVTile, getSmemVScales(idxCurrSMemVBuf), sourceHeadOffset,
+                      smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
+                      tokenOffset + sourceHeadOffset, 0, fp8VGlobalScale, fp4VGlobalScale);
+                } else {
 #if MIXED_BF16_PLACEMENT_EXPANSION
-                // [44]: helper begins with __syncwarp() after this warp's syncVTileLoad
-                // (waitGroup<nbVBuffers - 1>, per-thread completion) - see the K site.
-                expandMixedPartialHeadsInPlaceBF16Placement<cacheVTileSeqLen,
-                                                            gemm1WarpsPerGrp, true>(
-                    smemVTile, getSmemVScales(idxCurrSMemVBuf),
+                  // [44]: helper begins with __syncwarp() after this warp's syncVTileLoad
+                  // (waitGroup<nbVBuffers - 1>, per-thread completion) - see the K site.
+                  expandMixedPartialHeadsInPlaceBF16Placement<cacheVTileSeqLen, gemm1WarpsPerGrp,
+                                                              true>(
+                      smemVTile, getSmemVScales(idxCurrSMemVBuf),
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
-                    0u,
+                      0u,
 #elif MIXED_HOISTED_COPY
-                    vTagWordCurr,
+                      vTagWordCurr,
 #else
-                    mixedPageTagsWord(smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf]),
+                      mixedPageTagsWord(smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf]),
 #endif
-                    0, fp8VGlobalScale, fp4VGlobalScale);
+                      0, fp8VGlobalScale, fp4VGlobalScale);
 #else
-                expandMixedPartialHeadsInPlace<cacheVTileSeqLen,
-                                               gemm1WarpsPerGrp, true>(
-                    smemVTile,
-                    getSmemVScales(idxCurrSMemVBuf),
-                    0,
-                    smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    0, warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
+                  expandMixedPartialHeadsInPlace<cacheVTileSeqLen, gemm1WarpsPerGrp, true>(
+                      smemVTile, getSmemVScales(idxCurrSMemVBuf), 0,
+                      smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], tokenOffset,
+                      warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
 #endif
-              }
+                }
 #if GRP_LOAD_V
-              auto& mixedVExpandBar =
-                  smem.mixedVExpandBarriers[warpGrpIdx][idxCurrSMemVBuf];
-              unused(mixedVExpandBar.arrive());
-              mixedVExpandBar.wait_parity((mixedVExpandParity >> uint32_t(idxCurrSMemVBuf)) & 1U);
-              mixedVExpandParity ^= (1U << uint32_t(idxCurrSMemVBuf));
+                auto& mixedVExpandBar = smem.mixedVExpandBarriers[warpGrpIdx][idxCurrSMemVBuf];
+                unused(mixedVExpandBar.arrive());
+                mixedVExpandBar.wait_parity((mixedVExpandParity >> uint32_t(idxCurrSMemVBuf)) & 1U);
+                mixedVExpandParity ^= (1U << uint32_t(idxCurrSMemVBuf));
 #endif
               }
             }
@@ -3513,48 +3491,50 @@ CUBIN_EXPORT __global__
             auto const& smemVSfPart = getSmemVSfTile(idxCurrSMemVBuf);
 #endif
 
-            // do computation from shared memory X and V tiles
+            // do computation from shared memory X and V tiles. With nbHeadSplits > 1
+            // (headElems > 256), each warp computes multiple head-dim slices from the
+            // group-shared full-head V tile.
+#pragma unroll
+            for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+              WarpAcc& acc = accs[hs];
+              uint32_t const idxNSplit = grpLoadV ? (warpIdxInGrp + gemm1WarpsPerGrp * hs) : 0;
 #if BEAM_WIDTH == 1
-#if ENABLE_MIXED_KV_CACHE
-            if constexpr (compactMixedPages) {
-              if (needsExpansion) {
-                smemXVPartGemmMixed(
-                    warp, acc, skipXRowRescale, xRowNeedRescaleMask,
-                    xRowScales, smemXTile, idxVTile, smemVTile,
-                    smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp]
-                                 [idxCurrSMemVBuf][0][0],
-                    warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale);
-              } else {
-                // A16 pages retain FlashInfer's original consumer and its
-                // established ldmatrix/MMA register footprint.
-                smemXVPartGemm<CacheElem>(
-                    warp, acc, skipXRowRescale, xRowNeedRescaleMask,
-                    xRowScales, smemXTile, idxVTile, smemVTile,
-                    grpLoadV ? warpIdxInGrp : 0);
+#if ENABLE_MIXED_COMPACT_PAGES
+              if constexpr (compactMixedPages) {
+                if (needsExpansion) {
+                  smemXVPartGemmMixed(
+                      warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile,
+                      idxVTile, smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
+                      &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
+                      idxNSplit, fp8VGlobalScale, fp4VGlobalScale);
+                } else {
+                  // A16 pages retain FlashInfer's original consumer and its
+                  // established ldmatrix/MMA register footprint.
+                  smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask,
+                                            xRowScales, smemXTile, idxVTile, smemVTile, idxNSplit);
+                }
+              } else
+#endif
+              {
+                smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask,
+                                          xRowScales, smemXTile, idxVTile, smemVTile,
+#if ENABLE_4BIT_KV_CACHE
+                                          smemVSfPart,
+#endif
+                                          idxNSplit);
               }
-            } else
-#endif
-            {
-              smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale,
-                                      xRowNeedRescaleMask, xRowScales,
-                                      smemXTile, idxVTile, smemVTile,
-#if ENABLE_4BIT_KV_CACHE
-                                      smemVSfPart,
-#endif
-                                      grpLoadV ? warpIdxInGrp : 0);
-            }
 #else
-            WarpAcc tmpAcc{};
-            smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
-                                      xRowScales, smemXTile, idxVTile, smemVTile,
+              WarpAcc tmpAcc{};
+              smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
+                                        xRowScales, smemXTile, idxVTile, smemVTile,
 #if ENABLE_4BIT_KV_CACHE
-                                      smemVSfPart,
+                                        smemVSfPart,
 #endif
-                                      grpLoadV ? warpIdxInGrp : 0);
-            pickAccRowsForBeamSearch(warp, acc, tmpAcc, isConvergedTile(seqIter), idxBeam,
-                                     [](float& d, float s) { d += s; });
+                                        idxNSplit);
+              pickAccRowsForBeamSearch(warp, accs[hs], tmpAcc, isConvergedTile(seqIter), idxBeam,
+                                       [](float& d, float s) { d += s; });
 #endif
+            }
             if (grpLoadV) {
               unused(pWarpGrpBar->arrive());
             }
@@ -3598,7 +3578,10 @@ CUBIN_EXPORT __global__
         auto const globalRowMaxNew = fmaxf(globalRowMax, otherRowMax);
         auto const scaleForThis = expf(globalRowMax - globalRowMaxNew);
         auto const scaleForOther = expf(otherRowMax - globalRowMaxNew);
-        rescaleAcc(warp, acc, fullRescaleMask, scaleForThis);
+#pragma unroll
+        for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+          rescaleAcc(warp, accs[hs], fullRescaleMask, scaleForThis);
+        }
         globalRowSum = globalRowSum * scaleForThis + otherRowSum * scaleForOther;
         globalRowMax = globalRowMaxNew;
       }
@@ -3621,9 +3604,11 @@ CUBIN_EXPORT __global__
 #if LOW_PREC_OUTPUT
       voScale *= rcpOutScale;
 #endif
-      rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        rescaleAcc(warp, accs[hs], fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+      }
     }
-    GemmOutRegTile const outTile = toFp16(acc);
 
     auto mergeAndSaveOutTile = [&](GemmOutRegTile const& tile, bool reorder) {
       if constexpr (gemm1NbWarpGrps == 1) {
@@ -3656,11 +3641,30 @@ CUBIN_EXPORT __global__
 #else
     bool reorderOutRows = inputElemSize == 2 && cacheElemSize == 1;
 #endif
-    SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
-    // In multi-block mode only the last CTA writes the merged output; the other
-    // sub-sequences only contribute their partials via global scratch below.
-    bool ctaShouldWriteOut = !isMultiBlock;
-    if (isMultiBlock) {
+    // Writes one head-dim slice (warpTile.x elems) of the output from the swizzled smem tile.
+    auto writeOutSlice = [&](SharedMem::XSmemBuffer const& smemOutTile, uint32_t hs) {
+      uint32_t const dstColOffset = warpTile.x * (warpIdxInGrp + gemm1WarpsPerGrp * hs);
+#if SPEC_DEC
+      copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
+                            (idxHeadGrp * headGrpSize), nbValidHeadTokens,
+                            uint2{dstColOffset, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
+                            smemOutTile);
+#else
+      copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
+                            uint2{dstColOffset, nbValidRows * warpIdx.y}, smemOutTile);
+#endif
+    };
+    if (!isMultiBlock) {
+      // The swizzle buffer is reused across splits; the __syncthreads() at the start of
+      // mergeAndSaveOutTile separates one split's global write from the next split's store.
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(toFp16(accs[hs]), reorderOutRows);
+        if (warpGrpIdx == 0) {
+          writeOutSlice(*smemOutTile, hs);
+        }
+      }
+    } else {
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
@@ -3688,12 +3692,18 @@ CUBIN_EXPORT __global__
         rowSumBuffers[idxBuf].storeFromReg<false>(warp, globalRowSum);
       }
       using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
-      TinyPtr<Vec<ScratchBuf, gemm1WarpsPerGrp>> const scratchBuffers =
-          segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeq);
-      // copy output to scratch
-      copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
-          warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
-      __syncthreads();
+      constexpr uint32_t nbHeadSlices = gemm1WarpsPerGrp * nbHeadSplits;
+      TinyPtr<Vec<ScratchBuf, nbHeadSlices>> const scratchBuffers =
+          segmenter.newSeg<Vec<ScratchBuf, nbHeadSlices>>(nbSubSeq);
+      // copy output to scratch, one head-dim slice at a time
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(toFp16(accs[hs]), reorderOutRows);
+        copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
+            warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0),
+            &(*smemOutTile)(0, 0));
+        __syncthreads();
+      }
 #if __CUDA_ARCH__ == 1210
       // GB10 (sm121): device-scope release so the partials just written to global
       // scratch are visible to the last CTA (a different block) before the
@@ -3733,7 +3743,6 @@ CUBIN_EXPORT __global__
 
       // merge if we are the last CTA.
       bool const isLastCta = mbsmem.isLastCta;
-      ctaShouldWriteOut = isLastCta;
       if (isLastCta) {
         MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
         SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
@@ -3750,13 +3759,14 @@ CUBIN_EXPORT __global__
         auto getTileBuf = [&](auto& buffers, uint32_t d) -> decltype(buffers[0][0][0])& {
           return buffers[warpGrpIdx][warpIdxInGrp][d];
         };
-        auto loadBufAsync = [&](uint32_t n) {
+        auto loadBufAsync = [&](uint32_t n, uint32_t hs) {
           uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
           SharedMem::XSmemBuffer& dstTile = getTileBuf(mbbuf.tiles, d);
           SMemWarpRowMax& dstRowSum = getTileBuf(mbbuf.tileRowSums, d);
           SMemWarpRowMax& dstRowMax = getTileBuf(mbbuf.tileRowMax, d);
           copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(
-              0, &dstTile(0, 0), &scratchBuffers[idxBufBase + n][warpIdxInGrp](0, 0));
+              0, &dstTile(0, 0),
+              &scratchBuffers[idxBufBase + n][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0));
           constexpr uint32_t nbGrainsPerRowMaxBuf = exactDiv(sizeof(SMemWarpRowMax), grainBytes);
           copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
               0, reinterpret_cast<LdGrain*>(&dstRowSum),
@@ -3767,73 +3777,74 @@ CUBIN_EXPORT __global__
               reinterpret_cast<LdGrain const*>(&rowMaxBuffers[idxBufBase + n]),
               nbGrainsPerRowMaxBuf);
         };
-        loadBufAsync(warpGrpIdx);
-        ldgsts::commitGroup();
-        WarpAcc sumAcc{};
-        ThrdRegRowMax partialMergedRowSum{};
-        for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
-          if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
-            loadBufAsync(n + gemm1NbWarpGrps);
-          }
+        // Merge one head-dim slice at a time. mergedRowSum is recomputed per slice from
+        // per-subseq scalars; the value is identical across slices. The smem regions used
+        // by mbbuf tiles and the mergeAndSaveOutTile swizzle buffer are ordered by the
+        // __syncthreads() calls inside this loop and in mergeAndSaveOutTile.
+        for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+          loadBufAsync(warpGrpIdx, hs);
           ldgsts::commitGroup();
-          ldgsts::waitGroup<1>();
-          uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
-          WarpAcc tile = toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
-          ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowSum = getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
-          ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
-          partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
-          assert(std::isfinite(partialMergedRowSum[0]));
-          rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
-          sumAcc = sumAcc + tile;
-        }
-
-        ThrdRegRowMax mergedRowSum{};
-        if (gemm1NbWarpGrps == 1) {
-          mergedRowSum = partialMergedRowSum;
-        } else {
-          if (warpIdxInGrp == 0) {
-            mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+          WarpAcc sumAcc{};
+          ThrdRegRowMax partialMergedRowSum{};
+          for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
+            if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
+              loadBufAsync(n + gemm1NbWarpGrps, hs);
+            }
+            ldgsts::commitGroup();
+            ldgsts::waitGroup<1>();
+            uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+            WarpAcc tile =
+                toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
+            ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowSum =
+                getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
+            ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
+            partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
+            assert(std::isfinite(partialMergedRowSum[0]));
+            rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
+            sumAcc = sumAcc + tile;
           }
-          __syncthreads();
+
+          ThrdRegRowMax mergedRowSum{};
+          if (gemm1NbWarpGrps == 1) {
+            mergedRowSum = partialMergedRowSum;
+          } else {
+            if (warpIdxInGrp == 0) {
+              mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+            }
+            __syncthreads();
 #ifndef NDEBUG
-          assert((mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
-          __syncthreads();
+            assert(
+                (mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
+            __syncthreads();
 #endif
 #pragma unroll
-          for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
-            mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
-            assert(std::isfinite(mergedRowSum[0]));
+            for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
+              mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
+              assert(std::isfinite(mergedRowSum[0]));
+            }
           }
-        }
-        if (attentionSinks != nullptr) {
-          // Attention sinks are per head.
+          if (attentionSinks != nullptr) {
+            // Attention sinks are per head.
 #if SPEC_DEC
-          addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
-                                   attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+            addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
+                                     attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
 #else
-          addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+            addAttentionSinks(mergedRowSum, mergedRowMax,
+                              attentionSinks + headGrpSize * idxHeadGrp);
 #endif
+          }
+          __syncthreads();
+          rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
+          GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
+          SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
+          if (warpGrpIdx == 0) {
+            writeOutSlice(*smemOutTile, hs);
+          }
+          __syncthreads();
         }
-        __syncthreads();
-        rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
-        GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
-        smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
       }
-    }
-    if (ctaShouldWriteOut && warpGrpIdx == 0) {
-#if SPEC_DEC
-      copyOutputToGlobalMem(
-          warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize, (idxHeadGrp * headGrpSize),
-          nbValidHeadTokens,
-          uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
-          *smemOutTile);
-#else
-      copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
-                            uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y},
-                            *smemOutTile);
-#endif
     }
   }
 }
@@ -4006,9 +4017,8 @@ void launchMHA(
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
   dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(
-      dimGrid, dimCta, hostSmemSize, stream,
-      enable_pdl && !ENABLE_MIXED_KV_CACHE);
+  auto const launchCfg =
+      makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
 #if ENABLE_4BIT_KV_CACHE
@@ -4168,9 +4178,8 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
   dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(
-      dimGrid, dimCta, hostSmemSize, stream,
-      enable_pdl && !ENABLE_MIXED_KV_CACHE);
+  auto const launchCfg =
+      makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
 #if ENABLE_4BIT_KV_CACHE
