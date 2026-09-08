@@ -119,8 +119,8 @@ constexpr uint2 warpTile = {64, roundUp(nbValidRows, 16U)};
 static_assert(nbValidRows <= warpTile.y);
 
 // For headElems > warpTile.x * ctaShapeInWarps.x (i.e. 512), each gemm1 warp owns
-// nbHeadSplits head-dim slices of warpTile.x elems each (slice idx = warpIdxInGrp +
-// gemm1WarpsPerGrp * split), instead of requiring more warps than the CTA has.
+// nbHeadSplits head-dim slices of warpTile.x elems each, instead of requiring more
+// warps than the CTA has. vHeadSlice maps the group or private-buffer layout.
 constexpr uint32_t gemm1WarpsPerGrp = mha::min(exactDiv(headElems, warpTile.x), ctaShapeInWarps.x);
 constexpr uint32_t nbHeadSplits = exactDiv(headElems, warpTile.x* gemm1WarpsPerGrp);
 constexpr uint32_t gemm1NbWarpGrps =
@@ -221,8 +221,11 @@ constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPa
 // before the group's gemm1 reads the whole tile. A third buffer would only remove the wait, not the
 // protocol.
 constexpr bool grpLoadV = GRP_LOAD_V;
-// Multiple head-dim slices per warp require the group-shared full-head V buffer.
-static_assert(nbHeadSplits == 1 || grpLoadV);
+constexpr uint32_t warpVHeadElems = warpTile.x * nbHeadSplits;
+
+__device__ inline uint32_t vHeadSlice(uint32_t warp, uint32_t slice) {
+  return grpLoadV ? warp + gemm1WarpsPerGrp * slice : warp * nbHeadSplits + slice;
+}
 
 // [44] Track S step 6: the sm90 SPEC_DEC bf16 compact build expands compressed K/V blocks with
 // the bit-placement decode and the block scale folded with 2^k
@@ -448,21 +451,21 @@ struct alignas(128) SharedMem {
   using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kHeadPartBytes, grainBytes)>;
   using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
   using VSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
-                              exactDiv(grpLoadV ? headElems : warpTile.x, cacheElemsPerGrain)>;
+                              exactDiv(grpLoadV ? headElems : warpVHeadElems, cacheElemsPerGrain)>;
 
 #if ENABLE_4BIT_KV_CACHE
   using KSfSmemBuffer =
       Array2D<uint32_t, warpTile.x,
               exactDiv(kHeadPartBytes / CacheElemConverter::QuantVectorSize, grainBytesSf)>;
-  using VSfSmemBuffer =
-      Array2D<uint32_t, cacheVTileSeqLen,
-              exactDiv((grpLoadV ? headElems : warpTile.x) / CacheElemConverter::QuantVectorSize,
-                       grainBytesSf)>;
+  using VSfSmemBuffer = Array2D<uint32_t, cacheVTileSeqLen,
+                                exactDiv((grpLoadV ? headElems : warpVHeadElems) /
+                                             CacheElemConverter::QuantVectorSize,
+                                         grainBytesSf)>;
   using KSfSmemBufferPlain =
       Array2D<__nv_fp8_e4m3, warpTile.x, kHeadPartBytes / CacheElemConverter::QuantVectorSize>;
   using VSfSmemBufferPlain =
       Array2D<__nv_fp8_e4m3, cacheVTileSeqLen,
-              (grpLoadV ? headElems : warpTile.x) / CacheElemConverter::QuantVectorSize>;
+              (grpLoadV ? headElems : warpVHeadElems) / CacheElemConverter::QuantVectorSize>;
 #endif
 
   QSmemBuffer q[ctaShapeInWarps.y][nbQBuffers];
@@ -480,10 +483,12 @@ struct alignas(128) SharedMem {
   // The sm90 compact build ([43]) takes the 4 B stride (that 1,056 B is what lets the 128 B
   // K ring fit two CTAs); the other builds keep the 8 B layout byte-for-byte (sm120 fp4 q=1
   // measured +1.6 us with the shrunk layout, a smem-layout effect this step does not chase).
-  static constexpr uint32_t mixedVScaleBytes =
-      mha::max(4U, exactDiv(exactDiv(sizeof(PaddedCacheHead),
-                                     (kCompactTileLoops && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
-                            2 * grainBytes));
+  static constexpr uint32_t mixedVScaleBytes = mha::max(
+      4U,
+      exactDiv(
+          exactDiv(sizeof(PaddedCacheHead),
+                   ((kCompactTileLoops || nbHeadSplits > 1) && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
+          2 * grainBytes));
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
   MixedPageFormats<nbPagesPerVTile> vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
@@ -1696,14 +1701,14 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
   static_assert(SharedMem::XSmemBuffer::rows == 8 * InstAcc::rows * WarpAcc::rows);
   static_assert(grpLoadV || sizeof(SharedMem::VSmemBuffer::Elem) / cacheElemSize *
                                     SharedMem::VSmemBuffer::cols ==
-                                warpTile.x);
+                                warpVHeadElems);
   static_assert(!grpLoadV || sizeof(SharedMem::VSmemBuffer::Elem) / cacheElemSize *
                                      SharedMem::VSmemBuffer::cols ==
                                  headElems);
   if (grpLoadV) {
     assert(idxNSplit < gemm1WarpsPerGrp * nbHeadSplits);
   } else {
-    assert(idxNSplit == 0);
+    assert(idxNSplit < nbHeadSplits);
   }
   constexpr uint32_t gemmKSplit =
       exactDiv(SharedMem::VSmemBuffer::rows, 8 * kEx * nbInstInMatPerSliceInGemmKDim);
@@ -3566,7 +3571,7 @@ CUBIN_EXPORT __global__
 #pragma unroll
             for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
               WarpAcc& acc = accs[hs];
-              uint32_t const idxNSplit = grpLoadV ? (warpIdxInGrp + gemm1WarpsPerGrp * hs) : 0;
+              uint32_t const idxNSplit = grpLoadV ? vHeadSlice(warpIdxInGrp, hs) : hs;
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_COMPACT_PAGES
               if constexpr (compactMixedPages) {
@@ -3712,7 +3717,7 @@ CUBIN_EXPORT __global__
 #endif
     // Writes one head-dim slice (warpTile.x elems) of the output from the swizzled smem tile.
     auto writeOutSlice = [&](SharedMem::XSmemBuffer const& smemOutTile, uint32_t hs) {
-      uint32_t const dstColOffset = warpTile.x * (warpIdxInGrp + gemm1WarpsPerGrp * hs);
+      uint32_t const dstColOffset = warpTile.x * vHeadSlice(warpIdxInGrp, hs);
 #if SPEC_DEC
       copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
                             (idxHeadGrp * headGrpSize), nbValidHeadTokens,
@@ -3769,7 +3774,7 @@ CUBIN_EXPORT __global__
       for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
         SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(toFp16(accs[hs]), reorderOutRows);
         copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
-            warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0),
+            warpGrpIdx, &scratchBuffers[idxBuf][vHeadSlice(warpIdxInGrp, hs)](0, 0),
             &(*smemOutTile)(0, 0));
         __syncthreads();
       }
@@ -3835,7 +3840,7 @@ CUBIN_EXPORT __global__
           SMemWarpRowMax& dstRowMax = getTileBuf(mbbuf.tileRowMax, d);
           copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(
               0, &dstTile(0, 0),
-              &scratchBuffers[idxBufBase + n][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0));
+              &scratchBuffers[idxBufBase + n][vHeadSlice(warpIdxInGrp, hs)](0, 0));
           constexpr uint32_t nbGrainsPerRowMaxBuf = exactDiv(sizeof(SMemWarpRowMax), grainBytes);
           copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
               0, reinterpret_cast<LdGrain*>(&dstRowSum),

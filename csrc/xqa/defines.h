@@ -204,7 +204,11 @@ static_assert(CACHE_ELEM_ENUM != 0);
 // rows (one line request per token) instead of each fetching its own half row. The pure FP4
 // build (static format 2) is not request-bound on V and pays the group's per-tile syncs
 // (fp4 q=1 57.4 -> 71.7 us measured), so it keeps the per-warp loader; static A16 (0) too.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210) && \
+    CACHE_ELEM_ENUM == 5 && HEAD_ELEMS >= 256 && !SPEC_DEC && BEAM_WIDTH == 1
+// Wide heads retain each warp's contiguous column slices in its own V tile.
+#define GRP_LOAD_V 0
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
 #define GRP_LOAD_V                                                                              \
   ((CACHE_ELEM_ENUM != 0 && CACHE_ELEM_ENUM != 5) ||                                            \
    (CACHE_ELEM_ENUM == 5 && (MIXED_PAGE_STATIC_FORMAT == 1 || MIXED_PAGE_STATIC_FORMAT < 0)) || \

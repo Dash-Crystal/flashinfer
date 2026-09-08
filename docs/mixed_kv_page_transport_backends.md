@@ -3037,3 +3037,49 @@ with logs `/tmp/mixedkv-wtS7-{s0,base,s1,s1b,s1c,s2,s2b,s3}.log`, workspaces
 `/tmp/mixedkv-wtS7{,-c1..c5,-base,-base-li,-li}`, checkouts
 `/home/bigboi/dash-flashinfer-claude-wtS7{,-c1..c5,-base}`.  ws-1: `/tmp/mixedkv-wtS7{,-base}`,
 `/tmp/mixedkv-wtS7-{c,c2,c3,d}.log`, `/tmp/mixedkv-wtS7-b-{base,new}-q{1,4}-r{1,2,3}.json`.
+
+## September 8: wide-head decode integration in Gemma4 TP2
+
+The D512 integration had limited Track W's wide K parts to D128. `fb86a36e`
+restores that schedule for D256 with up to eight valid query rows, storing
+eight Q rows instead of sixteen and mapping unused MMA rows to stored rows.
+The group-V D256 module uses 98,688 bytes of shared memory on SM120.
+
+The per-warp V loader now supports multiple contiguous column slices per warp.
+`vHeadSlice` provides one mapping for output and multi-block scratch; the MMA
+loader indexes a local slice within the warp's V tile. SM120 mixed D256/D512
+decode uses this schedule, retaining the existing two buffers and original
+copy/scale/dequantization functions. This removes group-wide reuse and expansion
+barriers. D128, SM90 and continuation/prefill retain their existing policies.
+The D256/D512 modules use 100,224/94,976 bytes of shared memory, respectively.
+
+Validation ran complete W16/A16 Gemma4 12B TP2 servers on ws-1's two RTX 5090s,
+using the supervised persistent SVG REPL/video-labeling router. Samples from both
+widths and TP ranks contain all three formats; CPU attention over stored KV
+measures 0.140–0.256% relative RMS and zero output NaNs. This is consumer
+arithmetic error, not quantization error against original KV or sequence KL.
+
+The serving response retains joint moments separately for each captured padding
+shape. At counterfactual B64, 1K output and the `FULL/decode/padded:64` plan:
+
+| Input context | Group V | Private V, two campaigns | Native A16, private V |
+| --- | ---: | ---: | ---: |
+| 4K | 25.56 ms | 23.77–23.85 ms | 30.23 ms |
+| 8K | 34.04 ms | 30.35–30.51 ms | 44.73 ms |
+
+These are full-model-through-sampling response estimates from natural serving
+traffic, including output-context growth; no physical batch/context sweep was
+run. Longer contexts extrapolate the fitted marginal costs. Working statistical
+errors exclude model misspecification and temporal dependence. The estimates
+support approximately 7%/10–11% lower model latency from the V schedule at these
+coordinates, separately from compression's benefit over native A16. All runs
+include the same bounded producer integration; the A16 control explicitly uses
+router cosine thresholds of -2, and its page census confirms all A16.
+
+Evidence: ws-1 `/data/h3-runtime/mixed-kv-native-reuse-20260908/`, attempts
+35/38 (private V), 37 (group V), 36 (native A16), 34 (numerical samples).
+`metrics-after.prom` contains the replayable joint moments. Nsight Systems
+captures four complete-model executions with CUDA graph nodes and sampled device
+counters; these captures have different work shapes and are not direct kernel
+latency comparisons. The vLLM integration document contains the original D128
+receipt audit and the separate ordinary-FA4 comparison.
