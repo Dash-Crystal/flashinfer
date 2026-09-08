@@ -87,12 +87,17 @@ def test_cuda_page_seal_matches_direct_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("selected_format", [0, 1, 2])
+@pytest.mark.parametrize("heads, head_dim", [(2, 256), (4, 256), (1, 512)])
 def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
     selected_format: int,
+    heads: int,
+    head_dim: int,
 ) -> None:
     torch.manual_seed(79)
-    combined = torch.randn(4, 16, 2, 512, device="cuda", dtype=torch.bfloat16)
-    key, value = combined.split(256, dim=-1)
+    combined = torch.randn(
+        4, 16, heads, 2 * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    key, value = combined.split(head_dim, dim=-1)
     assert not key.is_contiguous()
     fp8_global_scale = torch.tensor(1.0 / 448.0, device="cuda")
     fp4_global_scale = torch.tensor(1.0 / 448.0, device="cuda")
@@ -103,11 +108,11 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
         torch.float8_e4m3fn
     )
     fp8_k_scales = torch.full(
-        (4, 16, 2, 16), 0x5A, device="cuda", dtype=torch.uint8
+        (4, 16, heads, head_dim // 16), 0x5A, device="cuda", dtype=torch.uint8
     )
     fp8_v_scales = torch.full_like(fp8_k_scales, 0x5A)
     fp4_k_payload = torch.full(
-        (4, 16, 2, 128), 0x5A, device="cuda", dtype=torch.uint8
+        (4, 16, heads, head_dim // 2), 0x5A, device="cuda", dtype=torch.uint8
     )
     fp4_v_payload = torch.full_like(fp4_k_payload, 0x5A)
     fp4_k_scales = torch.full_like(fp8_k_scales, 0x5A)
@@ -129,7 +134,6 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
         fp4_v_scales,
         torch.full((4,), 1, device="cuda", dtype=torch.uint8),
         torch.full((4, 2), torch.inf, device="cuda", dtype=torch.float32),
-        torch.empty((2, 16, 2, 4), device="cuda", dtype=torch.float32),
         torch.tensor(thresholds, device="cuda", dtype=torch.float32),
         fp8_global_scale,
         fp8_global_scale,
@@ -139,15 +143,26 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
     # Pages 0 and 1 complete. Page 2 is reused but remains partial.
     reused = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
     completed = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    seal_mixed_kv_pages_cuda(
-        key,
-        value,
-        reused,
-        torch.tensor(3, device="cuda", dtype=torch.int32),
-        completed,
-        torch.tensor(2, device="cuda", dtype=torch.int32),
-        cache,
-    )
+    reused_count = torch.tensor(3, device="cuda", dtype=torch.int32)
+    completed_count = torch.tensor(2, device="cuda", dtype=torch.int32)
+
+    def seal():
+        seal_mixed_kv_pages_cuda(
+            key,
+            value,
+            reused,
+            reused_count,
+            completed,
+            completed_count,
+            cache,
+        )
+
+    seal()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        seal()
+    graph.replay()
     torch.testing.assert_close(
         cache.page_format,
         torch.tensor(
@@ -184,19 +199,24 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
             ):
                 scale_values = scales.contiguous().view(torch.float8_e4m3fn).float()
                 denominator = fp8_global_scale * scale_values.repeat_interleave(16, -1)
-                expected = (source.float() / denominator).clamp(-448, 448).to(
-                    torch.float8_e4m3fn
+                expected = (
+                    (source.float() / denominator)
+                    .clamp(-448, 448)
+                    .to(torch.float8_e4m3fn)
                 )
                 torch.testing.assert_close(
-                    payload.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+                    payload.view(torch.uint8),
+                    expected.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
                 )
                 reconstructed = payload.float() * denominator
                 tensor_payload, tensor_scale = quantize_tensor_fp8_reference(source)
                 tensor_reconstructed = tensor_payload.float() * tensor_scale
                 block_residual = (reconstructed - source.float()).reshape(-1, 16).abs()
                 tensor_residual = (
-                    tensor_reconstructed - source.float()
-                ).reshape(-1, 16).abs()
+                    (tensor_reconstructed - source.float()).reshape(-1, 16).abs()
+                )
                 block_objective = (
                     block_residual.square().mean(-1)
                     + 0.05 * block_residual.amax(-1).square()
@@ -207,9 +227,7 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
                 ).mean()
                 assert block_objective <= tensor_objective
         elif selected_format == 2:
-            e2m1_magnitude = torch.tensor(
-                [0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda"
-            )
+            e2m1_magnitude = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
             for source, payload, scales in (
                 (key[page], cache.fp4_k_payload[page], cache.fp4_k_scales[page]),
                 (value[page], cache.fp4_v_payload[page], cache.fp4_v_scales[page]),
@@ -231,3 +249,31 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
     fp4_changed = (cache.fp4_k_payload[:2] != 0x5A).any()
     assert bool(fp8_changed) == (selected_format == 1)
     assert bool(fp4_changed) == (selected_format == 2)
+
+    # Counts, including empty replay, are authoritative; inactive entries are poison.
+    saved_formats = cache.page_format.clone()
+    saved_stats = cache.page_router_stats.clone()
+    reused.fill_(-100)
+    completed.fill_(-100)
+    reused_count.zero_()
+    completed_count.zero_()
+    graph.replay()
+    torch.testing.assert_close(cache.page_format, saved_formats)
+    torch.testing.assert_close(cache.page_router_stats, saved_stats)
+    reused[0] = 3
+    completed[0] = 3
+    reused_count.fill_(1)
+    completed_count.fill_(1)
+    graph.replay()
+    assert cache.page_format[3].item() == selected_format
+    assert torch.isfinite(cache.page_router_stats[3]).all()
+    key[3].zero_()
+    value[3].zero_()
+    graph.replay()
+    assert (cache.page_router_stats[3] == 0).all()
+    if selected_format == 1:
+        assert (cache.fp8_k_payload[3].view(torch.uint8) == 0).all()
+        assert (cache.fp8_k_scales[3] == 0).all()
+    elif selected_format == 2:
+        assert (cache.fp4_k_payload[3] == 0).all()
+        assert (cache.fp4_k_scales[3] == 0).all()

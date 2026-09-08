@@ -467,23 +467,44 @@ def xqa(
         expected_a16 = k_cache.shape
         expected_fp4 = (*expected_a16[:-1], expected_a16[-1] // 2)
         expected_scales = (*expected_a16[:-1], expected_a16[-1] // 16)
-        if page_transport.fp8_k_payload.shape != expected_a16 or page_transport.fp8_v_payload.shape != expected_a16:
+        if (
+            page_transport.fp8_k_payload.shape != expected_a16
+            or page_transport.fp8_v_payload.shape != expected_a16
+        ):
             raise ValueError("FP8 page payload pools must match the A16 cache shape")
-        if page_transport.fp4_k_payload.shape != expected_fp4 or page_transport.fp4_v_payload.shape != expected_fp4:
-            raise ValueError("FP4 page payload pools must pack two coefficients per byte")
+        if (
+            page_transport.fp4_k_payload.shape != expected_fp4
+            or page_transport.fp4_v_payload.shape != expected_fp4
+        ):
+            raise ValueError(
+                "FP4 page payload pools must pack two coefficients per byte"
+            )
         block_scales = (
             page_transport.fp8_k_scales,
             page_transport.fp8_v_scales,
             page_transport.fp4_k_scales,
             page_transport.fp4_v_scales,
         )
-        if any(x.shape != expected_scales or x.dtype != torch.uint8 for x in block_scales):
-            raise ValueError("each mixed-page block-scale pool must contain one E4M3 byte per 16 values")
-        if page_transport.fp8_k_payload.dtype != torch.float8_e4m3fn or page_transport.fp8_v_payload.dtype != torch.float8_e4m3fn:
+        if any(
+            x.shape != expected_scales or x.dtype != torch.uint8 for x in block_scales
+        ):
+            raise ValueError(
+                "each mixed-page block-scale pool must contain one E4M3 byte per 16 values"
+            )
+        if (
+            page_transport.fp8_k_payload.dtype != torch.float8_e4m3fn
+            or page_transport.fp8_v_payload.dtype != torch.float8_e4m3fn
+        ):
             raise TypeError("FP8 page payload pools must use float8_e4m3fn")
-        if page_transport.fp4_k_payload.dtype != torch.uint8 or page_transport.fp4_v_payload.dtype != torch.uint8:
+        if (
+            page_transport.fp4_k_payload.dtype != torch.uint8
+            or page_transport.fp4_v_payload.dtype != torch.uint8
+        ):
             raise TypeError("FP4 page payload pools must use packed uint8 storage")
-        if page_transport.page_format.dtype != torch.uint8 or page_transport.page_format.shape != (k_cache.shape[0],):
+        if (
+            page_transport.page_format.dtype != torch.uint8
+            or page_transport.page_format.shape != (k_cache.shape[0],)
+        ):
             raise ValueError("page_format must contain one uint8 tag per physical page")
         globals_ = (
             page_transport.fp8_k_global_scale,
@@ -505,7 +526,9 @@ def xqa(
         if any(x.device != q.device for x in transport_operands):
             raise ValueError("all mixed-page operands must be on the query device")
         if any(x.stride(-1) != 1 for x in transport_operands if x.dim() > 0):
-            raise ValueError("mixed-page payload and metadata inner dimensions must be contiguous")
+            raise ValueError(
+                "mixed-page payload and metadata inner dimensions must be contiguous"
+            )
 
     if output.dtype == torch.float8_e4m3fn:
         assert not mixed_page, "mixed-page XQA expands into A16 and requires A16 output"
@@ -535,12 +558,9 @@ def xqa(
                 fp4_k_scales=page_transport.fp4_k_scales.transpose(-3, -2),
                 fp4_v_scales=page_transport.fp4_v_scales.transpose(-3, -2),
             )
-    if (
-        get_compute_capability(torch.device(device="cuda"))[0] == 9
-        and (
-            (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
-            or (mixed_page and q_seq_len == 1)
-        )
+    if get_compute_capability(torch.device(device="cuda"))[0] == 9 and (
+        (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
+        or (mixed_page and q_seq_len == 1)
     ):
         run_sm90_fp8_mha = True
     else:
@@ -558,7 +578,9 @@ def xqa(
 
     # Large query spans share the runtime-width generic specialization.  Only
     # the small SM90 swap-AB case bakes the exact width into tile geometry.
-    module_q_seq_len = q_seq_len if swap_ab_eligible(q_seq_len, head_group_ratio) else 33
+    module_q_seq_len = (
+        q_seq_len if swap_ab_eligible(q_seq_len, head_group_ratio) else 33
+    )
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -583,9 +605,9 @@ def xqa(
             or use_sliding_window
             or swap_ab_eligible(q_seq_len, head_group_ratio)
         ):
-            # mha_sm90.cu rejects ragged Q and gets full draft masks wrong,
-            # both under sliding windows and in SWAP_AB. Causal masks can't
-            # be exempted without inspecting the device-side mask.
+            # SM90 still rejects ragged Q. Its shared bitmap consumer for
+            # sliding windows/SWAP_AB awaits GPU qualification; the targeted
+            # accumulator-layout test forces that source behind this gate.
             run_sm90_fp8_mha = False
 
     # Record the dispatch so a measurement can be attributed to the kernel

@@ -30,8 +30,12 @@ def make_transport(shape, mode: str, device: torch.device) -> MixedKVPagedCache:
     if mode == "mixed":
         page_format = (torch.arange(pages, device=device) % 3).to(torch.uint8)
     else:
-        page_format = torch.full((pages,), {"a16": 0, "fp8": 1, "fp4": 2}[mode],
-                                 dtype=torch.uint8, device=device)
+        page_format = torch.full(
+            (pages,),
+            {"a16": 0, "fp8": 1, "fp4": 2}[mode],
+            dtype=torch.uint8,
+            device=device,
+        )
     scalar = torch.ones((), dtype=torch.float32, device=device)
     # Zero payloads: finite values, no NaN hazards, same bytes moved as real data.
     return MixedKVPagedCache(
@@ -45,9 +49,11 @@ def make_transport(shape, mode: str, device: torch.device) -> MixedKVPagedCache:
         torch.full(scale_shape, 0x38, dtype=torch.uint8, device=device),
         page_format,
         torch.empty((pages, 2), dtype=torch.float32, device=device),
-        torch.empty((0, page_size, heads, 4), dtype=torch.float32, device=device),
         torch.empty(4, dtype=torch.float32, device=device),
-        scalar, scalar, scalar, scalar,
+        scalar,
+        scalar,
+        scalar,
+        scalar,
     )
 
 
@@ -65,7 +71,11 @@ def time_call(call, repeats: int, trials: int) -> dict[str, float]:
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1000 / repeats)
-    return {"median_us": statistics.median(samples), "min_us": min(samples), "max_us": max(samples)}
+    return {
+        "median_us": statistics.median(samples),
+        "min_us": min(samples),
+        "max_us": max(samples),
+    }
 
 
 def main() -> None:
@@ -82,9 +92,12 @@ def main() -> None:
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--q-lens", type=int, nargs="+", default=[1, 4, 64])
-    parser.add_argument("--modes", nargs="+",
-                        choices=("stock_a16", "transport_a16", "fp8", "fp4", "mixed"),
-                        default=("stock_a16", "transport_a16", "fp8", "fp4", "mixed"))
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("stock_a16", "transport_a16", "fp8", "fp4", "mixed"),
+        default=("stock_a16", "transport_a16", "fp8", "fp4", "mixed"),
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trials", type=int, default=15)
     args = parser.parse_args()
@@ -98,40 +111,67 @@ def main() -> None:
     shape = (pages, page_size, args.kv_heads, args.head_dim)
     k_cache = torch.zeros(shape, dtype=dtype, device=device)
     v_cache = torch.zeros(shape, dtype=dtype, device=device)
-    transports = {m: make_transport(shape, m, device) for m in ("a16", "fp8", "fp4", "mixed")}
-    kv_indptr = torch.arange(0, (args.batch_size + 1) * pages_per_request, pages_per_request,
-                             dtype=torch.int32, device=device)
+    transports = {
+        m: make_transport(shape, m, device) for m in ("a16", "fp8", "fp4", "mixed")
+    }
+    kv_indptr = torch.arange(
+        0,
+        (args.batch_size + 1) * pages_per_request,
+        pages_per_request,
+        dtype=torch.int32,
+        device=device,
+    )
     kv_indices = torch.arange(pages, dtype=torch.int32, device=device)
-    last_page_len = torch.full((args.batch_size,), page_size, dtype=torch.int32, device=device)
+    last_page_len = torch.full(
+        (args.batch_size,), page_size, dtype=torch.int32, device=device
+    )
     workspace = torch.empty(256 << 20, dtype=torch.uint8, device=device)
-    sm_scale = args.head_dim ** -0.5
+    sm_scale = args.head_dim**-0.5
     # One mixed module per static format (transport_a16 -> 0, fp8 -> 1, fp4 -> 2,
     # mixed -> dynamic); the URI names the format.
     static_of = {"transport_a16": 0, "fp8": 1, "fp4": 2, "mixed": None}
     jit_args_of = {
-        m: mixed_page_prefill_jit_args(dtype, dtype, dtype, args.head_dim, static_format=sf)
-        for m, sf in static_of.items() if m in args.modes
+        m: mixed_page_prefill_jit_args(
+            dtype, dtype, dtype, args.head_dim, static_format=sf
+        )
+        for m, sf in static_of.items()
+        if m in args.modes
     }
     for m, ja in jit_args_of.items():
         print(f"module {m}: {ja[0]} variant {ja[11]}", file=sys.stderr)
 
     results = []
     for q_len in args.q_lens:
-        qo_indptr = torch.arange(0, (args.batch_size + 1) * q_len, q_len, dtype=torch.int32,
-                                 device=device)
-        q = torch.randn(args.batch_size * q_len, heads_q, args.head_dim, dtype=dtype, device=device)
+        qo_indptr = torch.arange(
+            0, (args.batch_size + 1) * q_len, q_len, dtype=torch.int32, device=device
+        )
+        q = torch.randn(
+            args.batch_size * q_len, heads_q, args.head_dim, dtype=dtype, device=device
+        )
         causal = q_len > 1
 
         def plan(w):
-            w.plan(qo_indptr, kv_indptr, kv_indices, last_page_len, heads_q, args.kv_heads,
-                   args.head_dim, page_size, causal=causal, q_data_type=dtype, kv_data_type=dtype)
+            w.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                heads_q,
+                args.kv_heads,
+                args.head_dim,
+                page_size,
+                causal=causal,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+            )
 
         stock = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa3")
         plan(stock)
         mixed = {}
         for m, ja in jit_args_of.items():
-            mixed[m] = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa3",
-                                                           jit_args=ja)
+            mixed[m] = BatchPrefillWithPagedKVCacheWrapper(
+                workspace, "NHD", backend="fa3", jit_args=ja
+            )
             plan(mixed[m])
         for mode in args.modes:
             if mode == "stock_a16":
@@ -143,8 +183,10 @@ def main() -> None:
                 call = lambda: w.run(q, (k_cache, v_cache), *run_args)
             timing = time_call(call, args.repeats, args.trials)
             results.append({"q_len": q_len, "mode": mode, **timing})
-            print(f"q_len {q_len:4d} {mode:14s} median {timing['median_us']:9.2f} us",
-                  file=sys.stderr)
+            print(
+                f"q_len {q_len:4d} {mode:14s} median {timing['median_us']:9.2f} us",
+                file=sys.stderr,
+            )
     print(json.dumps({"results": results}, indent=2))
 
 

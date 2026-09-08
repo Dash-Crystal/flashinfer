@@ -17,6 +17,91 @@ def _pack_query_mask(batch_size: int, q_len: int, device: torch.device) -> torch
     return packed.expand(batch_size, -1, -1).contiguous().view(torch.uint16)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("q_len", [4, 40])
+@pytest.mark.parametrize("prefix,window", [(31, 0), (65, 17)])
+def test_sm90_accumulator_layouts_consume_supplied_masks(
+    monkeypatch, q_len, prefix, window
+):
+    """Both GMMA layouts honor noncausal draft bits and per-query window edges."""
+    import importlib
+    from types import SimpleNamespace
+
+    if get_compute_capability(torch.device("cuda"))[0] != 9:
+        pytest.skip("Hopper GMMA kernel required")
+    api = importlib.import_module("flashinfer.xqa")
+    get_module = api.get_xqa_module
+
+    # Exercise the corrected source behind the production qualification gate.
+    def sm90_module(*args, **kwargs):
+        module = get_module(*args, **kwargs)
+
+        def run(_selected_family, *operands):
+            return module.xqa(True, *operands)
+
+        return SimpleNamespace(uri=module.uri, xqa=run)
+
+    monkeypatch.setattr(api, "get_xqa_module", sm90_module)
+    device = torch.device("cuda")
+    length = prefix + q_len
+    batch, heads, kv_heads, dim, page = 2, 4, 1, 128, 16
+    pages = (length + page - 1) // page
+    torch.manual_seed(73)
+    key = torch.randn(
+        batch * pages, page, kv_heads, dim, device=device, dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    query = torch.randn(batch * q_len, heads, dim, device=device, dtype=key.dtype)
+    table = torch.arange(batch * pages, device=device, dtype=torch.int32).reshape(
+        batch, pages
+    )
+    lengths = torch.full((batch,), length, device=device, dtype=torch.int32)
+    words = (q_len + 31) // 32
+    q_rows = torch.arange(q_len, device=device)[:, None]
+    columns = torch.arange(words * 32, device=device)[None, :]
+    draft = (columns < q_len) & ((columns % 2 == 0) | (columns == q_rows))
+    bits = 1 << torch.arange(32, device=device, dtype=torch.int64)
+    packed = (
+        (draft.reshape(q_len, words, 32).to(torch.int64) * bits)
+        .sum(-1)
+        .to(torch.uint32)
+    )
+    packed = packed.expand(batch, -1, -1).contiguous().view(torch.uint16)
+    actual = xqa_batch_decode_with_kv_cache(
+        query,
+        (key, value),
+        torch.zeros(64 << 20, dtype=torch.uint8, device=device),
+        block_tables=table,
+        seq_lens=lengths,
+        max_seq_len=length,
+        bmm1_scale=dim**-0.5,
+        q_len_per_req=q_len,
+        mask=packed,
+        window_left=window - 1 if window else -1,
+        enable_pdl=False,
+    )
+    keep = torch.cat(
+        (torch.ones(q_len, prefix, device=device, dtype=torch.bool), draft[:, :q_len]),
+        -1,
+    )
+    if window:
+        keep &= (
+            torch.arange(length, device=device)[None, :] >= prefix + q_rows + 1 - window
+        )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.reshape(batch, q_len, heads, dim).transpose(1, 2).float(),
+        key.reshape(batch, pages * page, kv_heads, dim)[:, :length]
+        .transpose(1, 2)
+        .float(),
+        value.reshape(batch, pages * page, kv_heads, dim)[:, :length]
+        .transpose(1, 2)
+        .float(),
+        attn_mask=keep,
+        enable_gqa=True,
+    ).transpose(1, 2)
+    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
+
+
 def _decode_fp4(payload: torch.Tensor) -> torch.Tensor:
     low = payload & 0xF
     high = payload >> 4
@@ -68,6 +153,7 @@ def _make_transport(
         fp8_v = (torch.randn(shape, device=device) * 2).to(torch.float8_e4m3fn)
         scale_values = torch.tensor([0.5, 1.0, 2.0], device=device)
     else:
+
         def all_codes() -> torch.Tensor:
             # Uniform over the 254 finite E4M3 codes (NaN 0x7F / 0xFF remapped).
             codes = torch.randint(0, 256, shape, dtype=torch.int32, device=device)
@@ -116,11 +202,15 @@ def _make_transport(
         cycle = torch.tensor(format_cycles[page_mode], device=device, dtype=torch.uint8)
         page_format = cycle[torch.arange(num_pages, device=device) % len(cycle)]
     elif page_mode == "a16_fp8_runs":
-        page_format = ((torch.arange(num_pages, device=device) // 16) % 2).to(torch.uint8)
+        page_format = ((torch.arange(num_pages, device=device) // 16) % 2).to(
+            torch.uint8
+        )
     else:
         page_format = torch.full(
-            (num_pages,), {"a16": 0, "fp8": 1, "fp4": 2}[page_mode],
-            dtype=torch.uint8, device=device,
+            (num_pages,),
+            {"a16": 0, "fp8": 1, "fp4": 2}[page_mode],
+            dtype=torch.uint8,
+            device=device,
         )
     fp8_pages = page_format == 1
     fp4_pages = page_format == 2
@@ -158,7 +248,6 @@ def _make_transport(
         fp4_v_scales,
         page_format,
         torch.empty((num_pages, 2), dtype=torch.float32, device=device),
-        torch.empty((0, page_size, num_heads, 4), dtype=torch.float32, device=device),
         torch.empty(4, dtype=torch.float32, device=device),
         scalar,
         scalar,
@@ -199,11 +288,14 @@ def test_xqa_mixed_page_transport_matches_register_expansion(
     canonical_k, canonical_v, reference_k, reference_v, transport = _make_transport(
         shape, dtype, device, page_mode
     )
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(batch_size, pages_per_request)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, pages_per_request
+    )
     seq_lens = torch.full(
-        (batch_size,), pages_per_request * page_size - 3, dtype=torch.int32, device=device
+        (batch_size,),
+        pages_per_request * page_size - 3,
+        dtype=torch.int32,
+        device=device,
     )
     query = torch.randn(
         batch_size * q_len,
@@ -288,16 +380,21 @@ def test_xqa_native_block_fp8_matches_a16_expansion(q_len):
     _, _, reference_k, reference_v, transport = _make_transport(
         shape, dtype, device, "fp8"
     )
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(batch_size, pages_per_request)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, pages_per_request
+    )
     seq_lens = torch.full(
-        (batch_size,), pages_per_request * page_size - 3,
-        dtype=torch.int32, device=device,
+        (batch_size,),
+        pages_per_request * page_size - 3,
+        dtype=torch.int32,
+        device=device,
     )
     query = torch.randn(
-        batch_size * q_len, num_kv_heads * group_size, head_dim,
-        dtype=dtype, device=device,
+        batch_size * q_len,
+        num_kv_heads * group_size,
+        head_dim,
+        dtype=dtype,
+        device=device,
     )
     mask = None if q_len == 1 else _pack_query_mask(batch_size, q_len, device)
     kwargs = dict(
@@ -310,11 +407,14 @@ def test_xqa_native_block_fp8_matches_a16_expansion(q_len):
         enable_pdl=True,
     )
     expected = xqa_batch_decode_with_kv_cache(
-        query, (reference_k, reference_v),
-        torch.zeros(64 << 20, dtype=torch.uint8, device=device), **kwargs,
+        query,
+        (reference_k, reference_v),
+        torch.zeros(64 << 20, dtype=torch.uint8, device=device),
+        **kwargs,
     )
     actual = xqa_batch_decode_with_kv_cache(
-        query, (transport.fp8_k_payload, transport.fp8_v_payload),
+        query,
+        (transport.fp8_k_payload, transport.fp8_v_payload),
         torch.zeros(64 << 20, dtype=torch.uint8, device=device),
         kv_cache_sf=(
             transport.fp8_k_scales.view(torch.float8_e4m3fn),
@@ -392,7 +492,11 @@ def test_xqa_mixed_page_transport_tails_and_value_ranges(
     )
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
     query = torch.randn(
-        batch_size * q_len, num_kv_heads * group_size, head_dim, dtype=dtype, device=device
+        batch_size * q_len,
+        num_kv_heads * group_size,
+        head_dim,
+        dtype=dtype,
+        device=device,
     )
     mask = None if q_len == 1 else _pack_query_mask(batch_size, q_len, device)
     kwargs = dict(
@@ -474,11 +578,14 @@ def test_xqa_mixed_a16_stream_matches_stock_decode(pages_per_request):
     canonical_k, canonical_v, _, _, transport = _make_transport(
         shape, dtype, device, "a16"
     )
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(batch_size, pages_per_request)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, pages_per_request
+    )
     seq_lens = torch.full(
-        (batch_size,), pages_per_request * page_size - 3, dtype=torch.int32, device=device
+        (batch_size,),
+        pages_per_request * page_size - 3,
+        dtype=torch.int32,
+        device=device,
     )
     query = torch.randn(
         batch_size, num_kv_heads * group_size, head_dim, dtype=dtype, device=device
@@ -493,18 +600,25 @@ def test_xqa_mixed_a16_stream_matches_stock_decode(pages_per_request):
         enable_pdl=True,
     )
     expected = xqa_batch_decode_with_kv_cache(
-        query, (canonical_k, canonical_v),
-        torch.zeros(64 << 20, dtype=torch.uint8, device=device), **kwargs,
+        query,
+        (canonical_k, canonical_v),
+        torch.zeros(64 << 20, dtype=torch.uint8, device=device),
+        **kwargs,
     )
     actual = xqa_batch_decode_with_kv_cache(
-        query, (canonical_k, canonical_v),
+        query,
+        (canonical_k, canonical_v),
         torch.zeros(64 << 20, dtype=torch.uint8, device=device),
-        page_transport=transport, page_transport_static_format=0, **kwargs,
+        page_transport=transport,
+        page_transport_static_format=0,
+        **kwargs,
     )
     assert not torch.isnan(expected).any()
     assert not torch.isnan(actual).any()
     err = (actual.float() - expected.float()).abs().max().item()
     ref = expected.float().abs().max().item()
-    print(f"[a16_vs_stock-{pages_per_request}] max|diff|={err:.3e} max|ref|={ref:.3e}",
-          flush=True)
+    print(
+        f"[a16_vs_stock-{pages_per_request}] max|diff|={err:.3e} max|ref|={ref:.3e}",
+        flush=True,
+    )
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=2e-3)

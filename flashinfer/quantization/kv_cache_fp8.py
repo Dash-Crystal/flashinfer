@@ -45,7 +45,6 @@ class MixedKVPagedCache(NamedTuple):
     fp4_v_scales: torch.Tensor
     page_format: torch.Tensor
     page_router_stats: torch.Tensor
-    page_router_partials: torch.Tensor
     routing_thresholds: torch.Tensor
     fp8_k_global_scale: torch.Tensor
     fp8_v_global_scale: torch.Tensor
@@ -292,26 +291,12 @@ def seal_mixed_kv_pages_cuda(
         raise ValueError("page_router_stats must have shape [num_pages, 2]")
     if cache.page_router_stats.dtype != torch.float32:
         raise TypeError("page_router_stats must use float32")
-    expected_partials = (
-        completed_pages.numel(),
-        k_cache.shape[1],
-        k_cache.shape[2],
-        4,
-    )
-    if cache.page_router_partials.shape != expected_partials:
-        raise ValueError(
-            "page_router_partials must have shape "
-            f"{expected_partials}, got {tuple(cache.page_router_partials.shape)}"
-        )
-    if cache.page_router_partials.dtype != torch.float32:
-        raise TypeError("page_router_partials must use float32")
     if cache.routing_thresholds.shape != (4,):
         raise ValueError("routing_thresholds must contain FP4 and FP8 signature limits")
     if cache.routing_thresholds.dtype != torch.float32:
         raise TypeError("routing_thresholds must use float32")
     if (
         cache.page_router_stats.device != k_cache.device
-        or cache.page_router_partials.device != k_cache.device
         or cache.routing_thresholds.device != k_cache.device
     ):
         raise ValueError("routing state must be on the same CUDA device as the cache")
@@ -325,10 +310,10 @@ def seal_mixed_kv_pages_cuda(
         reused_count,
         completed_pages,
         completed_count,
-        cache.fp8_k_global_scale.reshape(1),
-        cache.fp8_v_global_scale.reshape(1),
-        cache.fp4_k_global_scale.reshape(1),
-        cache.fp4_v_global_scale.reshape(1),
+        cache.fp8_k_global_scale,
+        cache.fp8_v_global_scale,
+        cache.fp4_k_global_scale,
+        cache.fp4_v_global_scale,
         cache.fp8_k_payload,
         cache.fp8_v_payload,
         cache.fp8_k_scales,
@@ -337,7 +322,6 @@ def seal_mixed_kv_pages_cuda(
         cache.fp4_v_payload,
         cache.fp4_k_scales,
         cache.fp4_v_scales,
-        cache.page_router_partials,
         cache.page_format,
         cache.page_router_stats,
         cache.routing_thresholds,

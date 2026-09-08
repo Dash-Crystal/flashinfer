@@ -20,7 +20,12 @@ def pack_causal_mask(batch_size: int, q_len: int, device: torch.device) -> torch
     rows = torch.arange(q_len, device=device).view(-1, 1)
     bits = 1 << torch.arange(32, device=device, dtype=torch.int64)
     packed = (((columns <= rows).view(q_len, words, 32)) * bits).sum(-1)
-    return packed.to(torch.uint32).expand(batch_size, -1, -1).contiguous().view(torch.uint16)
+    return (
+        packed.to(torch.uint32)
+        .expand(batch_size, -1, -1)
+        .contiguous()
+        .view(torch.uint16)
+    )
 
 
 def make_transport(
@@ -33,7 +38,8 @@ def make_transport(
         page_format = (torch.arange(pages, device=device) % 3).to(torch.uint8)
     else:
         page_format = torch.full(
-            (pages,), {"a16": 0, "fp8": 1, "fp4": 2}[mode],
+            (pages,),
+            {"a16": 0, "fp8": 1, "fp4": 2}[mode],
             dtype=torch.uint8,
             device=device,
         )
@@ -49,7 +55,6 @@ def make_transport(
         torch.full(scale_shape, 0x38, dtype=torch.uint8, device=device),
         page_format,
         torch.empty((pages, 2), dtype=torch.float32, device=device),
-        torch.empty((0, page_size, heads, 4), dtype=torch.float32, device=device),
         torch.empty(4, dtype=torch.float32, device=device),
         scalar,
         scalar,
@@ -108,8 +113,13 @@ def kv_transport_bytes(args: argparse.Namespace, mode: str) -> int:
         if mode == "native_block_fp8":
             return pages * bytes_per_page["fp8"]
         storage_mode = "fp4" if mode == "native_fp4" else mode
-        return pages * bytes_per_page[storage_mode] + (0 if mode == "native_fp4" else pages)
-    counts = {name: (pages + 2 - index) // 3 for index, name in enumerate(("a16", "fp8", "fp4"))}
+        return pages * bytes_per_page[storage_mode] + (
+            0 if mode == "native_fp4" else pages
+        )
+    counts = {
+        name: (pages + 2 - index) // 3
+        for index, name in enumerate(("a16", "fp8", "fp4"))
+    }
     return sum(counts[name] * bytes_per_page[name] for name in counts) + pages
 
 
@@ -133,7 +143,16 @@ def main() -> None:
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("baseline_a16", "transport_a16", "fp8", "fp4", "native_fp8", "native_block_fp8", "native_fp4", "mixed"),
+        choices=(
+            "baseline_a16",
+            "transport_a16",
+            "fp8",
+            "fp4",
+            "native_fp8",
+            "native_block_fp8",
+            "native_fp4",
+            "mixed",
+        ),
         default=("baseline_a16", "transport_a16", "fp8", "fp4", "mixed"),
     )
     parser.add_argument("--repeats", type=int, default=20)
@@ -190,7 +209,8 @@ def main() -> None:
             native_fp4 = mode == "native_fp4"
             transport = (
                 None
-                if mode in ("baseline_a16", "native_fp8", "native_block_fp8", "native_fp4")
+                if mode
+                in ("baseline_a16", "native_fp8", "native_block_fp8", "native_fp4")
                 else transports[mode.removeprefix("transport_")]
             )
             static_format = {
@@ -247,9 +267,7 @@ def main() -> None:
                 file=sys.stderr,
                 flush=True,
             )
-            timing = time_call(
-                call, args.repeats, args.trials, not args.no_cuda_graph
-            )
+            timing = time_call(call, args.repeats, args.trials, not args.no_cuda_graph)
             transport_bytes = kv_transport_bytes(args, mode)
             report["measurements"].append(
                 {

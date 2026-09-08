@@ -39,7 +39,6 @@ def make_cache(
         torch.empty(scale_shape, dtype=torch.uint8, device=device),
         torch.zeros(pages, dtype=torch.uint8, device=device),
         torch.empty((pages, 2), dtype=torch.float32, device=device),
-        torch.empty((pages, page_size, heads, 4), dtype=torch.float32, device=device),
         torch.tensor(thresholds, dtype=torch.float32, device=device),
         global_scale,
         global_scale,
