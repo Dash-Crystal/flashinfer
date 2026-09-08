@@ -245,9 +245,10 @@ static_assert(!kMixedBF16PlacementExpansion ||
 // the static modules' format is a build constant (no tag is loaded, broadcast or staged), the
 // dynamic module packs the tile's tags into one word per buffer.  MIXED_ALL_HOISTED_COPY marks the
 // modules whose every K / V copy is the hoisted copy (fp8 / fp4: the stock A16 copy is dead code
-// once the flag is the constant true; dyn: kA16CopyFastPath is false); the a16 module keeps the
-// stock A16 copy, whose HeadPtr indexes the page vector.
-#define MIXED_ALL_HOISTED_COPY (MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT != 0)
+// once the flag is the constant true; dyn: kA16CopyFastPath is false). Sliding-window A16
+// also needs the bounded copy: masked leading rows can reference recycled pages.
+#define MIXED_ALL_HOISTED_COPY \
+  (MIXED_HOISTED_COPY && (MIXED_PAGE_STATIC_FORMAT != 0 || SLIDING_WINDOW))
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
 constexpr bool kMixedStaticNeedsExpansion = MIXED_PAGE_STATIC_FORMAT > 0;
 #endif
@@ -2459,6 +2460,8 @@ CUBIN_EXPORT __global__
       uint32_t const dstHeadOffset = 0;
       uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
+      uint32_t const nbHeadsSkip =
+          seqOffset < nbTotalSkipTokens ? nbTotalSkipTokens - seqOffset : 0U;
 
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_KV_CACHE && !MIXED_HOISTED_COPY
@@ -2532,7 +2535,7 @@ CUBIN_EXPORT __global__
       unused(dstHeadOffset);
       copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
           dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
-          tagWord, idxHeadGrp, idxPart, nbHeadsAvail);
+          tagWord, idxHeadGrp, idxPart, nbHeadsSkip, nbHeadsAvail);
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
                     "a16 static module: every page is A16, the stock A16 copy is the only body");
@@ -2552,11 +2555,11 @@ CUBIN_EXPORT __global__
         smem.kFormats[warpIdx.x][idxNextSMemKBuf] = pageFormats;
       }
       __syncwarp();
-      if (kA16CopyFastPath && !needsExpansion && isFullTile) {
+      if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0 && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
                               grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
                                                                     idxPart);
-      } else if (kA16CopyFastPath && !needsExpansion) {
+      } else if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0) {
         uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
             (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
@@ -2567,7 +2570,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
-            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart
+            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsSkip
 #if MIXED_KV_PROBE_C
             ,
             warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
@@ -2580,7 +2583,8 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
-            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsAvail
+            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsSkip,
+            nbHeadsAvail
 #if MIXED_KV_PROBE_C
             ,
             0, &smem.probeScratch[warpIdx.x][0]
@@ -3108,6 +3112,8 @@ CUBIN_EXPORT __global__
       uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
                                  cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
+      uint32_t const nbHeadsSkip =
+          seqOffset < nbTotalSkipTokens ? (nbTotalSkipTokens - seqOffset) : 0U;
 
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_KV_CACHE && MIXED_HOISTED_COPY
@@ -3182,7 +3188,7 @@ CUBIN_EXPORT __global__
                      ? cacheSeqLen - seqOffset
                      : 0U);  // may also be full but it can be handled correctly anyway
 #if ENABLE_MIXED_KV_CACHE
-      if (kA16CopyFastPath && !needsExpansion) {
+      if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0) {
         copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
                        grainBytesGmemCache, vSwizzle, false>(warpIdxInGrp, dst, src, nbHeadsAvail);
       } else {
@@ -3190,9 +3196,11 @@ CUBIN_EXPORT __global__
         uint32_t const sourceHeadOffset = headsPerWarp * warpIdxInGrp;
         uint32_t const warpHeadsAvail =
             sourceHeadOffset < nbHeadsAvail ? nbHeadsAvail - sourceHeadOffset : 0U;
+        uint32_t const warpHeadsSkip =
+            sourceHeadOffset < nbHeadsSkip ? nbHeadsSkip - sourceHeadOffset : 0U;
         copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false, compactMixedPages>(
             dst, getSmemVScales(idxNextSMemVBuf), sourceHeadOffset, cacheList.transport, pageIdx,
-            pageFormats, tokenOffset + sourceHeadOffset, idxHeadGrp, false, 0,
+            pageFormats, tokenOffset + sourceHeadOffset, idxHeadGrp, false, 0, warpHeadsSkip,
             mha::min(warpHeadsAvail, headsPerWarp));
       }
 #else
@@ -3219,7 +3227,7 @@ CUBIN_EXPORT __global__
       unused(dstHeadOffset);
       copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
           dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, tagWord, idxHeadGrp,
-          warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+          warpIdxInGrp, nbHeadsSkip, mha::min(nbHeadsAvail, cacheVTileSeqLen));
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
                     "a16 static module: every page is A16, the stock A16 copy is the only body");
@@ -3229,11 +3237,11 @@ CUBIN_EXPORT __global__
           warp, dst, dstHeadOffset, src, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
 #endif
 #else
-      if (kA16CopyFastPath && !needsExpansion && isFullTile) {
+      if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0 && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
                               grainBytesGmemCache, vSwizzle, true>(warp, dst, dstHeadOffset, src,
                                                                    warpIdxInGrp);
-      } else if (kA16CopyFastPath && !needsExpansion) {
+      } else if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0) {
         copyPartialHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
                               grainBytesGmemCache, vSwizzle, false>(
             warp, dst, dstHeadOffset, src, warpIdxInGrp, mha::min(nbHeadsAvail, cacheVTileSeqLen));
@@ -3241,7 +3249,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false,
                                    compactMixedPages>(
             dst, getSmemVScales(idxNextSMemVBuf), dstHeadOffset, cacheList.transport, pageIdx,
-            pageFormats, tokenOffset, idxHeadGrp, false, warpIdxInGrp,
+            pageFormats, tokenOffset, idxHeadGrp, false, warpIdxInGrp, nbHeadsSkip,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       }
 #endif  // MIXED_HOISTED_COPY
@@ -4213,7 +4221,21 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #else
     uint32_t const nbSeq = batchSize * nbKHeads;
 #endif
-    return chooseNbSubSeqPerSeq(multiProcessorCount, nbSeq, maxSeqLen);
+    uint32_t workSeqLen = maxSeqLen;
+#if SLIDING_WINDOW
+#if defined(XQA_MASK_MOD)
+    uint64_t windowSpan = xqa_mask_window_size;
+#else
+    uint64_t windowSpan = slidingWinSize;
+#endif
+#if SPEC_DEC && !IS_SPEC_DEC_TREE
+    windowSpan += qSeqLen - 1;
+#endif
+    // maxSeqLen also describes the page-table stride. Graph capture can retain
+    // that full-model extent even when this layer only traverses a short window.
+    workSeqLen = static_cast<uint32_t>(std::min<uint64_t>(maxSeqLen, windowSpan));
+#endif
+    return chooseNbSubSeqPerSeq(multiProcessorCount, nbSeq, workSeqLen);
   }();
 #if SPEC_DEC
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);

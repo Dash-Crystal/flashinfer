@@ -334,7 +334,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, uint32_t dstHeadOffset, PageTransport const& transport,
     Vec<KVCachePageIndex, nbPages> const& pages, MixedPageFormats<nbPages> const& formats,
-    uint32_t sourceHeadOffset, uint32_t headIdx, bool isK, uint32_t idxPart,
+    uint32_t sourceHeadOffset, uint32_t headIdx, bool isK, uint32_t idxPart, uint32_t nbSkipHeads,
     uint32_t nbAvailHeads = maxNbCopiedHeads, uint32_t idxWarp = 0,
     uint8_t* probeScratch = nullptr) {
   // The source origin is span-aligned, so headsPerSpan heads lie in one page:
@@ -385,7 +385,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
       uint32_t const blockInPart = blockInSpan % blocksPerPart;
       uint32_t const localHead = spanHead0 + headInSpan;
       uint32_t const token = token0 + headInSpan;
-      bool const validHead = isFull || localHead < nbAvailHeads;
+      bool const validHead = localHead >= nbSkipHeads && (isFull || localHead < nbAvailHeads);
       uint32_t const elem = (idxPart * blocksPerPart + blockInPart) * 16;
       bool const validElem = elem + 16 <= validElemsPerHead;
       bool const valid = validHead && validElem && pageValid;
@@ -501,7 +501,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
   for (uint32_t iteration = 0; iteration < headIterations; ++iteration) {
     uint32_t const localHead = iteration * nbThreads + idxWarp * warp_size + laneId();
     if (localHead >= maxNbCopiedHeads) continue;
-    bool const validHead = isFull || localHead < nbAvailHeads;
+    bool const validHead = localHead >= nbSkipHeads && (isFull || localHead < nbAvailHeads);
     uint32_t const absoluteToken = sourceHeadOffset + localHead;
     // One lane per head: the page is lane / tokensPerPage plus an iteration constant,
     // a compare/select chain over the register vector (no local memory).
@@ -1401,7 +1401,8 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, PageTransport const& transport, Vec<KVCachePageIndex, nbPages> const& pages,
-    uint32_t formatWord, uint32_t headIdx, uint32_t idxPart, uint32_t nbAvailHeads) {
+    uint32_t formatWord, uint32_t headIdx, uint32_t idxPart, uint32_t nbSkipHeads,
+    uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
   // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
@@ -1474,7 +1475,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     auto const iteration = [&](uint32_t i) {
       uint8_t const* const src = laneSrc + i * iterStride;
       uint32_t const localHead = spanHead0 + headInSpan0 + i * rowsPerIter;
-      bool const valid = pageValid && localHead < nbAvailHeads;
+      bool const valid = pageValid && localHead >= nbSkipHeads && localHead < nbAvailHeads;
       uint32_t const dstOff = dstSpan + i * iterTileBytes;
       if constexpr (isA16) {
         cpAsyncCgShared16(dstFirst + dstOff, src, valid ? grainBytes : 0U);
@@ -1544,7 +1545,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
       } else {
         scales = sp.v_scales;
       }
-      bool const valid = localHead < nbAvailHeads;
+      bool const valid = localHead >= nbSkipHeads && localHead < nbAvailHeads;
       uint64_t const scaleOffset = uint64_t(page) * sp.scale_stride.page +
                                    uint64_t(token) * sp.scale_stride.token +
                                    uint64_t(headIdx) * sp.scale_stride.head + scaleGroup;
