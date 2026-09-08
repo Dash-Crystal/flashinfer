@@ -102,7 +102,7 @@ constexpr bool kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0;
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
-constexpr uint3 ctaShapeInWarps = {4, 1, 2};
+CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {4, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
 constexpr uint32_t nbWarpsPerCta = ctaShapeInWarps.x * ctaShapeInWarps.y * ctaShapeInWarps.z;
@@ -3943,7 +3943,7 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType =
     XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
 #ifdef NDEBUG
-CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
+CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
     uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize,
     SeqLenDataType const* qCuSeqLens,
@@ -4006,6 +4006,24 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
+struct KernelLaunchGeometry {
+  uint32_t sharedBytes;
+  uint3 warps;
+
+  dim3 block() const { return {warp_size * warps.x, warps.y, warps.z}; }
+  uint32_t threads() const { return warp_size * warps.x * warps.y * warps.z; }
+  uint32_t sequenceTile() const { return warpTile.x * warps.x; }
+};
+
+static KernelLaunchGeometry const hostGeometry = []() {
+  KernelLaunchGeometry geometry;
+  checkCuda(cudaMemcpyFromSymbol(&geometry.sharedBytes, smemSize, sizeof(smemSize)));
+  checkCuda(cudaMemcpyFromSymbol(&geometry.warps, ctaShapeInWarps, sizeof(ctaShapeInWarps)));
+  checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 geometry.sharedBytes));
+  return geometry;
+}();
+
 #ifndef GENERATE_CUBIN
 void launchMHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,
@@ -4058,12 +4076,6 @@ void launchMHA(
 #if USE_INPUT_KV
   throw std::runtime_error("not implemented");
 #else
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
@@ -4081,7 +4093,7 @@ void launchMHA(
     }
     return std::min<uint32_t>(
         std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)),
-        divUp(maxSeqLen, ctaTile.x));
+        divUp(maxSeqLen, hostGeometry.sequenceTile()));
   }();
   // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
@@ -4090,9 +4102,8 @@ void launchMHA(
 #else
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
-  dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg =
-      makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
+  auto const launchCfg = makeLaunchConfig(dimGrid, hostGeometry.block(), hostGeometry.sharedBytes,
+                                          stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
 #if ENABLE_4BIT_KV_CACHE
@@ -4148,15 +4159,6 @@ void launchMHA(
 }
 #endif
 
-static uint32_t configureKernel() {
-  uint32_t size;
-  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
-  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
-  return size;
-}
-
-static uint32_t const hostSmemSize = configureKernel();
-
 // Track S step 4 [42]: default number of sub-sequences per sequence (multi-block mode).
 // Cost model, calibrated on the XQA_NB_SUB_SEQ sweeps (nkcut2 H200, 136 sequences x 16 tiles,
 // at 132 slots (1 CTA/SM) and 264 slots (2 CTAs/SM); ws-1 RTX 5090, 170 slots, P0.8): the
@@ -4171,11 +4173,11 @@ static uint32_t const hostSmemSize = configureKernel();
 // n = 4 (measured 0.85x), at 170 slots it keeps n = 1 (P0.8: every n > 1 was slower there).
 static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSeq,
                                      uint32_t maxSeqLen) {
-  uint32_t const nbTiles = std::max<uint32_t>(1U, divUp(maxSeqLen, ctaTile.x));
+  uint32_t const nbTiles = std::max<uint32_t>(1U, divUp(maxSeqLen, hostGeometry.sequenceTile()));
   static uint32_t const ctasPerSm = []() -> uint32_t {
     int n = 0;
     cudaError_t const err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &n, kernel_mha, static_cast<int>(ctaSize), hostSmemSize);
+        &n, kernel_mha, static_cast<int>(hostGeometry.threads()), hostGeometry.sharedBytes);
     if (err != cudaSuccess) {
       cudaGetLastError();
       return 1U;
@@ -4235,7 +4237,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
     if (env != nullptr) {
       int32_t const val = std::stoi(env);
       if (val > 0) {
-        return std::min<uint32_t>(val, divUp(maxSeqLen, ctaTile.x));
+        return std::min<uint32_t>(val, divUp(maxSeqLen, hostGeometry.sequenceTile()));
       }
     }
 #if SPEC_DEC
@@ -4265,9 +4267,8 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #else
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
-  dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg =
-      makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
+  auto const launchCfg = makeLaunchConfig(dimGrid, hostGeometry.block(), hostGeometry.sharedBytes,
+                                          stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   KVCacheList<true> const cacheList{kCacheVLLM,      vCacheVLLM,
 #if ENABLE_4BIT_KV_CACHE

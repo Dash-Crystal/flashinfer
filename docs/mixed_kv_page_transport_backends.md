@@ -3083,3 +3083,25 @@ captures four complete-model executions with CUDA graph nodes and sampled device
 counters; these captures have different work shapes and are not direct kernel
 latency comparisons. The vLLM integration document contains the original D128
 receipt audit and the separate ordinary-FA4 comparison.
+
+The follow-up 128-thread D256 arrangement used 43,392 bytes of shared memory
+and allowed two resident CTAs per SM. It measured 28.45/40.34/52.22 ms at
+4K/8K/12K in attempt 41, against 23.85/30.51/37.18 ms for the retained layout.
+For a full 1K window, halving the sequence tile and K-part width increases
+per-warp K-copy/expansion rounds from 16 to 64; across the smaller CTA this
+doubles K-copy requests. Extra residency did not compensate. The serving policy
+retains the 256-thread layout. Attempt 40's numerical captures for the alternate
+layout measured 0.160–0.226% relative RMS and zero output NaNs.
+
+The host launch refactor is retained independently: both launchers read shared
+memory and warp geometry from the compiled device constants. Occupancy queries,
+split-cost tile counts and block dimensions use that one realized geometry.
+This replaces two shared-memory setup paths and prevents the host's architecture
+preprocessor branch from supplying a different CTA shape than the device's.
+
+Attempt 42 runs the retained geometry through the final host refactor. Its
+2,033 padded-64 decode observations (0.324 ms residual RMS) predict
+23.38/29.46/35.54 ms at 4K/8K/12K input and 1K output. Across attempts 35, 38
+and 42 the retained estimates span 23.38–23.85 / 29.46–30.51 / 35.54–37.18 ms.
+This variation is not attributed to the startup-only host refactor. Ordinary
+FA4 in attempt 39 predicts 27.15/38.71/50.28 ms at the same coordinates.
