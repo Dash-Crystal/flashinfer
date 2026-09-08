@@ -846,6 +846,8 @@ __device__ inline void expandMixedPartialHeadsInPlace(
     Array2D<_LdGrain, dstNbHeads, dstNbGrains>& dst, uint8_t const* scales, uint32_t dstHeadOffset,
     MixedPageFormats<nbPages> const& formats, uint32_t sourceHeadOffset, uint32_t idxPart,
     float fp8GlobalScale, float fp4GlobalScale, uint32_t idxWarp = 0) {
+  // cp.async.wait_group completes each lane's copies; scales are shared across lanes.
+  __syncwarp();
   // Page-outer like copyMixedPartialHeadsAsync ([40]): one format branch per page
   // span, a format-specialised body for its blocks, the page loop rolled in the
   // dynamic module.  A16 spans are skipped.

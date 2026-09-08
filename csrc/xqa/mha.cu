@@ -27,6 +27,10 @@
 #include "mha_components.cuh"
 #include "mma.cuh"
 #include "utils.cuh"
+#if defined(XQA_MASK_MOD)
+#include "mask_mod.cuh"
+static_assert(SPEC_DEC && SLIDING_WINDOW);
+#endif
 #ifndef GENERATE_CUBIN
 #include <cuda_runtime.h>
 
@@ -615,6 +619,34 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
+
+#if defined(XQA_MASK_MOD)
+__device__ inline void applyMaskMod(WarpAcc& acc, MaskType const* operands, uint32_t request,
+                                    uint32_t headGroup, uint32_t rowOffset, uint32_t tileTokenBeg,
+                                    uint32_t queryLen, uint32_t cacheLen, uint32_t groupSize) {
+  auto const* captures = reinterpret_cast<uint64_t const*>(operands);
+#pragma unroll
+  for (uint32_t m = 0; m < acc.rows; ++m) {
+#pragma unroll
+    for (uint32_t i = 0; i < InstAcc::rows; ++i) {
+      uint32_t const row = rowOffset + instM * m + laneId() / 4 + i * 8;
+      uint32_t const query = row / groupSize;
+      uint32_t const head = headGroup * groupSize + row % groupSize;
+#pragma unroll
+      for (uint32_t n = 0; n < acc.cols; ++n) {
+#pragma unroll
+        for (uint32_t j = 0; j < InstAcc::cols; ++j) {
+          uint32_t const key = tileTokenBeg + instN * n + InstAcc::cols * (laneId() % 4) + j;
+          bool const visible =
+              query < queryLen && key < cacheLen &&
+              xqa_mask_mod(request, head, cacheLen - queryLen + query, key, captures);
+          acc(m, n)(i, j) = visible ? acc(m, n)(i, j) : safeInitRowMax;
+        }
+      }
+    }
+  }
+}
+#endif
 
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask,
                                           uint32_t rowOffset, uint32_t nbValidCols,
@@ -2195,12 +2227,18 @@ CUBIN_EXPORT __global__
   uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
   uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
   uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
+#if defined(XQA_MASK_MOD)
+  // Captured grids cover the query-span envelope, including empty request tiles.
+  if (idxHeadTokenInGrp >= totalNbHeadTokensInGrp) return;
+#endif
   uint32_t const nbValidHeadTokens =
       idxHeadTokenInGrp > totalNbHeadTokensInGrp
           ? 0u
           : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
   // Shift the mask ptr by batch_idx.
+#if !defined(XQA_MASK_MOD)
   mask += reqSeqOffset * divUp(qSeqLen, 32u);
+#endif
 #endif
 
   constexpr bool qkSwizzle = true;
@@ -2272,6 +2310,9 @@ CUBIN_EXPORT __global__
 #endif
 
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+#if defined(XQA_MASK_MOD)
+  slidingWinSize = xqa_mask_window_size;
+#endif
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
 #if SPEC_DEC && !IS_SPEC_DEC_TREE
@@ -2787,7 +2828,10 @@ CUBIN_EXPORT __global__
 #endif
       // masking
       uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
-#if SPEC_DEC
+#if defined(XQA_MASK_MOD)
+      applyMaskMod(acc, mask, idxReq, idxHeadGrp, idxHeadTokenInGrp, warpTileTokenBeg,
+                   actualQSeqLen, cacheSeqLen, headGrpSize);
+#elif SPEC_DEC
 #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
       // Tiles below the last row's window begin (cacheSeqLen - slidingWinSize)
       // need the per-row window edge mask; tiles fully below this CTA's

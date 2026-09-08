@@ -32,7 +32,13 @@ class MixedKVPagedCache(NamedTuple):
     ``routing_thresholds`` contains the two FP4 signature limits followed by
     the two FP8 limits.  The producer computes the signature from the A16 page,
     chooses one format, writes only that compressed pool (if any), then
-    publishes ``page_format`` last.
+    publishes ``page_format`` last. Payload views may start at their A16 row's
+    address; row strides are retained and scales must not overlap source rows.
+    The two compressed formats may share payload and scale storage.
+
+    ``page_router_stats`` stores neighbor cosine and block peak/RMS. The scale
+    search evaluates reconstruction error in registers without materializing
+    alternate page encodings.
     """
 
     fp8_k_payload: torch.Tensor
@@ -236,6 +242,8 @@ def seal_mixed_kv_pages_cuda(
     completed_pages: torch.Tensor,
     completed_count: torch.Tensor,
     cache: MixedKVPagedCache,
+    *,
+    page_router_partials: torch.Tensor | None = None,
 ) -> None:
     """Route and seal completed PagedAttention pages as FP4, FP8, or A16.
 
@@ -303,6 +311,20 @@ def seal_mixed_kv_pages_cuda(
 
     from .fp4_quantization import get_fp4_kv_quantization_module
 
+    partial_shape = (completed_pages.numel(), *k_cache.shape[1:3], 4)
+    if page_router_partials is None:
+        page_router_partials = torch.empty(
+            partial_shape, dtype=torch.float32, device=k_cache.device
+        )
+    if (
+        page_router_partials.shape != partial_shape
+        or page_router_partials.dtype != torch.float32
+        or page_router_partials.device != k_cache.device
+    ):
+        raise ValueError(
+            "page_router_partials must match the completed-page row geometry"
+        )
+
     get_fp4_kv_quantization_module().mixed_kv_quant_pages(
         k_cache,
         v_cache,
@@ -322,6 +344,7 @@ def seal_mixed_kv_pages_cuda(
         cache.fp4_v_payload,
         cache.fp4_k_scales,
         cache.fp4_v_scales,
+        page_router_partials,
         cache.page_format,
         cache.page_router_stats,
         cache.routing_thresholds,

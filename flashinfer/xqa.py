@@ -38,6 +38,19 @@ from .utils import (
 )
 
 
+class XQAMaskMod:
+    """Compiled scalar visibility program with live, graph-stable captures."""
+
+    def __init__(self, source: str, captures: tuple[torch.Tensor, ...], device):
+        self.source = source
+        self.captures = captures
+        self.operands = torch.tensor(
+            [tensor.data_ptr() for tensor in captures] or [0],
+            dtype=torch.uint64,
+            device=device,
+        )
+
+
 def get_xqa_module(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -51,6 +64,7 @@ def get_xqa_module(
     mixed_page: bool = False,
     block_scaled_fp8: bool = False,
     mixed_page_static_format: int = -1,
+    mask_mod_source: str | None = None,
 ):
     # Ragged Q must reuse the uniform module unless it changes the compile
     # flags; a second cache entry would re-register the same torch op.
@@ -68,6 +82,7 @@ def get_xqa_module(
         mixed_page,
         block_scaled_fp8,
         mixed_page_static_format,
+        mask_mod_source,
     )
 
 
@@ -85,6 +100,7 @@ def _get_xqa_module_cached(
     mixed_page: bool,
     block_scaled_fp8: bool,
     mixed_page_static_format: int,
+    mask_mod_source: str | None,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -99,6 +115,7 @@ def _get_xqa_module_cached(
         mixed_page,
         block_scaled_fp8,
         mixed_page_static_format,
+        mask_mod_source,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -278,6 +295,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
     page_transport: Optional[MixedKVPagedCache] = None,
     page_transport_static_format: Optional[int] = None,
+    mask_mod: Optional[XQAMaskMod] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -435,6 +453,12 @@ def xqa(
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
     mixed_page = page_transport is not None
+    if mask_mod is not None:
+        if mask is not None or sliding_win_size != 0:
+            raise ValueError(
+                "mask_mod owns visibility; separate mask/window operands conflict"
+            )
+        mask = mask_mod.operands
     mixed_page_static_format = (
         -1 if page_transport_static_format is None else page_transport_static_format
     )
@@ -598,6 +622,7 @@ def xqa(
         mixed_page,
         block_scaled_fp8,
         mixed_page_static_format,
+        None if mask_mod is None else mask_mod.source,
     )
 
     if q_seq_len > 1:
@@ -613,6 +638,8 @@ def xqa(
             # sliding windows/SWAP_AB awaits GPU qualification; the targeted
             # accumulator-layout test forces that source behind this gate.
             run_sm90_fp8_mha = False
+    if mask_mod is not None:
+        run_sm90_fp8_mha = False
 
     # Record the dispatch so a measurement can be attributed to the kernel
     # that ran: xqa_wrapper.cu takes the mha_sm90.cu (Hopper GMMA) branch iff

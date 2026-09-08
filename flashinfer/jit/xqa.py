@@ -15,10 +15,12 @@ limitations under the License.
 """
 
 import functools
+import hashlib
+from pathlib import Path
 
 from . import env as jit_env
 import torch
-from .utils import filename_safe_dtype_map
+from .utils import filename_safe_dtype_map, write_if_different
 from ..compilation_context import CompilationContext
 from .core import (
     JitSpec,
@@ -63,6 +65,7 @@ def gen_xqa_module(
     mixed_page: bool = False,
     block_scaled_fp8: bool = False,
     mixed_page_static_format: int = -1,
+    mask_mod_source: str | None = None,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -110,7 +113,7 @@ def gen_xqa_module(
         # headElems > 256 uses per-warp head-dim splits in mha.cu (see nbHeadSplits);
         # the specialized SPEC_DEC/SM90-GMMA paths do not support it, and the
         # persistent-Q smem budget requires head_group_ratio <= 16.
-        if q_seq_len > 1:
+        if q_seq_len > 1 and mask_mod_source is None:
             raise ValueError(
                 f"head_dim {head_dim} > 256 does not support speculative decoding (q_seq_len > 1)"
             )
@@ -122,7 +125,7 @@ def gen_xqa_module(
 
     flag_head_group_ratio = [f"-DHEAD_GRP_SIZE={head_group_ratio}"]
 
-    if use_sliding_window:
+    if use_sliding_window or mask_mod_source is not None:
         flag_sliding_window = ["-DSLIDING_WINDOW=1"]
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
@@ -150,7 +153,7 @@ def gen_xqa_module(
         # MMA rows; on sm90 it is the condition for the 2-CTA/SM SharedMem layout and
         # __launch_bounds__(256, 2) of the mixed-page build).  Only the mixed-page modules
         # take it: they are the ones measured on both hosts.
-        if mixed_page and q_seq_len * head_group_ratio <= 16:
+        if mixed_page and (q_seq_len * head_group_ratio <= 16 or head_dim >= 256):
             flag_spec_dec.append("-DM_TILESIZE=16")
     else:
         if use_ragged_q:
@@ -180,7 +183,12 @@ def gen_xqa_module(
     # layouts.  Block-scaled E4M3 uses the architecture-neutral XQA mainloop
     # until its SM90 RS-GMMA transform is wired from CUTLASS's mixed-input
     # collective; compiling an unsupported GMMA layout is not a fallback.
-    if _has_sm90_target() and not block_scaled_fp8 and head_dim <= 256:
+    if (
+        _has_sm90_target()
+        and not block_scaled_fp8
+        and head_dim <= 256
+        and mask_mod_source is None
+    ):
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
@@ -190,8 +198,23 @@ def gen_xqa_module(
     # Suffix the URI only when ragged Q actually changes the compile flags
     # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
     ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
+    mask_suffix = ""
+    mask_flags = []
+    if mask_mod_source is not None:
+        digest = hashlib.sha256(mask_mod_source.encode()).hexdigest()
+        mask_suffix = f"_mask_{digest}"
+        header = jit_env.FLASHINFER_GEN_SRC_DIR / f"xqa_mask_{digest}" / "mask_mod.cuh"
+        write_if_different(header, mask_mod_source)
+        mask_flags = [
+            "-DXQA_MASK_MOD=1",
+            f"-I{header.parent}",
+            f"-I{Path(torch.__file__).parent / 'include'}",
+        ]
+    module_name = f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{mask_suffix}"
+    if mask_mod_source is not None:
+        module_name = f"xqa_mask_{hashlib.sha256(module_name.encode()).hexdigest()}"
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
+        module_name,
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
@@ -205,7 +228,8 @@ def gen_xqa_module(
         + flag_spec_dec
         + flag_mla_wrapper
         + flag_sm90_mha
-        + flag_mixed_page_static_format,
+        + flag_mixed_page_static_format
+        + mask_flags,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
 

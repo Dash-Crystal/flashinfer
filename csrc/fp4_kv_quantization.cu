@@ -459,6 +459,110 @@ __device__ __forceinline__ float mixed_kv_to_float(InType value) {
   }
 }
 
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_route_rows_kernel(
+    const InType* __restrict__ k_input, const InType* __restrict__ v_input,
+    const int32_t* __restrict__ completed_pages, const int32_t* __restrict__ completed_count,
+    float* __restrict__ page_router_partials, const int completed_capacity, const int page_size,
+    const int num_heads, const int head_dim, const int64_t in_stride_page,
+    const int64_t in_stride_token, const int64_t in_stride_head, const int64_t in_stride_dim) {
+  const int event_token = blockIdx.x;
+  const int event = event_token / page_size;
+  if (event >= completed_capacity || event >= *completed_count) return;
+  const int token = event_token - event * page_size;
+  const int head = blockIdx.y;
+  const int32_t page = completed_pages[event];
+
+  float neighbor_dot = 0.0f;
+  float neighbor_left_sq = 0.0f;
+  float neighbor_right_sq = 0.0f;
+  if (token + 1 < page_size) {
+    for (int linear = threadIdx.x; linear < 2 * head_dim; linear += THREADS) {
+      const bool is_v = linear >= head_dim;
+      const int dim = is_v ? linear - head_dim : linear;
+      const InType* input = is_v ? v_input : k_input;
+      const int64_t offset = page * in_stride_page + token * in_stride_token +
+                             head * in_stride_head + dim * in_stride_dim;
+      const float left = mixed_kv_to_float(input[offset]);
+      const float right = mixed_kv_to_float(input[offset + in_stride_token]);
+      neighbor_dot = fmaf(left, right, neighbor_dot);
+      neighbor_left_sq = fmaf(left, left, neighbor_left_sq);
+      neighbor_right_sq = fmaf(right, right, neighbor_right_sq);
+    }
+  }
+  neighbor_dot = mixed_kv_block_sum<THREADS>(neighbor_dot);
+  neighbor_left_sq = mixed_kv_block_sum<THREADS>(neighbor_left_sq);
+  neighbor_right_sq = mixed_kv_block_sum<THREADS>(neighbor_right_sq);
+
+  static_assert(THREADS % 32 == 0);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  float peak_rms = 0.0f;
+  const int blocks_per_kv = head_dim / MIXED_KV_SIGNATURE_BLOCK_SIZE;
+  for (int block = warp; block < 2 * blocks_per_kv; block += THREADS / 32) {
+    const bool is_v = block >= blocks_per_kv;
+    const int dim_block = is_v ? block - blocks_per_kv : block;
+    const InType* input = is_v ? v_input : k_input;
+    const int dim = dim_block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane;
+    const int64_t offset = page * in_stride_page + token * in_stride_token + head * in_stride_head +
+                           dim * in_stride_dim;
+    const float value = mixed_kv_to_float(input[offset]);
+    float sum_sq = value * value;
+    float peak = fabsf(value);
+#pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2) {
+      sum_sq += __shfl_down_sync(uint32_t(-1), sum_sq, delta);
+      peak = fmaxf(peak, __shfl_down_sync(uint32_t(-1), peak, delta));
+    }
+    if (lane == 0) {
+      const float rms = sqrtf(sum_sq / float(MIXED_KV_SIGNATURE_BLOCK_SIZE));
+      peak_rms = fmaxf(peak_rms, rms == 0.0f ? 0.0f : peak / rms);
+    }
+  }
+  peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
+
+  if (threadIdx.x == 0) {
+    const int64_t partial = (static_cast<int64_t>(event_token) * num_heads + head) * 4;
+    page_router_partials[partial + 0] = neighbor_dot;
+    page_router_partials[partial + 1] = neighbor_left_sq;
+    page_router_partials[partial + 2] = neighbor_right_sq;
+    page_router_partials[partial + 3] = peak_rms;
+  }
+}
+
+template <int THREADS = 128>
+__global__ void mixed_kv_finalize_route_kernel(const int32_t* __restrict__ completed_pages,
+                                               const int32_t* __restrict__ completed_count,
+                                               const float* __restrict__ page_router_partials,
+                                               float* __restrict__ page_router_stats,
+                                               const int completed_capacity, const int page_size,
+                                               const int num_heads) {
+  const int event = blockIdx.x;
+  if (event >= completed_capacity || event >= *completed_count) return;
+  float dot = 0.0f;
+  float left_sq = 0.0f;
+  float right_sq = 0.0f;
+  float peak_rms = 0.0f;
+  const int rows = page_size * num_heads;
+  for (int row = threadIdx.x; row < rows; row += THREADS) {
+    const int64_t partial = (static_cast<int64_t>(event) * rows + row) * 4;
+    dot += page_router_partials[partial + 0];
+    left_sq += page_router_partials[partial + 1];
+    right_sq += page_router_partials[partial + 2];
+    peak_rms = fmaxf(peak_rms, page_router_partials[partial + 3]);
+  }
+  dot = mixed_kv_block_sum<THREADS>(dot);
+  left_sq = mixed_kv_block_sum<THREADS>(left_sq);
+  right_sq = mixed_kv_block_sum<THREADS>(right_sq);
+  peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
+  if (threadIdx.x == 0) {
+    const int32_t page = completed_pages[event];
+    const float denom = sqrtf(left_sq * right_sq);
+    page_router_stats[page * 2] = denom == 0.0f ? 0.0f : dot / denom;
+    page_router_stats[page * 2 + 1] = peak_rms;
+  }
+}
+
 __device__ __forceinline__ uint8_t
 mixed_kv_select_format(const float* __restrict__ page_router_stats, const int32_t page,
                        const float* __restrict__ routing_thresholds) {
@@ -470,84 +574,35 @@ mixed_kv_select_format(const float* __restrict__ page_router_stats, const int32_
 }
 
 // Match the existing bsfp8_quant_kernel / NVIDIA NVFP4 producer geometry:
-// one 16-lane subgroup owns one scale block. A CTA covers adjacent
+// one 16-lane subgroup owns one scale block.  A CTA covers eight adjacent
 // blocks, so scale selection and payload stores stay coalesced and no lane
 // serializes an entire coefficient block.
-template <typename InType, int THREADS = 256>
-__global__ void mixed_kv_seal_pages_kernel(
-    const InType* __restrict__ k_input, const InType* __restrict__ v_input,
-    const int32_t* __restrict__ completed_pages, const int32_t* __restrict__ completed_count,
-    const float* __restrict__ fp8_k_global_scale_ptr,
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_quant_rows_kernel(
+    const InType* k_input, const InType* v_input, const int32_t* __restrict__ completed_pages,
+    const int32_t* __restrict__ completed_count, const float* __restrict__ fp8_k_global_scale_ptr,
     const float* __restrict__ fp8_v_global_scale_ptr,
     const float* __restrict__ fp4_k_global_scale_ptr,
-    const float* __restrict__ fp4_v_global_scale_ptr, uint8_t* __restrict__ fp8_k_output,
-    uint8_t* __restrict__ fp8_v_output, uint8_t* __restrict__ fp8_k_block_scales,
-    uint8_t* __restrict__ fp8_v_block_scales, uint8_t* __restrict__ fp4_k_output,
-    uint8_t* __restrict__ fp4_v_output, uint8_t* __restrict__ fp4_k_block_scales,
-    uint8_t* __restrict__ fp4_v_block_scales, uint8_t* __restrict__ page_format,
-    float* __restrict__ page_router_stats, const float* __restrict__ routing_thresholds,
-    const int completed_capacity, const int page_size, const int num_heads, const int head_dim,
-    const int64_t in_stride_page, const int64_t in_stride_token, const int64_t in_stride_head,
-    const int64_t in_stride_dim, const int64_t fp8_stride_page, const int64_t fp8_stride_token,
-    const int64_t fp8_stride_head, const int64_t fp8_stride_dim, const int64_t fp4_stride_page,
-    const int64_t fp4_stride_token, const int64_t fp4_stride_head, const int64_t fp4_stride_dim,
-    const int64_t sf_stride_page, const int64_t sf_stride_token, const int64_t sf_stride_head,
-    const int64_t sf_stride_dim) {
-  const int event = blockIdx.x;
+    const float* __restrict__ fp4_v_global_scale_ptr, uint8_t* fp8_k_output, uint8_t* fp8_v_output,
+    uint8_t* __restrict__ fp8_k_block_scales, uint8_t* __restrict__ fp8_v_block_scales,
+    uint8_t* fp4_k_output, uint8_t* fp4_v_output, uint8_t* __restrict__ fp4_k_block_scales,
+    uint8_t* __restrict__ fp4_v_block_scales, const float* __restrict__ page_router_stats,
+    const float* __restrict__ routing_thresholds, const int completed_capacity, const int page_size,
+    const int num_heads, const int head_dim, const int64_t in_stride_page,
+    const int64_t in_stride_token, const int64_t in_stride_head, const int64_t in_stride_dim,
+    const int64_t fp8_stride_page, const int64_t fp8_stride_token, const int64_t fp8_stride_head,
+    const int64_t fp8_stride_dim, const int64_t fp4_stride_page, const int64_t fp4_stride_token,
+    const int64_t fp4_stride_head, const int64_t fp4_stride_dim, const int64_t sf_stride_page,
+    const int64_t sf_stride_token, const int64_t sf_stride_head, const int64_t sf_stride_dim) {
+  const int event_token = blockIdx.x;
+  const int event = event_token / page_size;
   if (event >= completed_capacity || event >= *completed_count) return;
+  const int token = event_token - event * page_size;
+  const int head = blockIdx.y;
   const int32_t page = completed_pages[event];
-
-  // A page owns its signature, selected encoding and final publication.
-  // Warp-local 32-value blocks avoid a global partials tensor and reduction launch.
-  const int warp_lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int signature_blocks = head_dim / MIXED_KV_SIGNATURE_BLOCK_SIZE;
-  const int rows = page_size * num_heads;
-  float dot = 0.0f, left_sq = 0.0f, right_sq = 0.0f, peak_rms = 0.0f;
-  for (int block = warp; block < rows * 2 * signature_blocks; block += THREADS / 32) {
-    const int dim_block = block % signature_blocks;
-    const int kv_row = block / signature_blocks;
-    const int kv = kv_row % 2;
-    const int row = kv_row / 2;
-    const int token = row / num_heads;
-    const int head = row % num_heads;
-    const InType* input = kv ? v_input : k_input;
-    const int dim = dim_block * MIXED_KV_SIGNATURE_BLOCK_SIZE + warp_lane;
-    const int64_t offset = page * in_stride_page + token * in_stride_token + head * in_stride_head +
-                           dim * in_stride_dim;
-    const float value = mixed_kv_to_float(input[offset]);
-    if (token + 1 < page_size) {
-      const float next = mixed_kv_to_float(input[offset + in_stride_token]);
-      dot = fmaf(value, next, dot);
-      left_sq = fmaf(value, value, left_sq);
-      right_sq = fmaf(next, next, right_sq);
-    }
-    float sum_sq = value * value;
-    float peak = fabsf(value);
-#pragma unroll
-    for (int delta = 16; delta > 0; delta /= 2) {
-      sum_sq += __shfl_down_sync(uint32_t(-1), sum_sq, delta);
-      peak = fmaxf(peak, __shfl_down_sync(uint32_t(-1), peak, delta));
-    }
-    if (warp_lane == 0) {
-      const float rms = sqrtf(sum_sq / float(MIXED_KV_SIGNATURE_BLOCK_SIZE));
-      peak_rms = fmaxf(peak_rms, rms == 0.0f ? 0.0f : peak / rms);
-    }
-  }
-  dot = mixed_kv_block_sum<THREADS>(dot);
-  left_sq = mixed_kv_block_sum<THREADS>(left_sq);
-  right_sq = mixed_kv_block_sum<THREADS>(right_sq);
-  peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
-  __shared__ uint8_t selected_format;
-  if (threadIdx.x == 0) {
-    const float denom = sqrtf(left_sq * right_sq);
-    page_router_stats[page * 2] = denom == 0.0f ? 0.0f : dot / denom;
-    page_router_stats[page * 2 + 1] = peak_rms;
-    selected_format = mixed_kv_select_format(page_router_stats, page, routing_thresholds);
-  }
-  __syncthreads();
+  const uint8_t selected_format =
+      mixed_kv_select_format(page_router_stats, page, routing_thresholds);
   if (selected_format == 0) {
-    if (threadIdx.x == 0) page_format[page] = 0;
     return;
   }
 
@@ -555,6 +610,7 @@ __global__ void mixed_kv_seal_pages_kernel(
   constexpr int GROUPS_PER_CTA = THREADS / BSFP8_BLOCK_SIZE;
   const int subgroup = threadIdx.x / BSFP8_BLOCK_SIZE;
   const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
+  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
   const int dim_blocks = head_dim / BSFP8_BLOCK_SIZE;
 
   __shared__ float global_scales[4];
@@ -575,20 +631,18 @@ __global__ void mixed_kv_seal_pages_kernel(
     uint8_t* fp4_scales = is_v ? fp4_v_block_scales : fp4_k_block_scales;
     const float global_scale = global_scales[(selected_format == 2 ? 2 : 0) + kv];
 
-    for (int block = subgroup; block < rows * dim_blocks; block += GROUPS_PER_CTA) {
-      const int dim_block = block % dim_blocks;
-      const int row = block / dim_blocks;
-      const int token = row / num_heads;
-      const int head = row % num_heads;
+    for (int base = 0; base < dim_blocks; base += GROUPS_PER_CTA) {
+      const int dim_block = base + subgroup;
+      const bool valid = dim_block < dim_blocks;
       const int dim = dim_block * BSFP8_BLOCK_SIZE + lane;
       const int64_t input_offset = page * in_stride_page + token * in_stride_token +
                                    head * in_stride_head + dim * in_stride_dim;
-      const float value = mixed_kv_to_float(input[input_offset]);
+      const float value = valid ? mixed_kv_to_float(input[input_offset]) : 0.0f;
       float block_max = fabsf(value);
 #pragma unroll
       for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
         block_max =
-            fmaxf(block_max, __shfl_xor_sync(uint32_t(-1), block_max, offset, BSFP8_BLOCK_SIZE));
+            fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, BSFP8_BLOCK_SIZE));
       }
 
       const float format_max = selected_format == 2 ? 6.0f : 448.0f;
@@ -620,8 +674,8 @@ __global__ void mixed_kv_seal_pages_kernel(
           float max_residual = residual;
 #pragma unroll
           for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
-            sum_squared += __shfl_xor_sync(uint32_t(-1), sum_squared, offset, BSFP8_BLOCK_SIZE);
-            max_residual = fmaxf(max_residual, __shfl_xor_sync(uint32_t(-1), max_residual, offset,
+            sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, BSFP8_BLOCK_SIZE);
+            max_residual = fmaxf(max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset,
                                                                BSFP8_BLOCK_SIZE));
           }
           const float objective =
@@ -632,10 +686,12 @@ __global__ void mixed_kv_seal_pages_kernel(
           }
         }
       }
+      // All source lanes have read before an in-place compressed store.
+      __syncthreads();
       __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
       const int64_t sf_offset = page * sf_stride_page + token * sf_stride_token +
                                 head * sf_stride_head + dim_block * sf_stride_dim;
-      if (lane == 0) {
+      if (valid && lane == 0) {
         if (selected_format == 2) {
           fp4_scales[sf_offset] = sf_fp8.__x;
         } else {
@@ -646,13 +702,14 @@ __global__ void mixed_kv_seal_pages_kernel(
           sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
       if (selected_format == 1) {
         __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
-        fp8_output[page * fp8_stride_page + token * fp8_stride_token + head * fp8_stride_head +
-                   dim * fp8_stride_dim] = encoded.__x;
+        if (valid)
+          fp8_output[page * fp8_stride_page + token * fp8_stride_token + head * fp8_stride_head +
+                     dim * fp8_stride_dim] = encoded.__x;
       } else {
         const int pair_lane = lane & (BSFP8_BLOCK_SIZE / 2 - 1);
-        const float low = __shfl_sync(uint32_t(-1), value, pair_lane * 2, BSFP8_BLOCK_SIZE);
-        const float high = __shfl_sync(uint32_t(-1), value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE);
-        if (lane < BSFP8_BLOCK_SIZE / 2) {
+        const float low = __shfl_sync(subgroup_mask, value, pair_lane * 2, BSFP8_BLOCK_SIZE);
+        const float high = __shfl_sync(subgroup_mask, value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE);
+        if (valid && lane < BSFP8_BLOCK_SIZE / 2) {
           const uint8_t packed = encode_e2m1_nibble(low * encode_scale) |
                                  (encode_e2m1_nibble(high * encode_scale) << 4);
           const int packed_dim = dim_block * (BSFP8_BLOCK_SIZE / 2) + lane;
@@ -663,22 +720,28 @@ __global__ void mixed_kv_seal_pages_kernel(
       }
     }
   }
-  // Consumers run after this kernel on the current stream. This is not a
-  // concurrent arena-reclamation protocol; the caller retains page ownership.
-  __syncthreads();
-  if (threadIdx.x == 0) page_format[page] = selected_format;
 }
 
-void mixed_kv_quant_pages(TensorView k_input, TensorView v_input, TensorView reused_pages,
-                          TensorView reused_count, TensorView completed_pages,
-                          TensorView completed_count, TensorView fp8_k_global_scale,
-                          TensorView fp8_v_global_scale, TensorView fp4_k_global_scale,
-                          TensorView fp4_v_global_scale, TensorView fp8_k_output,
-                          TensorView fp8_v_output, TensorView fp8_k_block_scales,
-                          TensorView fp8_v_block_scales, TensorView fp4_k_output,
-                          TensorView fp4_v_output, TensorView fp4_k_block_scales,
-                          TensorView fp4_v_block_scales, TensorView page_format,
-                          TensorView page_router_stats, TensorView routing_thresholds) {
+__global__ void mixed_kv_publish_pages_kernel(const int32_t* __restrict__ completed_pages,
+                                              const int32_t* __restrict__ completed_count,
+                                              uint8_t* __restrict__ page_format,
+                                              const float* __restrict__ page_router_stats,
+                                              const float* __restrict__ routing_thresholds,
+                                              const int completed_capacity) {
+  const int event = blockIdx.x * blockDim.x + threadIdx.x;
+  if (event >= completed_capacity || event >= *completed_count) return;
+  const int32_t page = completed_pages[event];
+  page_format[page] = mixed_kv_select_format(page_router_stats, page, routing_thresholds);
+}
+
+void mixed_kv_quant_pages(
+    TensorView k_input, TensorView v_input, TensorView reused_pages, TensorView reused_count,
+    TensorView completed_pages, TensorView completed_count, TensorView fp8_k_global_scale,
+    TensorView fp8_v_global_scale, TensorView fp4_k_global_scale, TensorView fp4_v_global_scale,
+    TensorView fp8_k_output, TensorView fp8_v_output, TensorView fp8_k_block_scales,
+    TensorView fp8_v_block_scales, TensorView fp4_k_output, TensorView fp4_v_output,
+    TensorView fp4_k_block_scales, TensorView fp4_v_block_scales, TensorView page_router_partials,
+    TensorView page_format, TensorView page_router_stats, TensorView routing_thresholds) {
   CHECK_CUDA(k_input);
   CHECK_CUDA(v_input);
   CHECK_CUDA(reused_pages);
@@ -697,6 +760,7 @@ void mixed_kv_quant_pages(TensorView k_input, TensorView v_input, TensorView reu
   CHECK_CUDA(fp4_v_output);
   CHECK_CUDA(fp4_k_block_scales);
   CHECK_CUDA(fp4_v_block_scales);
+  CHECK_CUDA(page_router_partials);
   CHECK_CUDA(page_format);
   CHECK_CUDA(page_router_stats);
   CHECK_CUDA(routing_thresholds);
@@ -756,6 +820,11 @@ void mixed_kv_quant_pages(TensorView k_input, TensorView v_input, TensorView reu
                  page_router_stats.size(1) == 2 && page_router_stats.dtype() == dl_float32)
       << "page_router_stats must be float32 [num_pages, 2]";
   const int completed_capacity = completed_pages.size(0);
+  TVM_FFI_ICHECK(
+      page_router_partials.ndim() == 4 && page_router_partials.size(0) == completed_capacity &&
+      page_router_partials.size(1) == page_size && page_router_partials.size(2) == num_heads &&
+      page_router_partials.size(3) == 4 && page_router_partials.dtype() == dl_float32)
+      << "page_router_partials must be float32 [event_capacity, page_size, num_heads, 4]";
   TVM_FFI_ICHECK(routing_thresholds.ndim() == 1 && routing_thresholds.size(0) == 4 &&
                  routing_thresholds.dtype() == dl_float32)
       << "routing_thresholds must be float32 [4]";
@@ -766,45 +835,62 @@ void mixed_kv_quant_pages(TensorView k_input, TensorView v_input, TensorView reu
   ffi::CUDADeviceGuard device_guard(k_input.device().device_id);
   cudaStream_t stream = get_stream(k_input.device());
   const int reused_capacity = reused_pages.size(0);
-  constexpr int QUANT_THREADS = 256;
+  constexpr int ROUTE_THREADS = 128;
+  constexpr int QUANT_THREADS = 128;
   constexpr int RESET_THREADS = 256;
   const int reset_blocks = (reused_capacity + RESET_THREADS - 1) / RESET_THREADS;
-  if (reset_blocks > 0) {
-    mixed_kv_reset_reused_pages_kernel<<<reset_blocks, RESET_THREADS, 0, stream>>>(
-        static_cast<const int32_t*>(reused_pages.data_ptr()),
-        static_cast<const int32_t*>(reused_count.data_ptr()),
-        static_cast<uint8_t*>(page_format.data_ptr()),
-        static_cast<float*>(page_router_stats.data_ptr()), reused_capacity);
-  }
+  mixed_kv_reset_reused_pages_kernel<<<reset_blocks, RESET_THREADS, 0, stream>>>(
+      static_cast<const int32_t*>(reused_pages.data_ptr()),
+      static_cast<const int32_t*>(reused_count.data_ptr()),
+      static_cast<uint8_t*>(page_format.data_ptr()),
+      static_cast<float*>(page_router_stats.data_ptr()), reused_capacity);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k_input.dtype(), c_type, [&] {
-    if (completed_capacity == 0) return true;
-    mixed_kv_seal_pages_kernel<c_type, QUANT_THREADS>
-        <<<completed_capacity, QUANT_THREADS, 0, stream>>>(
-            static_cast<const c_type*>(k_input.data_ptr()),
-            static_cast<const c_type*>(v_input.data_ptr()),
-            static_cast<const int32_t*>(completed_pages.data_ptr()),
-            static_cast<const int32_t*>(completed_count.data_ptr()),
-            static_cast<const float*>(fp8_k_global_scale.data_ptr()),
-            static_cast<const float*>(fp8_v_global_scale.data_ptr()),
-            static_cast<const float*>(fp4_k_global_scale.data_ptr()),
-            static_cast<const float*>(fp4_v_global_scale.data_ptr()),
-            static_cast<uint8_t*>(fp8_k_output.data_ptr()),
-            static_cast<uint8_t*>(fp8_v_output.data_ptr()),
-            static_cast<uint8_t*>(fp8_k_block_scales.data_ptr()),
-            static_cast<uint8_t*>(fp8_v_block_scales.data_ptr()),
-            static_cast<uint8_t*>(fp4_k_output.data_ptr()),
-            static_cast<uint8_t*>(fp4_v_output.data_ptr()),
-            static_cast<uint8_t*>(fp4_k_block_scales.data_ptr()),
-            static_cast<uint8_t*>(fp4_v_block_scales.data_ptr()),
-            static_cast<uint8_t*>(page_format.data_ptr()),
-            static_cast<float*>(page_router_stats.data_ptr()),
-            static_cast<const float*>(routing_thresholds.data_ptr()), completed_capacity, page_size,
-            num_heads, head_dim, k_input.stride(0), k_input.stride(1), k_input.stride(2),
-            k_input.stride(3), fp8_k_output.stride(0), fp8_k_output.stride(1),
-            fp8_k_output.stride(2), fp8_k_output.stride(3), fp4_k_output.stride(0),
-            fp4_k_output.stride(1), fp4_k_output.stride(2), fp4_k_output.stride(3),
-            fp8_k_block_scales.stride(0), fp8_k_block_scales.stride(1),
-            fp8_k_block_scales.stride(2), fp8_k_block_scales.stride(3));
+    const dim3 row_grid(completed_capacity * page_size, num_heads);
+    mixed_kv_route_rows_kernel<c_type, ROUTE_THREADS><<<row_grid, ROUTE_THREADS, 0, stream>>>(
+        static_cast<const c_type*>(k_input.data_ptr()),
+        static_cast<const c_type*>(v_input.data_ptr()),
+        static_cast<const int32_t*>(completed_pages.data_ptr()),
+        static_cast<const int32_t*>(completed_count.data_ptr()),
+        static_cast<float*>(page_router_partials.data_ptr()), completed_capacity, page_size,
+        num_heads, head_dim, k_input.stride(0), k_input.stride(1), k_input.stride(2),
+        k_input.stride(3));
+    mixed_kv_finalize_route_kernel<ROUTE_THREADS><<<completed_capacity, ROUTE_THREADS, 0, stream>>>(
+        static_cast<const int32_t*>(completed_pages.data_ptr()),
+        static_cast<const int32_t*>(completed_count.data_ptr()),
+        static_cast<const float*>(page_router_partials.data_ptr()),
+        static_cast<float*>(page_router_stats.data_ptr()), completed_capacity, page_size,
+        num_heads);
+    mixed_kv_quant_rows_kernel<c_type, QUANT_THREADS><<<row_grid, QUANT_THREADS, 0, stream>>>(
+        static_cast<const c_type*>(k_input.data_ptr()),
+        static_cast<const c_type*>(v_input.data_ptr()),
+        static_cast<const int32_t*>(completed_pages.data_ptr()),
+        static_cast<const int32_t*>(completed_count.data_ptr()),
+        static_cast<const float*>(fp8_k_global_scale.data_ptr()),
+        static_cast<const float*>(fp8_v_global_scale.data_ptr()),
+        static_cast<const float*>(fp4_k_global_scale.data_ptr()),
+        static_cast<const float*>(fp4_v_global_scale.data_ptr()),
+        static_cast<uint8_t*>(fp8_k_output.data_ptr()),
+        static_cast<uint8_t*>(fp8_v_output.data_ptr()),
+        static_cast<uint8_t*>(fp8_k_block_scales.data_ptr()),
+        static_cast<uint8_t*>(fp8_v_block_scales.data_ptr()),
+        static_cast<uint8_t*>(fp4_k_output.data_ptr()),
+        static_cast<uint8_t*>(fp4_v_output.data_ptr()),
+        static_cast<uint8_t*>(fp4_k_block_scales.data_ptr()),
+        static_cast<uint8_t*>(fp4_v_block_scales.data_ptr()),
+        static_cast<const float*>(page_router_stats.data_ptr()),
+        static_cast<const float*>(routing_thresholds.data_ptr()), completed_capacity, page_size,
+        num_heads, head_dim, k_input.stride(0), k_input.stride(1), k_input.stride(2),
+        k_input.stride(3), fp8_k_output.stride(0), fp8_k_output.stride(1), fp8_k_output.stride(2),
+        fp8_k_output.stride(3), fp4_k_output.stride(0), fp4_k_output.stride(1),
+        fp4_k_output.stride(2), fp4_k_output.stride(3), fp8_k_block_scales.stride(0),
+        fp8_k_block_scales.stride(1), fp8_k_block_scales.stride(2), fp8_k_block_scales.stride(3));
+    const int publish_blocks = (completed_capacity + RESET_THREADS - 1) / RESET_THREADS;
+    mixed_kv_publish_pages_kernel<<<publish_blocks, RESET_THREADS, 0, stream>>>(
+        static_cast<const int32_t*>(completed_pages.data_ptr()),
+        static_cast<const int32_t*>(completed_count.data_ptr()),
+        static_cast<uint8_t*>(page_format.data_ptr()),
+        static_cast<const float*>(page_router_stats.data_ptr()),
+        static_cast<const float*>(routing_thresholds.data_ptr()), completed_capacity);
     return true;
   });
 }
