@@ -148,12 +148,14 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
 // compressed K copy fetch whole 64 B (FP8) / 32 B (FP4) runs of the token row instead of one
 // 32 B / 16 B fragment (K line requests per SM-tile 1024 -> 512).  cacheVTileSeqLen 16 pays for
 // the 32 KB larger K ring inside the 99 KB SharedMem cap (K 64 KB + V 16 KB + Q 4 KB + X 8 KB).
-// The mixed-page D128 decode tile fits this schedule. D256 doubles Q storage and
-// exceeds the shared-memory budget; wider heads and SPEC_DEC retain 64 B K parts.
+// D256 uses the same copy schedule without storing unused padded Q rows.
+// Wider heads and query tiles retain 64 B K parts.
 // Native block-scaled builds need >= 32 V rows per warp pair for scale copies.
-#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC && HEAD_ELEMS <= 128
+#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC && \
+    (HEAD_ELEMS <= 128 || (HEAD_ELEMS == 256 && HEAD_GRP_SIZE * BEAM_WIDTH <= 8))
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 16;
+#define MIXED_COMPACT_Q_ROWS (HEAD_ELEMS == 256)
 #else
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
@@ -192,6 +194,9 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
 #ifndef MIXED_COMPACT_TILE_LOOPS
 #define MIXED_COMPACT_TILE_LOOPS 0
+#endif
+#ifndef MIXED_COMPACT_Q_ROWS
+#define MIXED_COMPACT_Q_ROWS 0
 #endif
 // Rolled per-tile loops and a single (bounds-checked) copy body per format: code footprint
 // over unrolled scheduling freedom (Track S step 5 [43], sm90 SPEC_DEC mixed build only).
@@ -438,7 +443,8 @@ using VCachePageIndices = Vec<KVCachePageIndex, nbPagesPerVTile>;
 static_assert(ctaShapeInWarps.y == 1);
 
 struct alignas(128) SharedMem {
-  using QSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(qHeadPartBytes, grainBytes)>;
+  static constexpr uint32_t qRows = MIXED_COMPACT_Q_ROWS ? 8 : warpTile.y;
+  using QSmemBuffer = Array2D<LdGrain, qRows, exactDiv(qHeadPartBytes, grainBytes)>;
   using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kHeadPartBytes, grainBytes)>;
   using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
   using VSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
@@ -1115,11 +1121,15 @@ using InstInMatWTrans = InstInMat<transOuter ? mnEx : kEx, transOuter ? kEx : mn
 // transInner: transpose the elements, i.e. the 8x8 b16 matrices. transOuter=true and
 // transInner=false is for B matrix of 16816. It actually loads two 8x16 B matrices for two
 // instructions. transOuter=false and transInner=false is for A matrix of 16816.
+struct DirectMatrixRow {
+  __device__ uint32_t operator()(uint32_t row) const { return row; }
+};
+
 template <uint32_t kEx, uint32_t mnEx, bool transOuter, bool transInner, bool is4BitElem,
-          uint32_t srcRows, uint32_t srcCols>
+          uint32_t srcRows, uint32_t srcCols, typename RowIndex = DirectMatrixRow>
 __device__ inline InstInMatWTrans<kEx, mnEx, transOuter> loadInstInMat(
     Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint32_t rowOffset,
-    uint32_t colOffset) {
+    uint32_t colOffset, RowIndex rowIndex = {}) {
   static_assert(kEx * mnEx == 4, "implemented only for ldmatrix.x4 for now");
   using Dst = InstInMatWTrans<kEx, mnEx, transOuter>;
   assert(rowOffset % (8 * mnEx) == 0 && colOffset % kEx == 0);
@@ -1129,8 +1139,8 @@ __device__ inline InstInMatWTrans<kEx, mnEx, transOuter> loadInstInMat(
   uint32_t const srcIdxKEx = (transOuter ? idxMNEx : idxKEx);
   uint32_t const srcIdxMNEx = (transOuter ? idxKEx : idxMNEx);
 
-  LdGrain const* const ptr =
-      &src.template at<true>(rowOffset + 8 * srcIdxMNEx + laneId() % 8, colOffset + srcIdxKEx);
+  LdGrain const* const ptr = &src.template at<true>(
+      rowIndex(rowOffset + 8 * srcIdxMNEx + laneId() % 8), colOffset + srcIdxKEx);
 
   Vec<uint32_t, 4> data;
 #if ENABLE_4BIT_KV_CACHE
@@ -1160,11 +1170,11 @@ using Array2DWTrans = Array2D<T, transpose ? cols : rows, transpose ? rows : col
 // kEx combines with dstCols and mnEx combines with dstRows.
 template <uint32_t kEx, uint32_t mnEx, uint32_t dstRows, uint32_t dstCols, bool transArr2D,
           bool transInstInMatOuter, bool transInstInMatInner, bool is4BitElem, uint32_t srcRows,
-          uint32_t srcCols /*in LdGrain*/>
+          uint32_t srcCols /*in LdGrain*/, typename RowIndex = DirectMatrixRow>
 __device__ inline Array2DWTrans<InstInMatWTrans<kEx, mnEx, transInstInMatOuter>, dstRows, dstCols,
                                 transArr2D>
 loadMatrix(Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint32_t rowBeg,
-           uint32_t colBeg) {
+           uint32_t colBeg, RowIndex rowIndex = {}) {
   assert(rowBeg % (8 * mnEx * dstRows) == 0 && colBeg % (kEx * dstCols) == 0);
   Array2DWTrans<InstInMatWTrans<kEx, mnEx, transInstInMatOuter>, dstRows, dstCols, transArr2D> dst;
 #pragma unroll
@@ -1173,10 +1183,19 @@ loadMatrix(Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint
     for (uint32_t j = 0; j < dstCols; j++) {
       (transArr2D ? dst(j, i) : dst(i, j)) =
           loadInstInMat<kEx, mnEx, transInstInMatOuter, transInstInMatInner, is4BitElem>(
-              warp, src, rowBeg + (mnEx * 8) * i, colBeg + kEx * j);
+              warp, src, rowBeg + (mnEx * 8) * i, colBeg + kEx * j, rowIndex);
     }
   }
   return dst;
+}
+
+template <uint32_t kEx, uint32_t mnEx, uint32_t rows, uint32_t cols>
+__device__ inline auto loadQueryMatrix(Warp const& warp, SharedMem::QSmemBuffer const& q,
+                                       uint32_t colBeg) {
+  // Padded MMA rows are never stored to output. Reuse valid shared rows for
+  // them instead of allocating another eight Q heads just to hold zeros.
+  return loadMatrix<kEx, mnEx, rows, cols, false, false, false, false>(
+      warp, q, 0, colBeg, [](uint32_t row) { return row % SharedMem::qRows; });
 }
 
 #if ENABLE_MIXED_COMPACT_PAGES
@@ -1277,8 +1296,7 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
 
 #pragma unroll
   for (uint32_t block = 0; block < blocksPerPart; ++block) {
-    auto const qSlice = loadMatrix<kEx, mnEx, qSliceRows, 1, false, false, false, false>(
-        warp, q, 0, qColBeg + kEx * block);
+    auto const qSlice = loadQueryMatrix<kEx, mnEx, qSliceRows, 1>(warp, q, qColBeg + kEx * block);
 #pragma unroll
     for (uint32_t page = 0; page < nbPagesPerWarpTile; ++page) {
       auto const loadPage = [&]() {
@@ -1573,8 +1591,7 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
     constexpr uint32_t qSliceRows = exactDiv(warpTile.y, 8 * mnEx);  // in InstInMat
     constexpr uint32_t qSliceCols = nbInstInMatPerSliceInGemmKDim;
     Array2D<InstInMat<kEx, mnEx>, qSliceRows, qSliceCols> const qSlice =
-        loadMatrix<kEx, mnEx, qSliceRows, qSliceCols, false, false, false, false>(
-            warp, q, 0, qColBeg + kEx * qSliceCols * s);
+        loadQueryMatrix<kEx, mnEx, qSliceRows, qSliceCols>(warp, q, qColBeg + kEx * qSliceCols * s);
     // load k
     constexpr uint32_t cvtExp = exactDiv(inputElemSize, kElemSize);
     constexpr uint32_t mnExK = mnEx * cvtExp;
@@ -2301,11 +2318,11 @@ CUBIN_EXPORT __global__
     uint32_t const idxHeadBeg = nbQHeads * beamWidth * idxReq + headGrpSize * idxHeadGrp;
     TinyPtr<IOHead const> const src{srcBase, idxHeadBeg};
 
-    constexpr bool isFullTile = (nbValidRows == warpTile.y);
+    constexpr bool isFullTile = (nbValidRows == SharedMem::qRows);
     static_assert(nbQBuffers == 1);
-    copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                   qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                      nbValidRows, localQHeadIdxMap);
+    copyHeadsAsync<PaddedInputHead, SharedMem::qRows, ctaShapeInWarps.x, grainBytes, grainBytes,
+                   qkSwizzle, isFullTile, SharedMem::qRows>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                            nbValidRows, localQHeadIdxMap);
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
   }
 #endif
