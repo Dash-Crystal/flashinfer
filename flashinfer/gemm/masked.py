@@ -15,19 +15,21 @@ def get_masked_gemm_module():
 
 
 @cache
-def _prepared_module(device: int, dtype: torch.dtype):
+def _prepared_module(device: int, dtype: torch.dtype, publish: bool):
     module = get_masked_gemm_module()
-    module.prepare(device, dtype == torch.bfloat16)
+    module.prepare(device, dtype == torch.bfloat16, publish)
     return module
 
 
-def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0):
+def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=None):
     """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
 
     The caller must consume outputs with the same row mask. Arbitrary holes in
     the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
     Operands are A row-major, B column-major, and output row-major, aligned to
-    eight FP16/BF16 values. No preparation tensor or launch is introduced.
+    eight FP16/BF16 values. An optional peer mapping receives the same epilogue
+    stores with system ordering. Its owner must order peer readers and reuse.
+    No preparation tensor or launch is introduced.
     """
     if (
         x.dtype not in (torch.float16, torch.bfloat16)
@@ -62,8 +64,19 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0):
         or row_offset + x.shape[0] > is_padding.numel()
     ):
         raise ValueError("Expected aligned CUDA TN GEMM operands and logical row mask")
+    if peer_output is not None and (
+        peer_output.device != x.device
+        or peer_output.dtype != out.dtype
+        or peer_output.shape != out.shape
+        or peer_output.stride() != out.stride()
+        or peer_output.data_ptr() % 16
+        or torch._C._overlaps(peer_output, out)
+    ):
+        raise ValueError(
+            "Peer output must be a distinct mapping with the output layout"
+        )
     if x.shape[0] and weight.shape[1]:
-        _prepared_module(x.device.index, x.dtype).run(
-            x, weight, out, is_padding, row_offset
+        _prepared_module(x.device.index, x.dtype, peer_output is not None).run(
+            x, weight, out, is_padding, row_offset, peer_output
         )
     return out

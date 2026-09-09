@@ -1,6 +1,6 @@
 # GEMM tiles with live row operands
 
-`mm_masked_tiles(x, weight, out, is_padding, row_offset=0)` reuses the
+`mm_masked_tiles(x, weight, out, is_padding, row_offset=0, peer_output=None)` reuses the
 caller's row visibility tensor. A CTA checks its 128-row tile and returns
 before operand loading or matrix multiplication if every row is padding.
 Partially visible tiles execute ordinary GEMM arithmetic. The operation
@@ -53,3 +53,24 @@ and 2.92% higher matched latency than the row composition. Both results are
 retained in the vLLM serving review; the canonical service adopts the masked
 row composition. Its numerical reference remains the ordinary unsplit GEMM
 and reduction, with the error metrics above.
+
+An optional `peer_output` maps an equally shaped peer allocation into the
+producer's CUDA address space. A CUTLASS output iterator writes the same
+epilogue fragment to local output and peer storage. The mainloop, rounding,
+visibility and tile geometry are shared with the local-only specialization.
+Each publishing thread executes a system fence before kernel completion.
+The caller orders the consumer launch after GEMM and performs a cross-rank
+rendezvous before reading the received contribution. Peer readers must finish
+before the producer reuses that slot. This API does not allocate, register,
+copy or synchronize peer buffers on the host.
+
+The vLLM integration owns one receive slot per overlapping partition in a
+communicator-lifetime symmetric allocation. The handle owns peer mappings;
+the existing consumer end rendezvous and stream join protect reuse across
+partitions and layers. The full-model campaign for this composition is
+`/data/h3-runtime/tp2-peer-publication-v22-20260909` on ws-1. Its isolated
+SM120 module build completes. The full-model numerical campaign completes at
+20:51:30 UTC with 14 samples and 82,909,440 values per rank: zero measured
+relative RMS, maximum absolute error and nonfinite count. Projection samples
+cover 1,761 rows, K=2,048/4,096/7,680 and N=3,840. This uncaptured numerical
+mode has no padded rows. Graph and adaptive serving measurements are pending.
