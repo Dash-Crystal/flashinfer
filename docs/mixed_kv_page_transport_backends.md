@@ -3218,4 +3218,12 @@ in candidate and distinct module identities. Its 36 consumer records measure
 0.146--0.349% RMS with zero nonfinite outputs, including sampled prefill and
 1,645-token continuation. Its D256 4K sample used one split; attempt 10
 keeps single/multi-split captures separately to cover the original failure.
-The corrected serving comparison remains in progress.
+The completed corrected comparison predicts 6.04% lower full-model
+continuation latency in the padded-1024 plan and 10.54% lower in padded-2048,
+at identical supplied work coordinates (working SE 0.53/0.62 percentage
+points, excluding drift and model error). Attempt 10 adds native D256
+two-split captures at contexts 1,468/2,103: output RMS 0.209--0.236%, partial
+attention RMS 0.175--0.253%, with zero nonfinite values. The source fix is
+therefore exercised through complete serving executions, including unaligned
+window boundaries. Decode response changes remain mixed; these measurements
+do not establish whole-sequence KL or a uniform hardware-roofline gain.
