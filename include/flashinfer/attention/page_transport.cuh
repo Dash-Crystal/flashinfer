@@ -37,18 +37,31 @@ struct KVPageTransport {
   uint8_t const* page_format = nullptr;
   KVPageStorage storage{};
 
-  __device__ uint8_t format(uint32_t page) const {
-    if (storage.pages == nullptr) return page_format[page];
-    const auto address = storage.template address<PagesPerBlock, PageStride>(page);
-    return address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
+  template <int StaticFormat = -1>
+  __device__ KVPageAddress resolve(uint32_t page, bool valid) const {
+    if (!valid) return {};
+    if (storage.pages != nullptr) return storage.template address<PagesPerBlock, PageStride>(page);
+    const auto format = StaticFormat >= 0 ? StaticFormat : page_format[page];
+    return KVPageAddress::make(uint64_t(page) << 2, static_cast<KVPageFormat>(format));
   }
 
-  __device__ KVPageFormatSpan span(uint32_t page, uint8_t format, bool valid = true) const {
+  // Resolve the address once at prefetch; payload and scale loads share it.
+  __device__ KVPageFormatSpan span(KVPageAddress address, uint8_t format) const {
     auto result = formats[format];
-    if (storage.pages == nullptr) return result;
-    const auto address =
-        valid ? storage.template address<PagesPerBlock, PageStride>(page) : KVPageAddress{};
     result.allocated = address.allocated();
+    if (storage.pages == nullptr) {
+      const uint64_t page = address.allocated() ? address.offset() >> 2 : 0;
+      result.k_payload =
+          static_cast<const uint8_t*>(result.k_payload) + page * result.payload_stride.page;
+      result.v_payload =
+          static_cast<const uint8_t*>(result.v_payload) + page * result.payload_stride.page;
+      if (format != static_cast<uint8_t>(KVPageFormat::kA16)) {
+        result.k_scales += page * result.scale_stride.page;
+        result.v_scales += page * result.scale_stride.page;
+      }
+      result.payload_stride.page = result.scale_stride.page = 0;
+      return result;
+    }
     const auto origin = address.allocated() ? address : KVPageAddress::make(0, KVPageFormat::kA16);
     result.k_payload = storage.payload(origin, 0, 0, false);
     result.v_payload = storage.payload(origin, 0, 0, true);

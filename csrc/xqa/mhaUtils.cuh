@@ -180,48 +180,36 @@ struct MixedPageFormats {
   Vec<uint8_t, nbPages> values;
 };
 
-// Gather every page tag in the warp tile exactly once.  The page list is
-// warp-uniform; elected lanes issue the byte loads and shuffles distribute the
-// fixed-size metadata vector used by all block owners.
 template <uint32_t nbPages>
-__device__ inline MixedPageFormats<nbPages> gatherMixedPageFormats(
-    PageTransport const& transport, Vec<KVCachePageIndex, nbPages> const& pages) {
-  MixedPageFormats<nbPages> ret;
-  uint32_t const lane = laneId();
-  uint32_t value = 0;
-  KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
-  if (page != kBAD_PAGE_INDEX) {
-    value = transport.format(page);
-  }
+struct MixedPageReferences {
+  Vec<uint64_t, nbPages> values;
+
+  __device__ MixedPageFormats<nbPages> formats() const {
+    MixedPageFormats<nbPages> result;
 #pragma unroll
-  for (uint32_t i = 0; i < nbPages; ++i) {
-    ret.values[i] = static_cast<uint8_t>(__shfl_sync(0xffffffffU, value, i));
+    for (uint32_t i = 0; i < nbPages; ++i) {
+      const flashinfer::KVPageAddress address{values[i]};
+      result.values[i] = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
+    }
+    return result;
   }
-  return ret;
+};
+
+// The lane-distributed prefetch retains both address and format until use.
+template <uint32_t nbPages>
+__device__ inline uint64_t mixedPageReferenceLane(PageTransport const& transport,
+                                                  Vec<KVCachePageIndex, nbPages> const& pages) {
+  uint32_t const lane = laneId();
+  KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
+  return transport.template resolve<MIXED_PAGE_STATIC_FORMAT>(page, page != kBAD_PAGE_INDEX).value;
 }
 
-// Two-step form of gatherMixedPageFormats for a loader that prefetches page
-// indices two tiles ahead: issue this lane's tag load as soon as the indices
-// have landed (no consumer -> no stall) ...
 template <uint32_t nbPages>
-__device__ inline uint32_t mixedPageTagLane(PageTransport const& transport,
-                                            Vec<KVCachePageIndex, nbPages> const& pages) {
-  uint32_t const lane = laneId();
-  uint32_t value = 0;
-  KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
-  if (page != kBAD_PAGE_INDEX) {
-    value = transport.format(page);
-  }
-  return value;
-}
-
-// ... and broadcast it a tile later, when it is needed.
-template <uint32_t nbPages>
-__device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t laneValue) {
-  MixedPageFormats<nbPages> ret;
+__device__ inline MixedPageReferences<nbPages> broadcastMixedPageReferences(uint64_t laneValue) {
+  MixedPageReferences<nbPages> ret;
 #pragma unroll
   for (uint32_t i = 0; i < nbPages; ++i) {
-    ret.values[i] = static_cast<uint8_t>(__shfl_sync(0xffffffffU, laneValue, i));
+    ret.values[i] = __shfl_sync(0xffffffffU, laneValue, i);
   }
   return ret;
 }
@@ -235,9 +223,11 @@ __device__ inline MixedPageFormats<nbPages> broadcastMixedPageTags(uint32_t lane
 // Data flow: laneValue (u8 in a u32, lane s) -> contrib = lane < nbPages ? tag << 8 lane : 0 ->
 // REDUX.OR -> word.  Control flow: convergent (all 32 lanes; called by the whole loader warp).
 template <uint32_t nbPages>
-__device__ inline uint32_t packMixedPageTags(uint32_t laneValue) {
+__device__ inline uint32_t packMixedPageTags(uint64_t laneReference) {
   static_assert(nbPages <= 4, "four 8-bit tags per word");
   uint32_t const lane = laneId();
+  const flashinfer::KVPageAddress address{laneReference};
+  uint32_t const laneValue = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
   uint32_t const contrib = lane < nbPages ? (laneValue << (8u * (lane & 3u))) : 0u;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_or_sync(0xFFFFFFFFu, contrib);
@@ -333,10 +323,9 @@ __device__ inline void copyMixedPartialHeadsAsync(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
     uint8_t* dstScales, uint32_t dstHeadOffset, PageTransport const& transport,
-    Vec<KVCachePageIndex, nbPages> const& pages, MixedPageFormats<nbPages> const& formats,
-    uint32_t sourceHeadOffset, uint32_t headIdx, bool isK, uint32_t idxPart, uint32_t nbSkipHeads,
-    uint32_t nbAvailHeads = maxNbCopiedHeads, uint32_t idxWarp = 0,
-    uint8_t* probeScratch = nullptr) {
+    MixedPageReferences<nbPages> const& references, uint32_t sourceHeadOffset, uint32_t headIdx,
+    bool isK, uint32_t idxPart, uint32_t nbSkipHeads, uint32_t nbAvailHeads = maxNbCopiedHeads,
+    uint32_t idxWarp = 0, uint8_t* probeScratch = nullptr) {
   // The source origin is span-aligned, so headsPerSpan heads lie in one page:
   // pages[] / formats[] are read once per
   // span (a compare/select chain over the register vector, no local memory).
@@ -356,27 +345,26 @@ __device__ inline void copyMixedPartialHeadsAsync(
                 "compact mixed-page fragments require the vLLM 16-token page unit");
   assert(idxWarp < nbWarps);
   using flashinfer::KVPageFormat;
+  const auto formats = references.formats();
   uint8_t constexpr a16Format = static_cast<uint8_t>(KVPageFormat::kA16);
   uint8_t constexpr fp8Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8);
   uint8_t constexpr fp4Format = static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4);
 
-  auto const copySpan = [&](uint32_t span, KVCachePageIndex page, auto formatTag) {
+  auto const copySpan = [&](uint32_t span, flashinfer::KVPageAddress address, auto formatTag) {
     constexpr uint8_t format = decltype(formatTag)::value;
     constexpr bool isA16 = format == a16Format;
     constexpr bool isFP8 = format == fp8Format;
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
-    auto const fmt = transport.span(page, format, page != kBAD_PAGE_INDEX);
+    auto const fmt = transport.span(address, format);
     auto const* payload = static_cast<uint8_t const*>(isK ? fmt.k_payload : fmt.v_payload);
-    bool const pageValid = page != kBAD_PAGE_INDEX && fmt.allocated;
+    bool const pageValid = fmt.allocated;
     uint32_t const spanHead0 = span * headsPerSpan;
     uint32_t const token0 = (sourceHeadOffset + spanHead0) % tokensPerPage;
     // The page's own format also for !valid blocks: their payload copies are zero-fills
     // and the expansion of a zero payload is zero, i.e. the same tile bytes the former
     // "treat as A16 and zero-fill 32 B" produced, without a lane-varying format.
-    uint64_t const pageBase = pageValid ? uint64_t(page) * fmt.payload_stride.page +
-                                              uint64_t(headIdx) * fmt.payload_stride.head
-                                        : 0;
+    uint64_t const pageBase = pageValid ? uint64_t(headIdx) * fmt.payload_stride.head : 0;
 #pragma unroll
     for (uint32_t iteration = 0; iteration < iterationsPerSpan; ++iteration) {
       uint32_t const blockInSpan = iteration * nbThreads + idxWarp * warp_size + laneId();
@@ -470,21 +458,22 @@ __device__ inline void copyMixedPartialHeadsAsync(
 #pragma unroll(pageLoopUnroll)
   for (uint32_t span = 0; span < nbSpans; ++span) {
     uint32_t const localPage = (sourceHeadOffset + span * headsPerSpan) / tokensPerPage;
-    KVCachePageIndex const page =
-        localPage < nbPages ? selectByIndex(pages, localPage) : kBAD_PAGE_INDEX;
+    const flashinfer::KVPageAddress address{localPage < nbPages
+                                                ? selectByIndex(references.values, localPage)
+                                                : flashinfer::kUnallocatedKVPage};
 #if MIXED_PAGE_STATIC_FORMAT >= 0
     unused(formats);
-    copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
+    copySpan(span, address, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
     uint8_t const format =
         localPage < nbPages ? selectByIndex(formats.values, localPage) : a16Format;
     if (format == a16Format) {
-      copySpan(span, page, MixedFormatTag<a16Format>{});
+      copySpan(span, address, MixedFormatTag<a16Format>{});
     } else if (format == fp8Format) {
-      copySpan(span, page, MixedFormatTag<fp8Format>{});
+      copySpan(span, address, MixedFormatTag<fp8Format>{});
     } else {
       assert(format == fp4Format);
-      copySpan(span, page, MixedFormatTag<fp4Format>{});
+      copySpan(span, address, MixedFormatTag<fp4Format>{});
     }
 #endif
   }
@@ -506,22 +495,22 @@ __device__ inline void copyMixedPartialHeadsAsync(
     // One lane per head: the page is lane / tokensPerPage plus an iteration constant,
     // a compare/select chain over the register vector (no local memory).
     uint32_t const localPage = absoluteToken / tokensPerPage;
-    KVCachePageIndex const page =
-        localPage < nbPages ? selectByIndex(pages, localPage) : kBAD_PAGE_INDEX;
+    const flashinfer::KVPageAddress address{localPage < nbPages
+                                                ? selectByIndex(references.values, localPage)
+                                                : flashinfer::kUnallocatedKVPage};
     uint32_t const token = absoluteToken % tokensPerPage;
-    bool const valid = validHead && page != kBAD_PAGE_INDEX;
+    bool const valid = validHead && address.allocated();
     uint8_t const format =
 #if MIXED_PAGE_STATIC_FORMAT >= 0
         valid ? MIXED_PAGE_STATIC_FORMAT : 0;
 #else
         valid ? selectByIndex(formats.values, localPage) : 0;
 #endif
-    auto const span = transport.span(page, format, page != kBAD_PAGE_INDEX);
+    auto const span = transport.span(address, format);
     bool const compressed = format != static_cast<uint8_t>(flashinfer::KVPageFormat::kA16);
     auto const* scales = isK ? span.k_scales : span.v_scales;
     uint64_t const scaleOffset = valid && compressed
-                                     ? uint64_t(page) * span.scale_stride.page +
-                                           uint64_t(token) * span.scale_stride.token +
+                                     ? uint64_t(token) * span.scale_stride.token +
                                            uint64_t(headIdx) * span.scale_stride.head + scaleGroup
                                      : 0;
     auto const* scaleSource =
@@ -1401,9 +1390,9 @@ template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, bool
 __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     Array2D<_LdGrain, dstNbHeads,
             exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
-    uint8_t* dstScales, PageTransport const& transport, Vec<KVCachePageIndex, nbPages> const& pages,
-    uint32_t formatWord, uint32_t headIdx, uint32_t idxPart, uint32_t nbSkipHeads,
-    uint32_t nbAvailHeads) {
+    uint8_t* dstScales, PageTransport const& transport,
+    MixedPageReferences<nbPages> const& references, uint32_t formatWord, uint32_t headIdx,
+    uint32_t idxPart, uint32_t nbSkipHeads, uint32_t nbAvailHeads) {
   using Tile = Array2D<_LdGrain, dstNbHeads,
                        exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>;
   // Dependent static_asserts only (see expandMixedPartialHeadsInPlaceBF16Placement).
@@ -1448,26 +1437,25 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
   uint32_t const dstSecond =
       tileBase + Tile::template byteOffset<swizzle>(headInSpan0, blockInPart * 2 + 1);
 
-  auto const copySpan = [&](uint32_t span, KVCachePageIndex page, auto formatTag) {
+  auto const copySpan = [&](uint32_t span, flashinfer::KVPageAddress address, auto formatTag) {
     constexpr uint8_t format = decltype(formatTag)::value;
     constexpr bool isA16 = format == a16Format;
     constexpr bool isFP8 = format == fp8Format;
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
-    auto const fmt = transport.span(page, format, page != kBAD_PAGE_INDEX);
+    auto const fmt = transport.span(address, format);
     uint8_t const* payload;
     if constexpr (isK) {
       payload = static_cast<uint8_t const*>(fmt.k_payload);
     } else {
       payload = static_cast<uint8_t const*>(fmt.v_payload);
     }
-    bool const pageValid = page != kBAD_PAGE_INDEX && fmt.allocated;
+    bool const pageValid = fmt.allocated;
     uint32_t const spanHead0 = span * headsPerSpan;
     // Byte offset of this lane's block inside the token row, per format.
     uint32_t const elemOff = isA16 ? elem * uint32_t(sizeof(InputElem)) : (isFP8 ? elem : elem / 2);
     // Page + head + lane-row terms once per span; the two iterations add 8 * stride.token.
-    uint64_t const laneOff = pageValid ? uint64_t(page) * fmt.payload_stride.page +
-                                             uint64_t(headIdx) * fmt.payload_stride.head +
+    uint64_t const laneOff = pageValid ? uint64_t(headIdx) * fmt.payload_stride.head +
                                              uint64_t(headInSpan0) * fmt.payload_stride.token
                                        : 0;
     uint8_t const* const laneSrc = payload + laneOff + elemOff;
@@ -1501,20 +1489,20 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 
 #pragma unroll(pageLoopUnroll)
   for (uint32_t span = 0; span < nbSpans; ++span) {
-    KVCachePageIndex const page = selectByIndex(pages, span);
+    const flashinfer::KVPageAddress address{selectByIndex(references.values, span)};
 #if MIXED_PAGE_STATIC_FORMAT >= 0
     unused(formatWord);
-    copySpan(span, page, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
+    copySpan(span, address, MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
     // [45c]: byte span of the register tag word (was a byte of the shuffled struct).
     uint8_t const format = mixedPageTagOfSpan(formatWord, span);
     if (format == a16Format) {
-      copySpan(span, page, MixedFormatTag<a16Format>{});
+      copySpan(span, address, MixedFormatTag<a16Format>{});
     } else if (format == fp8Format) {
-      copySpan(span, page, MixedFormatTag<fp8Format>{});
+      copySpan(span, address, MixedFormatTag<fp8Format>{});
     } else {
       assert(format == fp4Format);
-      copySpan(span, page, MixedFormatTag<fp4Format>{});
+      copySpan(span, address, MixedFormatTag<fp4Format>{});
     }
 #endif
   }
@@ -1529,8 +1517,8 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     uint32_t const localHead = i * warp_size + lane;
     uint32_t const localPage = i * exactDiv(warp_size, tokensPerPage) + lane / tokensPerPage;
     static_assert(headIterations * exactDiv(warp_size, tokensPerPage) <= nbPages);
-    KVCachePageIndex const page = selectByIndex(pages, localPage);
-    bool const pageValid = page != kBAD_PAGE_INDEX;
+    const flashinfer::KVPageAddress address{selectByIndex(references.values, localPage)};
+    bool const pageValid = address.allocated();
     uint8_t const format =
 #if MIXED_PAGE_STATIC_FORMAT >= 0
         pageValid ? MIXED_PAGE_STATIC_FORMAT : a16Format;
@@ -1539,7 +1527,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 #endif
     bool const compressed = format != a16Format;
     if (compressed) {
-      auto const sp = transport.span(page, format, page != kBAD_PAGE_INDEX);
+      auto const sp = transport.span(address, format);
       uint8_t const* scales;
       if constexpr (isK) {
         scales = sp.k_scales;
@@ -1547,8 +1535,7 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
         scales = sp.v_scales;
       }
       bool const valid = sp.allocated && localHead >= nbSkipHeads && localHead < nbAvailHeads;
-      uint64_t const scaleOffset = uint64_t(page) * sp.scale_stride.page +
-                                   uint64_t(token) * sp.scale_stride.token +
+      uint64_t const scaleOffset = uint64_t(token) * sp.scale_stride.token +
                                    uint64_t(headIdx) * sp.scale_stride.head + scaleGroup;
       cpAsyncCaShared<scaleLoadBytes>(scaleBase + i * warp_size * scaleLoadBytes,
                                       scales + scaleOffset, valid ? scaleLoadBytes : 0U);

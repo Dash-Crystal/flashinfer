@@ -96,8 +96,8 @@ constexpr bool compactMixedPages = ENABLE_MIXED_COMPACT_PAGES;
 // through copyMixedPartialHeadsAsync, whose per-page A16 body is the stock two-grain
 // copy, so it carries no separate copyPartialHeadsAsync instantiations (their code
 // sat between the hot mixed copy/expansion bodies of a kernel that stalled on
-// instruction fetch).  Static modules keep the stock A16 path.
-constexpr bool kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0;
+// instruction fetch). Rectangular static modules keep the stock A16 path.
+constexpr bool kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0 && XQA_PAGE_BLOCK_STRIDE == 0;
 
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
@@ -256,7 +256,8 @@ static_assert(!kMixedBF16PlacementExpansion ||
 // once the flag is the constant true; dyn: kA16CopyFastPath is false). Sliding-window A16
 // also needs the bounded copy: masked leading rows can reference recycled pages.
 #define MIXED_ALL_HOISTED_COPY \
-  (MIXED_HOISTED_COPY && (MIXED_PAGE_STATIC_FORMAT != 0 || SLIDING_WINDOW))
+  (MIXED_HOISTED_COPY &&       \
+   (MIXED_PAGE_STATIC_FORMAT != 0 || SLIDING_WINDOW || XQA_PAGE_BLOCK_STRIDE > 0))
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
 constexpr bool kMixedStaticNeedsExpansion = MIXED_PAGE_STATIC_FORMAT > 0;
 #endif
@@ -2419,12 +2420,7 @@ CUBIN_EXPORT __global__
     // by the previous call become current, their tags are requested, and p's
     // indices are requested.
     KCachePageIndices pageIdxNext = KCachePageIndices::filled(kBAD_PAGE_INDEX);
-#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
-    // [45c] static modules: the format is the build constant MIXED_PAGE_STATIC_FORMAT; no tag
-    // is loaded, broadcast or staged (the copy and the expansion ignored the tags already).
-#else
-    uint32_t pageTagLane = 0;
-#endif
+    uint64_t pageReferenceLane = flashinfer::kUnallocatedKVPage;
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
     // [45c] dynamic module: the tile's tags packed (byte s = page s; 0 = every page A16), one
     // word per K buffer, rotated with idxCurrSMemKBuf as two named registers (a u32[2] indexed
@@ -2441,9 +2437,7 @@ CUBIN_EXPORT __global__
       uint32_t const idxBeam = 0;
 #if ENABLE_MIXED_KV_CACHE
       pageIdx = pageIdxNext;
-#if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
-      pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
-#endif
+      pageReferenceLane = mixedPageReferenceLane(cacheList.transport, pageIdx);
 #if MIXED_COMPACT_TILE_LOOPS
       // [45f]: list load predicated on the kernel parameter maxNbPagesPerSeq, BAD selected on
       // nbPages afterwards (one dependent round trip less in the CTA prologue; same values).
@@ -2486,8 +2480,12 @@ CUBIN_EXPORT __global__
           seqOffset < nbTotalSkipTokens ? nbTotalSkipTokens - seqOffset : 0U;
 
 #if BEAM_WIDTH == 1
-#if ENABLE_MIXED_KV_CACHE && !MIXED_HOISTED_COPY
-      auto const pageFormats = broadcastMixedPageTags<nbPagesPerWarpTile>(pageTagLane);
+#if ENABLE_MIXED_KV_CACHE
+      const auto pageReferences =
+          broadcastMixedPageReferences<nbPagesPerWarpTile>(pageReferenceLane);
+#if !MIXED_HOISTED_COPY
+      const auto pageFormats = pageReferences.formats();
+#endif
 #endif
 #if !MIXED_ALL_HOISTED_COPY
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
@@ -2530,17 +2528,8 @@ CUBIN_EXPORT __global__
       bool const isFullTile = !kCompactTileLoops && (seqIter + 1 < nbSeqIters);
 #if ENABLE_MIXED_KV_CACHE
 #if MIXED_HOISTED_COPY
-      // [45c] metadata in registers (sm90 SPEC_DEC compact build; the stock body is the #else).
-      // Data flow: static modules - the expansion decision is the build constant
-      //   kMixedStaticNeedsExpansion, nothing is loaded or stored for it; dynamic module -
-      //   pageTagLane (lane s = tag of page s, requested one tile ago by loadPages) -> REDUX.OR ->
-      //   tagWord (byte s = tag of span s; 0 = all A16), passed by value to the copy (per-span
-      //   format branch, scale-loop format) and kept in kTagWordNext for the expansion of this
-      //   buffer one part later (rotated to kTagWordCurr at idxCurrSMemKBuf++).
-      // Control flow: no lane-0 store, no __syncwarp (it existed only for the STS -> LDS flag
-      //   path; the stock loaders issue cp.async with no barrier before it); one copy body per
-      //   module - MIXED_ALL_HOISTED_COPY (fp8 / fp4 / dyn): the hoisted copy; a16: the stock
-      //   bounds-checked A16 copy (isFullTile is constant false under kCompactTileLoops).
+      // Addresses remain in the prefetched references; the expansion ring
+      // needs only the derived format word for each buffer.
       static_assert(kCompactTileLoops, "MIXED_HOISTED_COPY implies the compact tile loops");
       static_assert(ctaTile.x % tokensPerPage == 0 && warpTile.x % tokensPerPage == 0);
       assert(tokenOffset == 0);
@@ -2548,7 +2537,7 @@ CUBIN_EXPORT __global__
 #if MIXED_PAGE_STATIC_FORMAT >= 0
       constexpr uint32_t tagWord = 0;  // static modules: the copy ignores the word
 #else
-      uint32_t const tagWord = packMixedPageTags<nbPagesPerWarpTile>(pageTagLane);
+      uint32_t const tagWord = packMixedPageTags<nbPagesPerWarpTile>(pageReferenceLane);
       kTagWordNext = tagWord;
 #endif
       uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
@@ -2556,7 +2545,7 @@ CUBIN_EXPORT __global__
 #if MIXED_ALL_HOISTED_COPY
       unused(dstHeadOffset);
       copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
-          dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageIdx,
+          dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageReferences,
           tagWord, idxHeadGrp, idxPart, nbHeadsSkip, nbHeadsAvail);
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
@@ -2592,7 +2581,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
-            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsSkip
+            cacheList.transport, pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip
 #if MIXED_KV_PROBE_C
             ,
             warpTile.x, 0, &smem.probeScratch[warpIdx.x][0]
@@ -2605,7 +2594,7 @@ CUBIN_EXPORT __global__
         copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
-            cacheList.transport, pageIdx, pageFormats, 0, idxHeadGrp, true, idxPart, nbHeadsSkip,
+            cacheList.transport, pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip,
             nbHeadsAvail
 #if MIXED_KV_PROBE_C
             ,
@@ -2981,11 +2970,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE
     // Two-deep prefetch, see the K loader.
     VCachePageIndices pageIdxNext = VCachePageIndices::filled(kBAD_PAGE_INDEX);
-#if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
-    // [45c] static modules: no tags (see the K loader).
-#else
-    uint32_t pageTagLane = 0;
-#endif
+    uint64_t pageReferenceLane = flashinfer::kUnallocatedKVPage;
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
     // [45c] dynamic module: packed tag word per V buffer, rotated at idxCurrSMemVBuf++ (see the
     // K loader's kTagWordNext / kTagWordCurr).
@@ -2999,9 +2984,7 @@ CUBIN_EXPORT __global__
       uint32_t const idxBeam = 0;
 #if ENABLE_MIXED_KV_CACHE
       pageIdx = pageIdxNext;
-#if !(MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0)
-      pageTagLane = mixedPageTagLane(cacheList.transport, pageIdx);
-#endif
+      pageReferenceLane = mixedPageReferenceLane(cacheList.transport, pageIdx);
 #if MIXED_COMPACT_TILE_LOOPS
       // [45f]: see the K loader.
       unused(idxBeam);
@@ -3138,11 +3121,11 @@ CUBIN_EXPORT __global__
           seqOffset < nbTotalSkipTokens ? (nbTotalSkipTokens - seqOffset) : 0U;
 
 #if BEAM_WIDTH == 1
+#if ENABLE_MIXED_KV_CACHE
+      const auto pageReferences = broadcastMixedPageReferences<nbPagesPerVTile>(pageReferenceLane);
+#endif
 #if ENABLE_MIXED_KV_CACHE && MIXED_HOISTED_COPY
-      // [45c] metadata in registers (see loadKTilePart for the data / control flow): no
-      // broadcast, no lane-0 stores, no __syncwarp; static modules carry no tag at all, the
-      // dynamic module packs pageTagLane into tagWord (copy) = vTagWordNext (expansion, one V
-      // iteration later, rotated at idxCurrSMemVBuf++).
+      // Reuse the prefetched references for V payload and scale loads.
       static_assert(
           ctaTile.x % tokensPerPage == 0 && (warpTile.x * nbXTilesPerXIter) % tokensPerPage == 0 &&
           cacheVTileSeqStride % tokensPerPage == 0 && cacheVTileSeqLen % tokensPerPage == 0);
@@ -3150,11 +3133,11 @@ CUBIN_EXPORT __global__
 #if MIXED_PAGE_STATIC_FORMAT >= 0
       constexpr uint32_t tagWord = 0;  // static modules: the copy ignores the word
 #else
-      uint32_t const tagWord = packMixedPageTags<nbPagesPerVTile>(pageTagLane);
+      uint32_t const tagWord = packMixedPageTags<nbPagesPerVTile>(pageReferenceLane);
       vTagWordNext = tagWord;
 #endif
 #elif ENABLE_MIXED_KV_CACHE
-      auto const pageFormats = broadcastMixedPageTags<nbPagesPerVTile>(pageTagLane);
+      const auto pageFormats = pageReferences.formats();
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // Sub-page V tiles retain the physical token offset in payload and scale loads.
       static_assert(ctaTile.x % tokensPerPage == 0 &&
@@ -3221,8 +3204,8 @@ CUBIN_EXPORT __global__
         uint32_t const warpHeadsSkip =
             sourceHeadOffset < nbHeadsSkip ? nbHeadsSkip - sourceHeadOffset : 0U;
         copyMixedPartialHeadsAsync<headsPerWarp, 1, vSwizzle, false, compactMixedPages>(
-            dst, getSmemVScales(idxNextSMemVBuf), sourceHeadOffset, cacheList.transport, pageIdx,
-            pageFormats, tokenOffset + sourceHeadOffset, idxHeadGrp, false, 0, warpHeadsSkip,
+            dst, getSmemVScales(idxNextSMemVBuf), sourceHeadOffset, cacheList.transport,
+            pageReferences, tokenOffset + sourceHeadOffset, idxHeadGrp, false, 0, warpHeadsSkip,
             mha::min(warpHeadsAvail, headsPerWarp));
       }
 #else
@@ -3248,8 +3231,8 @@ CUBIN_EXPORT __global__
       // [44] item 3: this warp's 128 B half row (idxPart = warpIdxInGrp), row 0 origin.
       unused(dstHeadOffset);
       copyMixedPartialHeadsAsyncHoisted<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false>(
-          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageIdx, tagWord, idxHeadGrp,
-          warpIdxInGrp, nbHeadsSkip, mha::min(nbHeadsAvail, cacheVTileSeqLen));
+          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport, pageReferences, tagWord,
+          idxHeadGrp, warpIdxInGrp, nbHeadsSkip, mha::min(nbHeadsAvail, cacheVTileSeqLen));
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
                     "a16 static module: every page is A16, the stock A16 copy is the only body");
@@ -3270,8 +3253,8 @@ CUBIN_EXPORT __global__
       } else {
         copyMixedPartialHeadsAsync<cacheVTileSeqLen, gemm1WarpsPerGrp, vSwizzle, false,
                                    compactMixedPages>(
-            dst, getSmemVScales(idxNextSMemVBuf), dstHeadOffset, cacheList.transport, pageIdx,
-            pageFormats, tokenOffset, idxHeadGrp, false, warpIdxInGrp, nbHeadsSkip,
+            dst, getSmemVScales(idxNextSMemVBuf), dstHeadOffset, cacheList.transport,
+            pageReferences, tokenOffset, idxHeadGrp, false, warpIdxInGrp, nbHeadsSkip,
             mha::min(nbHeadsAvail, cacheVTileSeqLen));
       }
 #endif  // MIXED_HOISTED_COPY
