@@ -203,7 +203,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
-                         uint64_t scratchBytes, uint32_t const* decodeWork, cudaStream_t stream);
+                         uint64_t scratchBytes, uint32_t const* attentionWork, cudaStream_t stream);
 
 void launchHopperF8MHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,

@@ -29,7 +29,7 @@
 #include "utils.cuh"
 #include "workScheduling.cuh"
 
-#define XQA_DEVICE_DECODE_SCHEDULE (ENABLE_MIXED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1)
+#define XQA_DEVICE_WORK_SCHEDULE (ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1)
 #define XQA_RAGGED_QUERY_SCHEDULE (ENABLE_MIXED_KV_CACHE && SPEC_DEC && BEAM_WIDTH == 1)
 #if defined(XQA_MASK_MOD)
 #include "mask_mod.cuh"
@@ -2150,9 +2150,9 @@ CUBIN_EXPORT __global__
         uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
         ,
-        uint32_t const* decodeWork = nullptr
+        uint32_t const* attentionWork = nullptr
 #endif
 #if XQA_RAGGED_QUERY_SCHEDULE
         ,
@@ -2164,30 +2164,37 @@ CUBIN_EXPORT __global__
   uint3 workBlock = blockIdx;
   uint32_t workBatchSize = batchSize;
   uint32_t request = blockIdx.z;
+#if XQA_DEVICE_WORK_SCHEDULE
+  if (attentionWork != nullptr) {
+    uint32_t const jobs = attentionWork[0];
+    uint32_t const splits = attentionWork[1];
+    uint32_t const ordinal = blockIdx.x / (splits * nbKHeads);
+    if (ordinal >= jobs) return;
+    workGrid = dim3{splits, nbKHeads, jobs};
+    workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, ordinal};
+    workBatchSize = jobs;
+#if !SPEC_DEC
+    request = attentionWork[2 + ordinal];
+#endif
+  }
+#endif
 #if XQA_RAGGED_QUERY_SCHEDULE
   uint32_t queryRowOffset = 0;
   if (raggedJobs != 0) {
-    uint32_t const splits = gridDim.x / (raggedJobs * nbKHeads);
-    uint32_t const tile = blockIdx.x / (splits * nbKHeads);
-    workGrid = dim3{splits, nbKHeads, raggedJobs};
-    workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, tile};
-    workBatchSize = raggedJobs;
+    if (attentionWork == nullptr) {
+      uint32_t const splits = gridDim.x / (raggedJobs * nbKHeads);
+      workGrid = dim3{splits, nbKHeads, raggedJobs};
+      workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads,
+                        blockIdx.x / (splits * nbKHeads)};
+      workBatchSize = raggedJobs;
+    }
+    uint32_t const tile = workBlock.z;
     request = xqa_work::raggedRequest(qCuSeqLens, batchSize, tile, headGrpSize, rowsPerBlock);
     queryRowOffset = (tile - xqa_work::raggedTileStart(qCuSeqLens[request], request, headGrpSize,
                                                        rowsPerBlock)) *
                      rowsPerBlock;
-  }
-#endif
-#if XQA_DEVICE_DECODE_SCHEDULE
-  if (decodeWork != nullptr) {
-    uint32_t const requests = decodeWork[0];
-    uint32_t const splits = decodeWork[1];
-    uint32_t const ordinal = blockIdx.x / (splits * nbKHeads);
-    if (ordinal >= requests) return;
-    workGrid = dim3{splits, nbKHeads, requests};
-    workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, ordinal};
-    workBatchSize = requests;
-    request = decodeWork[2 + ordinal];
+    // Mixed transport launches without PDL; empty jobs need no barrier initialization.
+    if (queryRowOffset >= (qCuSeqLens[request + 1] - qCuSeqLens[request]) * headGrpSize) return;
   }
 #endif
   assert(allowMultiBlockMode || workGrid.x == 1);
@@ -4014,9 +4021,9 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
     uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
     ,
-    uint32_t const* decodeWork = nullptr
+    uint32_t const* attentionWork = nullptr
 #endif
 #if XQA_RAGGED_QUERY_SCHEDULE
     ,
@@ -4049,9 +4056,9 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
                   sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
                   semaphores, scratch
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
                   ,
-                  decodeWork
+                  attentionWork
 #endif
 #if XQA_RAGGED_QUERY_SCHEDULE
                   ,
@@ -4225,7 +4232,7 @@ void launchMHA(
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
                      semaphores, scratch
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
                      ,
                      static_cast<uint32_t const*>(nullptr)
 #endif
@@ -4260,11 +4267,13 @@ uint32_t xqaResidentSlots(uint32_t multiProcessorCount) {
   return residentSlots(multiProcessorCount);
 }
 
-#if XQA_DEVICE_DECODE_SCHEDULE
-__global__ void prepareDecodeWork(uint32_t const* lengths, uint32_t requests, uint32_t heads,
-                                  uint32_t slots, uint32_t tile, uint32_t window,
-                                  uint32_t* output) {
-  xqa_work::prepareWarp(lengths, requests, heads, slots, tile, window, output);
+#if XQA_DEVICE_WORK_SCHEDULE
+__global__ void prepareAttentionWork(uint32_t const* lengths, uint32_t requests, uint32_t heads,
+                                     uint32_t slots, uint32_t tile, uint32_t window,
+                                     uint32_t* output, uint32_t const* queryOffsets,
+                                     uint32_t queryHeads, uint32_t queryRows) {
+  xqa_work::prepareWarp(lengths, requests, heads, slots, tile, window, output, queryOffsets,
+                        queryHeads, queryRows);
 }
 #endif
 
@@ -4293,26 +4302,30 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
-                         uint64_t scratchBytes, uint32_t const* decodeWork, cudaStream_t stream) {
+                         uint64_t scratchBytes, uint32_t const* attentionWork,
+                         cudaStream_t stream) {
 #if XQA_RAGGED_QUERY_SCHEDULE
   uint32_t const raggedJobs = qCuSeqLens == nullptr
                                   ? 0
                                   : xqa_work::raggedTileStart(queryTokens, batchSize, headGrpSize,
                                                               hostGeometry.splitKV.rows);
 #endif
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
   auto const splitOverride = std::getenv("XQA_NB_SUB_SEQ");
-  uint32_t const decodeSlots =
-      allowMultiBlockMode && (splitOverride == nullptr || std::stoi(splitOverride) <= 0)
-          ? residentSlots(multiProcessorCount)
-          : 0;
+  uint32_t const workSlots = allowMultiBlockMode
+#if XQA_RAGGED_QUERY_SCHEDULE
+                                     && raggedJobs != 0
+#endif
+                                     && (splitOverride == nullptr || std::stoi(splitOverride) <= 0)
+                                 ? residentSlots(multiProcessorCount)
+                                 : 0;
 #endif
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
     }
-#if XQA_DEVICE_DECODE_SCHEDULE
-    if (decodeSlots != 0) return 1;
+#if XQA_DEVICE_WORK_SCHEDULE
+    if (workSlots != 0) return 1;
 #endif
     auto const env = std::getenv("XQA_NB_SUB_SEQ");
     if (env != nullptr) {
@@ -4358,32 +4371,47 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
 #else
   dim3 dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
-#if XQA_DEVICE_DECODE_SCHEDULE
-  if (decodeSlots != 0) {
+#endif
+#if XQA_DEVICE_WORK_SCHEDULE
+  if (workSlots != 0) {
     uint32_t const tile = hostGeometry.sequenceTile();
     uint32_t maxTiles = divUp(maxSeqLen, tile);
-#if SLIDING_WINDOW
-    maxTiles = std::min(maxTiles, divUp(slidingWinSize + tile - 1, tile));
+    uint32_t jobs = batchSize;
+    uint32_t const* queryOffsets = nullptr;
+    uint32_t queryHeads = 0, queryRows = 0;
+    uint64_t window = slidingWinSize;
+#if defined(XQA_MASK_MOD)
+    window = xqa_mask_window_size;
 #endif
-    dimGrid = dim3{xqa_work::gridCapacity(decodeSlots, batchSize, nbKHeads, maxTiles), 1, 1};
+#if XQA_RAGGED_QUERY_SCHEDULE
+    jobs = raggedJobs;
+    queryOffsets = qCuSeqLens;
+    queryHeads = headGrpSize;
+    queryRows = hostGeometry.splitKV.rows;
+#endif
+    uint64_t span = window;
+#if XQA_RAGGED_QUERY_SCHEDULE
+    span += qSeqLen - 1;
+#endif
+    if (window != 0)
+      maxTiles = std::min<uint64_t>(maxTiles, divUp(span + tile - 1, uint64_t(tile)));
+    dimGrid = dim3{xqa_work::gridCapacity(workSlots, jobs, nbKHeads, maxTiles), 1, 1};
     uint64_t const partialBytes = uint64_t(dimGrid.x + 1) * hostGeometry.scratchBytes;
-    if (decodeWork == nullptr) {
+    if (attentionWork == nullptr) {
       uint64_t const workBytes = roundUp(uint64_t(batchSize + 2) * sizeof(uint32_t), uint64_t{256});
       if (scratchBytes < partialBytes + workBytes)
-        throw std::runtime_error("XQA scratch is too small for partials and decode work");
+        throw std::runtime_error("XQA scratch is too small for partials and attention work");
       auto* const work =
           reinterpret_cast<uint32_t*>(static_cast<char*>(scratch) + scratchBytes - workBytes);
-      prepareDecodeWork<<<1, 32, 0, stream>>>(seqLen, batchSize, nbKHeads, decodeSlots, tile,
-                                              slidingWinSize, work);
-      decodeWork = work;
+      prepareAttentionWork<<<1, 32, 0, stream>>>(seqLen, batchSize, nbKHeads, workSlots, tile,
+                                                 window, work, queryOffsets, queryHeads, queryRows);
+      attentionWork = work;
     } else if (scratchBytes < partialBytes) {
       throw std::runtime_error("XQA scratch is too small for partials");
     }
+  } else {
+    attentionWork = nullptr;
   }
-#endif
-#endif
-#if XQA_DEVICE_DECODE_SCHEDULE
-  if (decodeSlots == 0) decodeWork = nullptr;
 #endif
   auto const launchCfg = makeLaunchConfig(dimGrid, hostGeometry.block(), hostGeometry.sharedBytes,
                                           stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
@@ -4438,9 +4466,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
                      semaphores, scratch
-#if XQA_DEVICE_DECODE_SCHEDULE
+#if XQA_DEVICE_WORK_SCHEDULE
                      ,
-                     decodeWork
+                     attentionWork
 #endif
 #if XQA_RAGGED_QUERY_SCHEDULE
                      ,

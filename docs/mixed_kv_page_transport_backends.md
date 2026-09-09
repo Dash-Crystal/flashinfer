@@ -3227,3 +3227,21 @@ attention RMS 0.175--0.253%, with zero nonfinite values. The source fix is
 therefore exercised through complete serving executions, including unaligned
 window boundaries. Decode response changes remain mixed; these measurements
 do not establish whole-sequence KL or a uniform hardware-roofline gain.
+
+
+### Live query-span scheduling
+
+`XQAWork` shares native and ragged query-span work preparation with page events.
+Existing query offsets locate query tiles; live sequence lengths determine KV
+split work. The compiled module supplies tile geometry and residency. Unused
+captured-grid jobs return before barrier initialization, without another
+preparation launch or host readback. Logical-mask spans share one query
+specialization across runtime widths so graph replay reads the prepared buffer.
+The public operand is `attention_work` throughout the XQA call chain.
+
+Full-model Gemma4 12B W16/A16 TP2 on SM120 produced 52 attention samples with
+0.136--0.420% relative RMS and no nonfinite outputs against attention over
+decoded stored KV. The query-span samples include 1,542-token continuation and
+D512 split counts 1/3/4. CPU source coverage measured zero missing/duplicate rows
+or capacity overflows over 960 geometries and 7,680 work cases. Whole-sequence
+KL and the serving latency effect are separate measurements.

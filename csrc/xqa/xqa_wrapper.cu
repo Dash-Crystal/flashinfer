@@ -68,12 +68,13 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
                  Optional<TensorView> kvScaleTensor, int64_t qSeqLen,
                  Optional<TensorView> qCuSeqLens, Optional<TensorView> mask, TensorView semaphores,
-                 TensorView scratch, bool enable_pdl, Optional<TensorView> decodeWork) {
+                 TensorView scratch, bool enable_pdl, Optional<TensorView> attentionWork) {
   auto stream = get_stream(output.device());
-  if (decodeWork.has_value()) {
-    TVM_FFI_ICHECK(decodeWork.value().dtype() == dl_int32 && decodeWork.value().IsContiguous() &&
-                   decodeWork.value().numel() >= batchSize + 2);
-    CHECK_DEVICE(decodeWork.value(), output);
+  if (attentionWork.has_value()) {
+    TVM_FFI_ICHECK(attentionWork.value().dtype() == dl_int32 &&
+                   attentionWork.value().IsContiguous() &&
+                   attentionWork.value().numel() >= batchSize + 2);
+    CHECK_DEVICE(attentionWork.value(), output);
   }
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -246,8 +247,8 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
       sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
       scratch.numel() * scratch.dtype().bits / 8,
-      decodeWork.has_value() ? static_cast<uint32_t const*>(decodeWork.value().data_ptr())
-                             : nullptr,
+      attentionWork.has_value() ? static_cast<uint32_t const*>(attentionWork.value().data_ptr())
+                                : nullptr,
       stream);
 }
 #endif

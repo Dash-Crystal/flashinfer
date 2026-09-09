@@ -169,7 +169,7 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
-        decode_work: Optional[torch.Tensor],
+        attention_work: Optional[torch.Tensor],
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -213,7 +213,7 @@ def _get_xqa_module_cached(
             semaphores,
             workspace_buffer,
             enable_pdl,
-            decode_work,
+            attention_work,
         )
 
     @register_fake_op(op_name)
@@ -257,7 +257,7 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
-        decode_work: Optional[torch.Tensor],
+        attention_work: Optional[torch.Tensor],
     ) -> None:
         pass
 
@@ -271,32 +271,57 @@ def _get_xqa_module_cached(
     )
 
 
-class XQADecodeWork:
-    """Graph-stable live work for a native mixed-page decode specialization."""
+def xqa_query_specialization(query_length, head_group_ratio, *, logical_mask=False):
+    """Logical-mask spans retain one geometry across captured query widths."""
+    if logical_mask and query_length > 1:
+        return 33
+    return (
+        query_length
+        if query_length == 1 or swap_ab_eligible(query_length, head_group_ratio)
+        else 33
+    )
+
+
+class XQAWork:
+    """Graph-stable live work using the executing mixed-page module's geometry."""
 
     def __init__(
-        self, max_requests, input_dtype, num_q_heads, page_transport, window_left
+        self,
+        max_requests,
+        input_dtype,
+        num_q_heads,
+        page_transport,
+        window_left,
+        query_length=1,
+        mask_mod=None,
     ):
         page_size, heads, head_dim = page_transport.page_geometry
         addresses = page_transport.page_addresses
-        self.window = window_left + 1 if window_left >= 0 else 0
+        self.window = (
+            window_left + 1 if window_left is not None and window_left >= 0 else 0
+        )
+        self.query_heads = num_q_heads // heads
+        self.query_span = query_length > 1
         module = get_xqa_module(
             input_dtype,
             input_dtype,
             page_size,
             head_dim,
-            num_q_heads // heads,
-            self.window > 0,
+            self.query_heads,
+            self.window > 0 if not self.query_span else False,
             input_dtype,
-            1,
-            False,
+            xqa_query_specialization(
+                query_length, self.query_heads, logical_mask=mask_mod is not None
+            ),
+            self.query_span,
             True,
             False,
             -1,
-            None,
+            None if mask_mod is None else mask_mod.source,
             (addresses.shape[1], addresses.stride(0)),
         )
         self.sequence_tile = module.sequence_tile()
+        self.query_rows = module.split_kv_geometry()[1]
         self.module = module
         self.resident_slots = module.resident_slots(
             get_device_sm_count(addresses.device)
@@ -393,7 +418,7 @@ def xqa(
     page_transport: Optional[MixedKVPagedCache] = None,
     page_transport_static_format: Optional[int] = None,
     mask_mod: Optional[XQAMaskMod] = None,
-    decode_work: Optional[torch.Tensor] = None,
+    attention_work: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -482,6 +507,11 @@ def xqa(
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
         cumulative offsets.
+
+    attention_work : Optional[torch.Tensor], default=None
+        Device work prepared with :class:`XQAWork`'s compiled geometry.
+        Stores live job count, split count and native decode request indices.
+        Query spans use the existing cumulative query offsets for job mapping.
 
     Note
     ----
@@ -746,8 +776,8 @@ def xqa(
 
     # Large query spans share the runtime-width generic specialization.  Only
     # the small SM90 swap-AB case bakes the exact width into tile geometry.
-    module_q_seq_len = (
-        q_seq_len if swap_ab_eligible(q_seq_len, head_group_ratio) else 33
+    module_q_seq_len = xqa_query_specialization(
+        q_seq_len, head_group_ratio, logical_mask=mask_mod is not None
     )
     xqa_module = get_xqa_module(
         q.dtype,
@@ -840,7 +870,7 @@ def xqa(
         q_seq_len,
         q_cu_seq_lens,
         mask,
-        decode_work,
+        attention_work,
     )
 
 

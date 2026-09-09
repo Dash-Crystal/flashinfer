@@ -23,7 +23,7 @@ def gen_fp4_kv_quantization_module() -> JitSpec:
         supported_major_versions=[9, 10, 11, 12]
     )
     return gen_jit_spec(
-        "fp4_kv_prepare_work_v2",
+        "fp4_kv_prepare_work_v4",
         [
             jit_env.FLASHINFER_CSRC_DIR / "fp4_kv_quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "mixed_kv_prepare.cu",

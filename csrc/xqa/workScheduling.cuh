@@ -77,23 +77,36 @@ __device__ inline uint32_t chooseSplitsWarp(uint32_t slots, uint32_t sequences, 
   return select(best, single);
 }
 
-// One warp produces [live requests, splits, compact-to-input request indices].
+// One warp produces [live jobs, splits, optional compact request indices].
 __device__ inline void prepareWarp(uint32_t const* lengths, uint32_t requests, uint32_t heads,
-                                   uint32_t slots, uint32_t tile, uint32_t window,
-                                   uint32_t* output) {
+                                   uint32_t slots, uint32_t tile, uint32_t window, uint32_t* output,
+                                   uint32_t const* queryOffsets = nullptr, uint32_t queryHeads = 0,
+                                   uint32_t queryRows = 0) {
   uint32_t const lane = threadIdx.x % 32;
   uint32_t live = 0;
   uint32_t maxTiles = 0;
+  uint32_t queryJobs = 0;
   for (uint32_t first = 0; first < requests; first += 32) {
     uint32_t const r = first + lane;
     uint32_t const len = r < requests ? lengths[r] : 0;
-    uint32_t const begin = window != 0 && len > window ? len - window : 0;
-    uint32_t const tiles = (len + tile - 1) / tile - begin / tile;
+    uint32_t const queries =
+        queryOffsets != nullptr && r < requests ? queryOffsets[r + 1] - queryOffsets[r] : 1;
+    bool const active = len != 0 && queries != 0;
+    uint64_t const span = uint64_t(window) + queries - 1;
+    uint32_t const begin = window != 0 && len > span ? len - span : 0;
+    uint32_t const tiles = active ? (len + tile - 1) / tile - begin / tile : 0;
     maxTiles = max(maxTiles, tiles);
-    uint32_t const mask = __ballot_sync(~0U, len != 0);
-    if (len != 0) output[2 + live + __popc(mask & ((1U << lane) - 1))] = r;
-    live += __popc(mask);
+    if (queryOffsets != nullptr) {
+      if (active)
+        queryJobs =
+            max(queryJobs, raggedTileStart(queryOffsets[r + 1], r + 1, queryHeads, queryRows));
+    } else {
+      uint32_t const mask = __ballot_sync(~0U, active);
+      if (active) output[2 + live + __popc(mask & ((1U << lane) - 1))] = r;
+      live += __popc(mask);
+    }
   }
+  if (queryOffsets != nullptr) live = __reduce_max_sync(~0U, queryJobs);
   maxTiles = __reduce_max_sync(~0U, maxTiles);
   uint32_t const splits = chooseSplitsWarp(slots, live * heads, maxTiles);
   if (lane == 0) {

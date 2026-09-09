@@ -14,14 +14,15 @@ __global__ void mixed_kv_prepare_metadata_kernel(
     int64_t const* slots, uint32_t numSlots, uint32_t pageSize,
     cuda::fast_mod_div<uint64_t> pageDivisor, uint32_t* writable, uint32_t* writableCount,
     uint32_t* completed, uint32_t* completedCount, uint32_t const* lengths, uint32_t requests,
-    uint32_t* work, uint32_t heads, uint32_t residentSlots, uint32_t sequenceTile,
-    uint32_t window) {
+    uint32_t* work, uint32_t heads, uint32_t residentSlots, uint32_t sequenceTile, uint32_t window,
+    uint32_t const* queryOffsets, uint32_t queryHeads, uint32_t queryRows) {
   using IndexScan = cub::BlockScan<int32_t, 256>;
   using CountScan = cub::BlockScan<uint32_t, 256>;
   __shared__ typename IndexScan::TempStorage indexStorage;
   __shared__ typename CountScan::TempStorage countStorage;
   if (work != nullptr && threadIdx.x < 32) {
-    xqa_work::prepareWarp(lengths, requests, heads, residentSlots, sequenceTile, window, work);
+    xqa_work::prepareWarp(lengths, requests, heads, residentSlots, sequenceTile, window, work,
+                          queryOffsets, queryHeads, queryRows);
   }
   uint32_t written = 0;
   uint32_t sealed = 0;
@@ -59,7 +60,8 @@ void mixed_kv_prepare_metadata(TensorView slots, TensorView writable, TensorView
                                TensorView completed, TensorView completedCount, int64_t pageSize,
                                Optional<TensorView> lengths, Optional<TensorView> work,
                                int64_t heads, int64_t residentSlots, int64_t sequenceTile,
-                               int64_t window) {
+                               int64_t window, Optional<TensorView> queryOffsets,
+                               int64_t queryHeads, int64_t queryRows) {
   TVM_FFI_ICHECK(slots.ndim() == 1 && slots.dtype() == dl_int64 && slots.stride(0) == 1);
   CHECK_CUDA(slots);
   TVM_FFI_ICHECK(pageSize > 0 && pageSize <= UINT32_MAX && slots.numel() <= INT32_MAX);
@@ -75,6 +77,13 @@ void mixed_kv_prepare_metadata(TensorView slots, TensorView writable, TensorView
     TVM_FFI_ICHECK(work.value().dtype() == dl_int32 && work.value().IsContiguous() &&
                    work.value().numel() >= lengths.value().numel() + 2);
     CHECK_DEVICE(work.value(), slots);
+    if (queryOffsets.has_value()) {
+      auto const offsets = queryOffsets.value();
+      TVM_FFI_ICHECK(offsets.dtype() == dl_int32 && offsets.IsContiguous() &&
+                     offsets.numel() == lengths.value().numel() + 1 && queryHeads > 0 &&
+                     queryRows > 0);
+      CHECK_DEVICE(offsets, slots);
+    }
     TVM_FFI_ICHECK(heads > 0 && residentSlots > 0 && sequenceTile > 0 && window >= 0);
   }
   ffi::CUDADeviceGuard guard(slots.device().device_id);
@@ -87,7 +96,10 @@ void mixed_kv_prepare_metadata(TensorView slots, TensorView writable, TensorView
       lengths.has_value() ? static_cast<uint32_t const*>(lengths.value().data_ptr()) : nullptr,
       lengths.has_value() ? lengths.value().numel() : 0,
       work.has_value() ? static_cast<uint32_t*>(work.value().data_ptr()) : nullptr, heads,
-      residentSlots, sequenceTile, window);
+      residentSlots, sequenceTile, window,
+      queryOffsets.has_value() ? static_cast<uint32_t const*>(queryOffsets.value().data_ptr())
+                               : nullptr,
+      queryHeads, queryRows);
   TVM_FFI_ICHECK(cudaPeekAtLastError() == cudaSuccess);
 }
 
