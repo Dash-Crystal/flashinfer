@@ -27,6 +27,9 @@
 #include "mha_components.cuh"
 #include "mma.cuh"
 #include "utils.cuh"
+#include "workScheduling.cuh"
+
+#define XQA_DEVICE_DECODE_SCHEDULE (ENABLE_MIXED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1)
 #if defined(XQA_MASK_MOD)
 #include "mask_mod.cuh"
 static_assert(SPEC_DEC && SLIDING_WINDOW);
@@ -2097,6 +2100,59 @@ __device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
 }
 #endif
 
+#if XQA_DEVICE_DECODE_SCHEDULE
+struct DecodeWorkTile {
+  uint32_t requests;
+  uint32_t splits;
+  uint32_t request;
+};
+
+__device__ inline DecodeWorkTile decodeWorkTile(KVCacheList<usePagedKVCache> const& cacheList,
+                                                uint32_t batchSize, uint32_t nbKHeads,
+                                                uint32_t slots, uint32_t window) {
+  extern __shared__ char smemByteBuf[];
+  auto& shared = *reinterpret_cast<DecodeWorkTile*>(smemByteBuf);
+  if (threadIdx.x < warp_size && threadIdx.y == 0 && threadIdx.z == 0) {
+    uint32_t const lane = laneId();
+    uint32_t requests = 0;
+    uint32_t maxTiles = 0;
+    for (uint32_t r = lane; r < batchSize; r += warp_size) {
+      uint32_t const len = getCacheSeqLen(cacheList, r);
+      uint32_t const begin = len > window ? len - window : 0;
+      requests += len != 0;
+      maxTiles = mha::max(maxTiles, divUp(len, ctaTile.x) - begin / ctaTile.x);
+    }
+    requests = __reduce_add_sync(~0U, requests);
+    maxTiles = __reduce_max_sync(~0U, maxTiles);
+    uint32_t const splits =
+        allowMultiBlockMode ? xqa_work::chooseSplitsWarp(slots, requests * nbKHeads, maxTiles) : 1;
+    uint32_t const ordinal = blockIdx.x / (splits * nbKHeads);
+    uint32_t request = batchSize;
+    if (ordinal < requests) {
+      uint32_t remaining = ordinal;
+      for (uint32_t r0 = 0; r0 < batchSize; r0 += warp_size) {
+        uint32_t const r = r0 + lane;
+        bool const active = r < batchSize && getCacheSeqLen(cacheList, r) != 0;
+        uint32_t const activeMask = __ballot_sync(~0U, active);
+        uint32_t const count = __popc(activeMask);
+        if (remaining < count) {
+          uint32_t const before = __popc(activeMask & ((1U << lane) - 1));
+          uint32_t const owner = __ballot_sync(~0U, active && before == remaining);
+          request = r0 + __ffs(owner) - 1;
+          break;
+        }
+        remaining -= count;
+      }
+    }
+    if (lane == 0) shared = {requests, splits, request};
+  }
+  __syncthreads();
+  DecodeWorkTile const result = shared;
+  __syncthreads();  // The attention prologue reuses this shared-memory region.
+  return result;
+}
+#endif
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -2141,25 +2197,50 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
         uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
-        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
+#if XQA_DEVICE_DECODE_SCHEDULE
+        ,
+        uint32_t decodeSlots = 0
+#endif
+    ) {
 
-  assert(allowMultiBlockMode || gridDim.x == 1);
-  bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
-  uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
-  uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? blockIdx.x : 0;
+  dim3 workGrid = gridDim;
+  uint3 workBlock = blockIdx;
+  uint32_t workBatchSize = batchSize;
+  uint32_t request = blockIdx.z;
+#if XQA_DEVICE_DECODE_SCHEDULE
+  if (decodeSlots != 0) {
+#if SLIDING_WINDOW
+    uint32_t const window = slidingWinSize;
+#else
+    uint32_t const window = ~0U;
+#endif
+    DecodeWorkTile const work = decodeWorkTile(cacheList, batchSize, nbKHeads, decodeSlots, window);
+    if (work.request == batchSize) return;
+    workGrid = dim3{work.splits, nbKHeads, work.requests};
+    workBlock = uint3{blockIdx.x % work.splits, (blockIdx.x / work.splits) % nbKHeads,
+                      blockIdx.x / (work.splits * nbKHeads)};
+    workBatchSize = work.requests;
+    request = work.request;
+  }
+#endif
+  assert(allowMultiBlockMode || workGrid.x == 1);
+  bool const isMultiBlock = allowMultiBlockMode && (workGrid.x != 1);
+  uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? workGrid.x : 1;
+  uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? workBlock.x : 0;
   assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
 
-  // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of
+  // workGrid: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of
   // requests
-  assert(gridDim.z == batchSize && gridDim.y == nbKHeads);
+  assert(workGrid.z == workBatchSize && workGrid.y == nbKHeads);
   extern __shared__ char smemByteBuf[];
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
-  uint32_t const idxReq = blockIdx.z;
+  uint32_t const idxReq = request;
 #if !SPEC_DEC
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
-  uint32_t const idxHeadGrp = blockIdx.y;  // inside one request
+  uint32_t const idxHeadGrp = workBlock.y;  // inside one request
 #endif
 
   auto const ctaThrdId =
@@ -2247,9 +2328,9 @@ CUBIN_EXPORT __global__
   uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
   uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
 
-  uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
-  uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
-  uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
+  uint32_t const nbTokenBlocksPerGrp = workGrid.y / nbKHeads;
+  uint32_t const idxHeadGrp = workBlock.y / nbTokenBlocksPerGrp;  // inside one request
+  uint32_t const idxHeadTokenInGrp = (workBlock.y % nbTokenBlocksPerGrp) * warpTile.y;
   uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
 #if defined(XQA_MASK_MOD)
   // Captured grids cover the query-span envelope, including empty request tiles.
@@ -3725,19 +3806,19 @@ CUBIN_EXPORT __global__
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
-      uint32_t const nbIndepHeadTokens = gridDim.y;
-      uint32_t const indepHeadTokenIdx = blockIdx.y;
-      uint32_t const nbSeq = nbIndepHeadTokens * batchSize;
+      uint32_t const nbIndepHeadTokens = workGrid.y;
+      uint32_t const indepHeadTokenIdx = workBlock.y;
+      uint32_t const nbSeq = nbIndepHeadTokens * workBatchSize;
 #else
-      uint32_t const nbSeq = nbKHeads * batchSize;
+      uint32_t const nbSeq = nbKHeads * workBatchSize;
 #endif
       uint32_t const nbSubSeq = nbSubSeqPerSeq * nbSeq;
       MemSegmenter<false> segmenter{scratch};
 
 #if SPEC_DEC
-      uint32_t const idxSeq = nbIndepHeadTokens * idxReq + indepHeadTokenIdx;
+      uint32_t const idxSeq = nbIndepHeadTokens * workBlock.z + indepHeadTokenIdx;
 #else
-      uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
+      uint32_t const idxSeq = nbKHeads * workBlock.z + idxHeadGrp;
 #endif
       uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
       uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
@@ -3957,7 +4038,12 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if ENABLE_4BIT_KV_CACHE
     uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
-    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
+#if XQA_DEVICE_DECODE_SCHEDULE
+    ,
+    uint32_t decodeSlots = 0
+#endif
+) {
 #if SPEC_DEC
   kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
 #else
@@ -3983,7 +4069,12 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if ENABLE_4BIT_KV_CACHE
                   sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
-                  semaphores, scratch);
+                  semaphores, scratch
+#if XQA_DEVICE_DECODE_SCHEDULE
+                  ,
+                  decodeSlots
+#endif
+  );
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -4136,55 +4227,31 @@ void launchMHA(
 #if ENABLE_4BIT_KV_CACHE
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
-                     semaphores, scratch);
+                     semaphores, scratch
+#if XQA_DEVICE_DECODE_SCHEDULE
+                     ,
+                     0U
+#endif
+  );
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
 }
 #endif
 
-// Track S step 4 [42]: default number of sub-sequences per sequence (multi-block mode).
-// Cost model, calibrated on the XQA_NB_SUB_SEQ sweeps (nkcut2 H200, 136 sequences x 16 tiles,
-// at 132 slots (1 CTA/SM) and 264 slots (2 CTAs/SM); ws-1 RTX 5090, 170 slots, P0.8): the
-// CTAs of a wave run in lockstep, so the kernel takes waves x (fixed + tilesPerCta x tTile)
-// with waves = ceil(nbSeq x n / slots), slots = SMs x resident CTAs per SM, and tilesPerCta
-// the mean nbTiles / n (the sub-sequences take the tiles round-robin, so a 3.2-tile mean
-// mixes 4- and 3-tile CTAs that backfill each other).  The per-CTA fixed cost (Q load,
-// pipeline ramp, multi-block store/merge) measured 5.5-7 us against 4-11 us per 256-token
-// tile on both hosts, i.e. about one tile: kFixedCostInTiles = 1.  Because the scratch
-// round trip of the merge is not in the model, n > 1 is taken only for a modelled gain above
-// 5 %: at 264 slots that picks n = 5 (measured best: 680 CTAs, 2.58 waves), at 132 slots
-// n = 4 (measured 0.85x), at 170 slots it keeps n = 1 (P0.8: every n > 1 was slower there).
-static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSeq,
-                                     uint32_t maxSeqLen) {
-  uint32_t const nbTiles = std::max<uint32_t>(1U, divUp(maxSeqLen, hostGeometry.sequenceTile()));
+static uint32_t residentSlots(uint32_t multiProcessorCount) {
   static uint32_t const ctasPerSm = []() -> uint32_t {
     int n = 0;
-    cudaError_t const err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &n, kernel_mha, static_cast<int>(hostGeometry.threads()), hostGeometry.sharedBytes);
-    if (err != cudaSuccess) {
-      cudaGetLastError();
-      return 1U;
-    }
+    checkCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &n, kernel_mha, static_cast<int>(hostGeometry.threads()), hostGeometry.sharedBytes));
     return static_cast<uint32_t>(std::max(n, 1));
   }();
-  constexpr uint64_t kMilli = 1000;
-  constexpr uint64_t kFixedCostInTiles = 1;
-  constexpr uint64_t kMinGainPercent = 5;
-  uint64_t const slots = std::max<uint32_t>(1U, multiProcessorCount * ctasPerSm);
-  auto const cost = [&](uint32_t n) -> uint64_t {
-    uint64_t const waves = divUp<uint64_t>(uint64_t{nbSeq} * n, slots);
-    return waves * (kFixedCostInTiles * kMilli + kMilli * nbTiles / n);
-  };
-  uint32_t best = 1;
-  uint64_t bestCost = cost(1);
-  for (uint32_t n = 2; n <= nbTiles; n++) {
-    uint64_t const c = cost(n);
-    if (c < bestCost) {
-      bestCost = c;
-      best = n;
-    }
-  }
-  return (best > 1 && bestCost * 100 < cost(1) * (100 - kMinGainPercent)) ? best : 1;
+  return std::max(1U, multiProcessorCount * ctasPerSm);
+}
+
+static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSeq,
+                                     uint32_t maxSeqLen) {
+  uint32_t const nbTiles = std::max(1U, divUp(maxSeqLen, hostGeometry.sequenceTile()));
+  return xqa_work::chooseSplits(residentSlots(multiProcessorCount), nbSeq, nbTiles);
 }
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
@@ -4212,10 +4279,19 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream) {
+#if XQA_DEVICE_DECODE_SCHEDULE
+  auto const splitOverride = std::getenv("XQA_NB_SUB_SEQ");
+  uint32_t const decodeSlots = (splitOverride == nullptr || std::stoi(splitOverride) <= 0)
+                                   ? residentSlots(multiProcessorCount)
+                                   : 0;
+#endif
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
     }
+#if XQA_DEVICE_DECODE_SCHEDULE
+    if (decodeSlots != 0) return 1;
+#endif
     auto const env = std::getenv("XQA_NB_SUB_SEQ");
     if (env != nullptr) {
       int32_t const val = std::stoi(env);
@@ -4248,7 +4324,17 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
 #else
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
+  dim3 dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
+#if XQA_DEVICE_DECODE_SCHEDULE
+  if (decodeSlots != 0) {
+    uint32_t const tile = hostGeometry.sequenceTile();
+    uint32_t maxTiles = divUp(maxSeqLen, tile);
+#if SLIDING_WINDOW
+    maxTiles = std::min(maxTiles, divUp(slidingWinSize + tile - 1, tile));
+#endif
+    dimGrid = dim3{xqa_work::gridCapacity(decodeSlots, batchSize, nbKHeads, maxTiles), 1, 1};
+  }
+#endif
 #endif
   auto const launchCfg = makeLaunchConfig(dimGrid, hostGeometry.block(), hostGeometry.sharedBytes,
                                           stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
@@ -4302,7 +4388,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                      sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
-                     semaphores, scratch);
+                     semaphores, scratch
+#if XQA_DEVICE_DECODE_SCHEDULE
+                     ,
+                     decodeSlots
+#endif
+  );
   checkCuda(cudaPeekAtLastError());
 }
 #endif
