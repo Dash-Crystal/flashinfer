@@ -38,4 +38,18 @@ The first numerical campaign completes at 18:13:20 UTC: 13 samples and
 maximum absolute error is 2.0, and nonfinite count is zero against the
 unsplit projection/reduction/consumer reference. This uncaptured numerical
 mode has no padding; full graph replay exercises the changing tile mask.
-Graph attribution and matched serving responses remain pending.
+Full-model graph and adaptive serving measurements now complete. At matched
+live-query/context work against the preceding row pipeline, target execution
+through sampling changes 64.973 to 63.729 ms at capacity 512, 116.920 to
+111.351 ms at 1,024, and 192.520 to 172.016 ms at 2,048: estimated latency
+reductions of 1.91%, 4.76% and 10.65%. Working standard errors are undefined,
+1.89 and 2.67 percentage points, excluding temporal dependence and model error.
+Decode is unchanged by this producer selection; its sparse estimates do not
+establish a uniform frontier gain. These are full-server comparisons, not
+standalone GEMM timings or measured DRAM throughput.
+
+A column-partition composition using the same kernel measures 1.73%, 2.73%
+and 2.92% higher matched latency than the row composition. Both results are
+retained in the vLLM serving review; the canonical service adopts the masked
+row composition. Its numerical reference remains the ordinary unsplit GEMM
+and reduction, with the error metrics above.
