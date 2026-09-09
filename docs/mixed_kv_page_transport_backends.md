@@ -3141,3 +3141,47 @@ Attempt 42 runs the retained geometry through the final host refactor. Its
 and 42 the retained estimates span 23.38–23.85 / 29.46–30.51 / 35.54–37.18 ms.
 This variation is not attributed to the startup-only host refactor. Ordinary
 FA4 in attempt 39 predicts 27.15/38.71/50.28 ms at the same coordinates.
+
+### SM120 loop compaction and serving attribution, September 9
+
+The mixed SM120 decode specializations now share the copy/expansion/MMA
+body across head parts and sequence tiles. V-scale storage and SM90 BF16
+bit-placement conversion retain independent architecture/geometry predicates.
+For Gemma4 TP2, the compiled D256 body decreases from 14,488 to 5,184 static
+instructions and 174 to 152 registers; D512 decreases from 27,040 to 6,040
+instructions and 234 to 219 registers. Shared memory still limits each to
+one resident CTA per SM. These reductions do not imply a proportional
+execution-time improvement.
+
+The generic split-KV merge explicitly synchronizes copy and consumer lanes
+after the asynchronous scratch wait and before reusing a tile. The compiled
+module also exposes its scratch geometry for bounded serving diagnostics.
+The ordinary launcher and diagnostics share the workspace partition; no
+diagnostic copy or synchronization runs unless explicitly requested.
+
+The full-model campaign at ws-1
+`/data/h3-runtime/tp2-rolled-transport-v5-20260909/` uses vLLM shared metadata
+preparation and this loop/synchronization change. Its fresh-reference
+comparison predicts 4K-input/1K-output latency changes of -4.6% at B48,
++5.2% at B56, +5.7% at B64 and -11.0% at B96, with working standard errors
+of 1.13, 0.99, 7.56 and 6.74 percentage points respectively. These are
+conditional estimates from adaptive serving, not a batch sweep. The two
+campaigns also differ in resident page composition. There is no established
+uniform frontier improvement. vLLM's `docs/design/tp2_execution_review.md`
+records the full comparison and limitations.
+
+Earlier numerical captures classified a sampled one-row request as decode
+without retaining the whole batch's executed specialization. They could
+attach an unused decode descriptor to a ragged query-span call. Thus the
+large D256 errors in those records cannot be attributed to native decode
+or to this compaction change. The corrected recorder retains dispatch
+identity and query spans and compares native partials, normalizers and merge
+error separately. Numerical attribution must follow the executed module.
+
+The corrected full-server attempt 7 at context 4,096 measures native D256
+RMS 1.654/1.047% and D512 0.305/0.248%, with zero nonfinite outputs.
+CPU recombination of native partials matches the native merge within
+0.152--0.191% RMS. D256 partials already have 2.507--3.769% error, placing
+the remaining discrepancy before the merge in those captures. Separate
+one-row requests in ragged query-span kernels measure 0.163--0.284% RMS
+at context 4,663. These measurements do not establish whole-sequence KL.

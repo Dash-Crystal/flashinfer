@@ -170,6 +170,13 @@ void launchMHA(
 
 uint32_t xqaSequenceTile();
 uint32_t xqaResidentSlots(uint32_t multiProcessorCount);
+struct SplitKVGeometry {
+  uint32_t scalarBytes;
+  uint32_t rows;
+  uint32_t columns;
+  uint32_t slices;
+};
+SplitKVGeometry xqaSplitKVGeometry();
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,

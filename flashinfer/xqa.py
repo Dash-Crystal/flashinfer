@@ -267,6 +267,7 @@ def _get_xqa_module_cached(
         uri=spec.name,
         sequence_tile=module.xqa_sequence_tile,
         resident_slots=module.xqa_resident_slots,
+        split_kv_geometry=module.xqa_split_kv_geometry,
     )
 
 
@@ -296,6 +297,7 @@ class XQADecodeWork:
             (addresses.shape[1], addresses.stride(0)),
         )
         self.sequence_tile = module.sequence_tile()
+        self.module = module
         self.resident_slots = module.resident_slots(
             get_device_sm_count(addresses.device)
         )
@@ -303,6 +305,51 @@ class XQADecodeWork:
         self.buffer = torch.empty(
             max_requests + 2, dtype=torch.int32, device=addresses.device
         )
+
+    def snapshot_partials(self, workspace_buffer, request):
+        """Copy one request's split state for explicit serving diagnostics.
+
+        This synchronizes only when invoked by instrumentation. It does not
+        launch attention or retain observations during ordinary serving.
+        """
+        work = self.buffer.cpu().tolist()
+        live, splits = work[:2]
+        ordinal = work[2 : 2 + live].index(request)
+        if splits == 1:
+            return {"live_requests": live, "splits": splits}
+        scalar_bytes, rows, columns, slices = self.module.split_kv_geometry()
+        partial_bytes = slices * rows * columns * 16
+        count = live * self.heads * splits
+        first = ordinal * self.heads * splits
+        selected = self.heads * splits
+        _, scratch = xqa_workspace_views(workspace_buffer)
+
+        def copy(offset, stride):
+            begin = offset + first * stride
+            return scratch[begin : begin + selected * stride].cpu()
+
+        partial_start = (
+            (2 * count * scalar_bytes + partial_bytes - 1)
+            // partial_bytes
+            * partial_bytes
+        )
+        return {
+            "live_requests": live,
+            "splits": splits,
+            "request": request,
+            "compact_request": ordinal,
+            "geometry": (scalar_bytes, rows, columns, slices),
+            "row_max": copy(0, scalar_bytes),
+            "row_sum": copy(count * scalar_bytes, scalar_bytes),
+            "partials": copy(partial_start, partial_bytes),
+        }
+
+
+def xqa_workspace_views(workspace_buffer):
+    """Views of the semaphore prefix and attention scratch in one allocation."""
+    storage = workspace_buffer.view(torch.uint8)
+    semaphore_bytes = 8 * 1024 * 1024
+    return storage[:semaphore_bytes], storage[semaphore_bytes:]
 
 
 # Kernel family and JIT module of the most recent xqa() call (set right before

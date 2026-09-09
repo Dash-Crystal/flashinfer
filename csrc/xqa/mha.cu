@@ -195,15 +195,24 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #endif
 #endif
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210) && \
+    CACHE_ELEM_ENUM == 5 && !SPEC_DEC
+#define MIXED_COMPACT_TILE_LOOPS 1
+#endif
 #ifndef MIXED_COMPACT_TILE_LOOPS
 #define MIXED_COMPACT_TILE_LOOPS 0
 #endif
 #ifndef MIXED_COMPACT_Q_ROWS
 #define MIXED_COMPACT_Q_ROWS 0
 #endif
-// Rolled per-tile loops and a single (bounds-checked) copy body per format: code footprint
-// over unrolled scheduling freedom (Track S step 5 [43], sm90 SPEC_DEC mixed build only).
+// Share the mixed copy/expand/MMA body across head parts and sequence tiles.
 constexpr bool kCompactTileLoops = MIXED_COMPACT_TILE_LOOPS != 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && CACHE_ELEM_ENUM == 5 && SPEC_DEC && \
+    M_TILESIZE == 16
+constexpr bool kCompactVScaleStorage = true;
+#else
+constexpr bool kCompactVScaleStorage = false;
+#endif
 // constexpr uint32_t cacheElemsPerKHeadPart = exactDiv(kHeadPartBytes, cacheElemSize);
 
 constexpr bool persistentQ = paddedInputHeadBytes * ctaTile.y <= (16u << 10);
@@ -230,18 +239,13 @@ __device__ inline uint32_t vHeadSlice(uint32_t warp, uint32_t slice) {
   return grpLoadV ? warp + gemm1WarpsPerGrp * slice : warp * nbHeadSplits + slice;
 }
 
-// [44] Track S step 6: the sm90 SPEC_DEC bf16 compact build expands compressed K/V blocks with
-// the bit-placement decode and the block scale folded with 2^k
-// (expandMixedPartialHeadsInPlaceBF16Placement).  Derived from the step-5 predicate
-// (kCompactTileLoops: __CUDA_ARCH__ 900, CACHE_ELEM_ENUM 5, SPEC_DEC, M_TILESIZE 16) plus the
-// decode's own requirements: bf16 math, per-warp V tiles (no grpLoadV row offsets), the
-// expansion (not the compact register) form.  Every other build keeps the stock helper.
-// A preprocessor guard (not `if constexpr`): the V call site is in the kernel body, not in a
-// template, where a discarded `if constexpr` branch is still instantiated - the new helper's
-// static_asserts would fire in the other builds and the preprocessed source of those builds
-// must stay identical (sm120 SASS byte-identity is the acceptance check).
-#define MIXED_BF16_PLACEMENT_EXPANSION \
-  (ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_TILE_LOOPS && !INPUT_FP16 && !(GRP_LOAD_V))
+// Bit-placement expansion requires the SM90 M16 tile geometry. Its conversion
+// selection is independent of whether the copy/expand/MMA loops are rolled.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && SPEC_DEC && M_TILESIZE == 16
+#define MIXED_BF16_PLACEMENT_EXPANSION (ENABLE_MIXED_KV_CACHE && !INPUT_FP16 && !(GRP_LOAD_V))
+#else
+#define MIXED_BF16_PLACEMENT_EXPANSION 0
+#endif
 constexpr bool kMixedBF16PlacementExpansion = MIXED_BF16_PLACEMENT_EXPANSION != 0;
 static_assert(!kMixedBF16PlacementExpansion ||
                   (kCompactTileLoops && mha::is_same_v<InputElem, __nv_bfloat16> && !grpLoadV &&
@@ -487,12 +491,12 @@ struct alignas(128) SharedMem {
   // The sm90 compact build ([43]) takes the 4 B stride (that 1,056 B is what lets the 128 B
   // K ring fit two CTAs); the other builds keep the 8 B layout byte-for-byte (sm120 fp4 q=1
   // measured +1.6 us with the shrunk layout, a smem-layout effect this step does not chase).
-  static constexpr uint32_t mixedVScaleBytes = mha::max(
-      4U,
-      exactDiv(
-          exactDiv(sizeof(PaddedCacheHead),
-                   ((kCompactTileLoops || nbHeadSplits > 1) && !grpLoadV) ? gemm1WarpsPerGrp : 1U),
-          2 * grainBytes));
+  static constexpr uint32_t mixedVScaleBytes =
+      mha::max(4U, exactDiv(exactDiv(sizeof(PaddedCacheHead),
+                                     ((kCompactVScaleStorage || nbHeadSplits > 1) && !grpLoadV)
+                                         ? gemm1WarpsPerGrp
+                                         : 1U),
+                            2 * grainBytes));
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
   MixedPageFormats<nbPagesPerVTile> vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
@@ -3873,6 +3877,8 @@ CUBIN_EXPORT __global__
             }
             ldgsts::commitGroup();
             ldgsts::waitGroup<1>();
+            // Partial rows are copied by fewer lanes than consume the matrix.
+            __syncwarp();
             uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
             WarpAcc tile =
                 toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
@@ -3885,6 +3891,7 @@ CUBIN_EXPORT __global__
             assert(std::isfinite(partialMergedRowSum[0]));
             rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
             sumAcc = sumAcc + tile;
+            __syncwarp();
           }
 
           ThrdRegRowMax mergedRowSum{};
@@ -4026,11 +4033,15 @@ static constexpr auto kernel_mha = kernel_mha_impl;
 CUBIN_EXPORT __device__ constexpr uint32_t scratchBytesPerCta =
     2 * sizeof(SMemWarpRowMax) +
     nbValidRows * SharedMem::XSmemBuffer::cols * sizeof(LdGrain) * gemm1WarpsPerGrp * nbHeadSplits;
+CUBIN_EXPORT __device__ constexpr SplitKVGeometry splitKVGeometry = {
+    sizeof(SMemWarpRowMax), nbValidRows, SharedMem::XSmemBuffer::cols,
+    gemm1WarpsPerGrp* nbHeadSplits};
 
 struct KernelLaunchGeometry {
   uint32_t sharedBytes;
   uint32_t scratchBytes;
   uint3 warps;
+  SplitKVGeometry splitKV;
 
   dim3 block() const { return {warp_size * warps.x, warps.y, warps.z}; }
   uint32_t threads() const { return warp_size * warps.x * warps.y * warps.z; }
@@ -4043,12 +4054,15 @@ static KernelLaunchGeometry const hostGeometry = []() {
   checkCuda(
       cudaMemcpyFromSymbol(&geometry.scratchBytes, scratchBytesPerCta, sizeof(scratchBytesPerCta)));
   checkCuda(cudaMemcpyFromSymbol(&geometry.warps, ctaShapeInWarps, sizeof(ctaShapeInWarps)));
+  checkCuda(cudaMemcpyFromSymbol(&geometry.splitKV, splitKVGeometry, sizeof(splitKVGeometry)));
   checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  geometry.sharedBytes));
   return geometry;
 }();
 
 #ifndef GENERATE_CUBIN
+SplitKVGeometry xqaSplitKVGeometry() { return hostGeometry.splitKV; }
+
 void launchMHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <tvm/ffi/container/array.h>
+
 #include "../tvm_ffi_utils.h"
 #include "mha.h"
 
@@ -256,4 +258,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_sequence_tile, xqaSequenceTile);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_resident_slots, xqaResidentSlots);
+tvm::ffi::Array<int64_t> xqa_split_kv_geometry() {
+  auto const g = xqaSplitKVGeometry();
+  return tvm::ffi::Array<int64_t>{g.scalarBytes, g.rows, g.columns, g.slices};
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_split_kv_geometry, xqa_split_kv_geometry);
 #endif
