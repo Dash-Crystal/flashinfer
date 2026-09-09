@@ -105,10 +105,20 @@ struct KVPageArena {
   uint32_t* hints;
   unsigned long long* allocated_bytes;
   unsigned long long* allocation_failures;
+  unsigned long long* mandatory_failures;
+  unsigned long long* reserved_blocks;
+  unsigned long long* page_counts;
+  uint32_t* block_reservations;
+  const uint32_t* a16_classes;
   uint32_t slab_count;
   uint32_t slab_bytes;
   uint32_t bitmap_words;
   uint32_t size_classes;
+
+  __device__ void reserve_block(uint32_t block, bool reserve) const {
+    uint32_t const old = atomicExch(block_reservations + block, uint32_t(reserve));
+    if (old != uint32_t(reserve)) atomicAdd(reserved_blocks, reserve ? 1ULL : UINT64_MAX);
+  }
 
   __device__ uint32_t availability_words() const { return (slab_count + 63) / 64; }
   __device__ void mark_available(uint32_t size_class, uint32_t slab, bool value) const {
@@ -171,6 +181,7 @@ struct KVPageArena {
                 atomicExch(&slab->lock, 0U);
                 atomicExch(hints + list, word);
                 atomicAdd(allocated_bytes, static_cast<unsigned long long>(extent_bytes));
+                atomicAdd(page_counts + a16_classes[size_class], 1ULL);
                 return KVPageAddress::make(
                     uint64_t(index) * slab_bytes + uint64_t(j * 64 + slot_bit) * extent_bytes,
                     format);
@@ -194,6 +205,7 @@ struct KVPageArena {
       __nanosleep(64);
     }
     uint32_t const extent_bytes = slab->slot_bytes;
+    uint32_t const a16_class = a16_classes[slab->size_class];
     uint32_t const slot = (address.offset() % slab_bytes) / extent_bytes;
     occupied[uint64_t(index) * bitmap_words + slot / 64] &= ~(uint64_t{1} << (slot % 64));
     uint32_t const used = --slab->used;
@@ -202,6 +214,7 @@ struct KVPageArena {
     __threadfence();
     atomicExch(&slab->lock, 0U);
     atomicAdd(allocated_bytes, 0ULL - static_cast<unsigned long long>(extent_bytes));
+    atomicAdd(page_counts + a16_class, UINT64_MAX);
   }
 };
 

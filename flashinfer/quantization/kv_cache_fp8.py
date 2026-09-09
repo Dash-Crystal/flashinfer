@@ -81,6 +81,17 @@ class MixedKVPageArena:
             {(extent, n) for n in page_values for extent in self.page_extents(n)}
         )
         self.extents = [extent for extent, _ in self.classes]
+        self.page_values = sorted(set(page_values))
+        self.a16_bytes = torch.tensor(
+            [self.page_extents(n)[0] for n in self.page_values],
+            dtype=torch.int32,
+            device=device,
+        )
+        self.a16_classes = torch.tensor(
+            [self.page_values.index(n) for _, n in self.classes],
+            dtype=torch.int32,
+            device=device,
+        )
         self.slab_bytes = max(1 << 20, 128 * ((max(self.extents) + 127) // 128))
         num_slabs = capacity_bytes // self.slab_bytes
         if num_slabs == 0 or num_blocks <= 0 or pages_per_block <= 0:
@@ -107,10 +118,17 @@ class MixedKVPageArena:
         self.hints = torch.zeros(
             len(self.extents) + 1, dtype=torch.int32, device=device
         )
-        self.counters = torch.zeros(2, dtype=torch.int64, device=device)
+        self.counters = torch.zeros(
+            4 + len(self.page_values), dtype=torch.int64, device=device
+        )
+        self.reservations = torch.zeros(num_blocks, dtype=torch.int32, device=device)
+        self.capacity_snapshot = torch.empty(
+            5 + 2 * len(self.page_values), dtype=torch.int64, device=device
+        )
         module = get_fp4_kv_quantization_module()
         self.update = module.mixed_kv_arena_update
         self._blocks = module.mixed_kv_arena_blocks
+        self._capacity = module.mixed_kv_arena_capacity
         self._block_operands = (
             self.data,
             self.pages,
@@ -119,6 +137,8 @@ class MixedKVPageArena:
             self.available,
             self.hints,
             self.counters,
+            self.reservations,
+            self.a16_classes,
             self.slab_bytes,
         )
 
@@ -140,13 +160,22 @@ class MixedKVPageArena:
 
     def reset_blocks(self, blocks: torch.Tensor) -> None:
         """Release every old layer page before a logical block is reassigned."""
-        self._blocks(*self._block_operands, blocks, None)
+        self._blocks(*self._block_operands, blocks, None, True)
+
+    def release_blocks(self, blocks: torch.Tensor) -> None:
+        """Release unreferenced storage and its unwritten-page reservation."""
+        self._blocks(*self._block_operands, blocks, None, False)
+
+    def capacity(self) -> torch.Tensor:
+        """Snapshot allocator capacity after the current stream's publications."""
+        self._capacity(*self._block_operands, self.a16_bytes, self.capacity_snapshot)
+        return self.capacity_snapshot
 
     def copy_blocks(
         self, sources: torch.Tensor, destinations: torch.Tensor, num_blocks: int
     ) -> None:
         """Copy committed encodings; subsequent writes promote private pages."""
-        self._blocks(*self._block_operands, destinations, sources)
+        self._blocks(*self._block_operands, destinations, sources, True)
 
 
 def _check_input(x: torch.Tensor, block_size: int) -> None:

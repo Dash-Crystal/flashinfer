@@ -407,19 +407,19 @@ __global__ void mixed_kv_reset_reused_pages_kernel(const int32_t* __restrict__ r
   }
 }
 
-template <int THREADS>
-__device__ __forceinline__ float mixed_kv_block_sum(float value) {
+template <int THREADS, typename T>
+__device__ __forceinline__ T mixed_kv_block_sum(T value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {
     value += __shfl_down_sync(uint32_t(-1), value, offset);
   }
-  __shared__ float warp_values[THREADS / 32];
+  __shared__ T warp_values[THREADS / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   if (lane == 0) warp_values[warp] = value;
   __syncthreads();
   if (warp == 0) {
-    value = lane < THREADS / 32 ? warp_values[lane] : 0.0f;
+    value = lane < THREADS / 32 ? warp_values[lane] : T{0};
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
       value += __shfl_down_sync(uint32_t(-1), value, offset);
@@ -932,8 +932,10 @@ __global__ void mixed_kv_arena_prepare_kernel(flashinfer::KVPageStorage storage,
   if (source.allocated() && source.format() == flashinfer::KVPageFormat::kA16) return;
   __shared__ uint64_t pending;
   if (threadIdx.x == 0) {
+    arena.reserve_block(page / storage.pages_per_block, true);
     const auto format = flashinfer::KVPageFormat::kA16;
     pending = arena.allocate(storage.geometry.extent_bytes(format), classes[0], format).value;
+    if (pending == flashinfer::kUnallocatedKVPage) atomicAdd(arena.mandatory_failures, 1ULL);
   }
   __syncthreads();
   const flashinfer::KVPageAddress destination{pending};
@@ -1000,7 +1002,7 @@ __global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
   const int token = event_token % storage.geometry.tokens;
   const int head = blockIdx.y;
   const auto address = storage.address(completed[event]);
-  if (!address.allocated()) return;
+  if (!address.allocated() || address.format() != flashinfer::KVPageFormat::kA16) return;
   const auto load = [&](bool is_v, int row_token, int dim) {
     auto* input = reinterpret_cast<const InType*>(storage.payload(address, row_token, head, is_v));
     return mixed_kv_to_float(input[dim]);
@@ -1021,7 +1023,7 @@ __global__ void mixed_kv_arena_select_kernel(flashinfer::KVPageStorage storage,
   const int page = completed[event];
   const uint8_t format = mixed_kv_select_format(stats, event, thresholds);
   const auto source = storage.address(page);
-  if (format == 0 || !source.allocated()) {
+  if (format == 0 || !source.allocated() || source.format() != flashinfer::KVPageFormat::kA16) {
     pending[event] = source.value;
     return;
   }
@@ -1090,6 +1092,7 @@ __global__ void mixed_kv_arena_publish_kernel(flashinfer::KVPageStorage storage,
 flashinfer::KVPageArena make_mixed_kv_arena(TensorView data, TensorView pages, TensorView slabs,
                                             TensorView occupied, TensorView available,
                                             TensorView hints, TensorView counters,
+                                            TensorView reservations, TensorView a16_classes,
                                             int64_t slab_bytes) {
   CHECK_CUDA(data);
   TVM_FFI_ICHECK(data.ndim() == 1 && data.dtype() == dl_uint8 && data.stride(0) == 1);
@@ -1107,11 +1110,16 @@ flashinfer::KVPageArena make_mixed_kv_arena(TensorView data, TensorView pages, T
   TVM_FFI_ICHECK(available.stride(1) == 1 && available.stride(0) == available.size(1));
   TVM_FFI_ICHECK(hints.ndim() == 1 && hints.dtype() == dl_int32 &&
                  hints.numel() == available.size(0) && hints.stride(0) == 1);
-  TVM_FFI_ICHECK(counters.ndim() == 1 && counters.dtype() == dl_int64 && counters.numel() == 2 &&
+  TVM_FFI_ICHECK(counters.ndim() == 1 && counters.dtype() == dl_int64 && counters.numel() > 4 &&
                  counters.stride(0) == 1);
+  TVM_FFI_ICHECK(reservations.ndim() == 1 && reservations.dtype() == dl_int32 &&
+                 reservations.numel() == pages.size(0) && reservations.stride(0) == 1);
+  TVM_FFI_ICHECK(a16_classes.ndim() == 1 && a16_classes.dtype() == dl_int32 &&
+                 a16_classes.numel() == available.size(0) - 1 && a16_classes.stride(0) == 1);
   TVM_FFI_ICHECK(slab_bytes <= UINT32_MAX && slabs.size(0) <= UINT32_MAX &&
                  pages.stride(0) <= UINT32_MAX);
-  for (auto tensor : {pages, slabs, occupied, available, hints, counters}) {
+  for (auto tensor :
+       {pages, slabs, occupied, available, hints, counters, reservations, a16_classes}) {
     TVM_FFI_ICHECK(tensor.device().device_type == data.device().device_type &&
                    tensor.device().device_id == data.device().device_id);
   }
@@ -1121,6 +1129,11 @@ flashinfer::KVPageArena make_mixed_kv_arena(TensorView data, TensorView pages, T
                                 static_cast<uint32_t*>(hints.data_ptr()),
                                 static_cast<unsigned long long*>(counters.data_ptr()),
                                 static_cast<unsigned long long*>(counters.data_ptr()) + 1,
+                                static_cast<unsigned long long*>(counters.data_ptr()) + 2,
+                                static_cast<unsigned long long*>(counters.data_ptr()) + 3,
+                                static_cast<unsigned long long*>(counters.data_ptr()) + 4,
+                                static_cast<uint32_t*>(reservations.data_ptr()),
+                                static_cast<const uint32_t*>(a16_classes.data_ptr()),
                                 static_cast<uint32_t>(slabs.size(0)),
                                 static_cast<uint32_t>(slab_bytes),
                                 static_cast<uint32_t>(occupied.size(1)),
@@ -1135,15 +1148,19 @@ __global__ void mixed_kv_arena_blocks_kernel(uint8_t* data, uint64_t* pages, uin
                                              flashinfer::KVPageArena arena,
                                              const int64_t* destinations,
                                              int64_t destination_stride, const int64_t* sources,
-                                             int64_t source_stride) {
+                                             int64_t source_stride, bool reserve) {
   const int event = blockIdx.x;
   const int column = blockIdx.y;
   const int64_t destination_block = destinations[int64_t(event) * destination_stride];
+  if constexpr (COPY) {
+    if (destination_block == sources[int64_t(event) * source_stride]) return;
+  }
   auto* destination_entry = pages + destination_block * page_stride + column;
   __shared__ uint64_t destination;
   __shared__ uint64_t source;
   __shared__ uint32_t bytes;
   if (threadIdx.x == 0) {
+    if (column == 0) arena.reserve_block(destination_block, reserve);
     auto const previous = atomicExch(reinterpret_cast<unsigned long long*>(destination_entry),
                                      flashinfer::kUnallocatedKVPage);
     arena.release({previous});
@@ -1156,6 +1173,8 @@ __global__ void mixed_kv_arena_blocks_kernel(uint8_t* data, uint64_t* pages, uin
         auto const& slab = arena.slabs[address.offset() / arena.slab_bytes];
         bytes = slab.slot_bytes;
         destination = arena.allocate(bytes, slab.size_class, address.format()).value;
+        if (destination == flashinfer::kUnallocatedKVPage)
+          atomicAdd(arena.mandatory_failures, 1ULL);
       }
     }
   }
@@ -1173,10 +1192,11 @@ __global__ void mixed_kv_arena_blocks_kernel(uint8_t* data, uint64_t* pages, uin
 
 void mixed_kv_arena_blocks(TensorView data, TensorView pages, TensorView slabs, TensorView occupied,
                            TensorView available, TensorView hints, TensorView counters,
-                           int64_t slab_bytes, TensorView destinations,
-                           ffi::Optional<TensorView> sources) {
-  auto arena =
-      make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters, slab_bytes);
+                           TensorView reservations, TensorView a16_classes, int64_t slab_bytes,
+                           TensorView destinations, ffi::Optional<TensorView> sources,
+                           bool reserve) {
+  auto arena = make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters,
+                                   reservations, a16_classes, slab_bytes);
   TVM_FFI_ICHECK(destinations.ndim() == 1 && destinations.dtype() == dl_int64 &&
                  destinations.stride(0) > 0);
   CHECK_CUDA(destinations);
@@ -1194,12 +1214,13 @@ void mixed_kv_arena_blocks(TensorView data, TensorView pages, TensorView slabs, 
     mixed_kv_arena_blocks_kernel<true><<<grid, 128, 0, stream>>>(
         static_cast<uint8_t*>(data.data_ptr()), static_cast<uint64_t*>(pages.data_ptr()),
         pages.stride(0), arena, static_cast<const int64_t*>(destinations.data_ptr()),
-        destinations.stride(0), static_cast<const int64_t*>(src.data_ptr()), src.stride(0));
+        destinations.stride(0), static_cast<const int64_t*>(src.data_ptr()), src.stride(0),
+        reserve);
   } else {
     mixed_kv_arena_blocks_kernel<false><<<grid, 32, 0, stream>>>(
         static_cast<uint8_t*>(data.data_ptr()), static_cast<uint64_t*>(pages.data_ptr()),
         pages.stride(0), arena, static_cast<const int64_t*>(destinations.data_ptr()),
-        destinations.stride(0), nullptr, 0);
+        destinations.stride(0), nullptr, 0, reserve);
   }
 }
 
@@ -1207,10 +1228,10 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
                            TensorView reused_count, TensorView completed,
                            TensorView completed_count, TensorView data, TensorView pages,
                            TensorView slabs, TensorView occupied, TensorView available,
-                           TensorView hints, TensorView counters, TensorView classes,
-                           TensorView partials, TensorView stats, TensorView pending,
-                           TensorView global_scales, TensorView thresholds, int64_t page_size,
-                           int64_t slab_bytes) {
+                           TensorView hints, TensorView counters, TensorView reservations,
+                           TensorView a16_classes, TensorView classes, TensorView partials,
+                           TensorView stats, TensorView pending, TensorView global_scales,
+                           TensorView thresholds, int64_t page_size, int64_t slab_bytes) {
   CHECK_CUDA(k);
   CHECK_CUDA(v);
   CHECK_DIM(3, k);
@@ -1260,8 +1281,8 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
                  uint64_t(slab_bytes));
   TVM_FFI_ICHECK(slab_bytes <= UINT32_MAX && slabs.size(0) <= UINT32_MAX &&
                  pages.stride(0) <= UINT32_MAX);
-  auto arena =
-      make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters, slab_bytes);
+  auto arena = make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters,
+                                   reservations, a16_classes, slab_bytes);
   ffi::CUDADeviceGuard device_guard(k.device().device_id);
   cudaStream_t stream = get_stream(k.device());
   const auto* reset = static_cast<const int32_t*>(reused.data_ptr());
@@ -1304,6 +1325,54 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
   });
 }
 
+__global__ void mixed_kv_arena_capacity_kernel(flashinfer::KVPageArena arena,
+                                               const uint32_t* a16_bytes, int kinds,
+                                               int64_t* output) {
+  const int kind = blockIdx.x;
+  unsigned long long free = 0;
+  for (uint32_t i = threadIdx.x; i < arena.slab_count; i += blockDim.x) {
+    const auto slab = arena.slabs[i];
+    if (kind == kinds) {
+      free += slab.used == 0;
+    } else if (slab.used && arena.a16_classes[slab.size_class] == uint32_t(kind) &&
+               slab.slot_bytes == a16_bytes[kind]) {
+      free += arena.slab_bytes / slab.slot_bytes - slab.used;
+    }
+  }
+  free = mixed_kv_block_sum<256>(free);
+  if (threadIdx.x == 0) {
+    output[kind == kinds ? 4 : 5 + kind] = free;
+    if (kind != kinds) output[5 + kinds + kind] = arena.page_counts[kind];
+    if (kind == 0) {
+      output[0] = *arena.allocated_bytes;
+      output[1] = *arena.allocation_failures;
+      output[2] = *arena.mandatory_failures;
+      output[3] = *arena.reserved_blocks;
+    }
+  }
+}
+
+void mixed_kv_arena_capacity(TensorView data, TensorView pages, TensorView slabs,
+                             TensorView occupied, TensorView available, TensorView hints,
+                             TensorView counters, TensorView reservations, TensorView a16_classes,
+                             int64_t slab_bytes, TensorView a16_bytes, TensorView output) {
+  auto arena = make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters,
+                                   reservations, a16_classes, slab_bytes);
+  const int kinds = counters.numel() - 4;
+  TVM_FFI_ICHECK(a16_bytes.ndim() == 1 && a16_bytes.dtype() == dl_int32 &&
+                 a16_bytes.numel() == kinds && a16_bytes.stride(0) == 1);
+  TVM_FFI_ICHECK(output.ndim() == 1 && output.dtype() == dl_int64 &&
+                 output.numel() == 5 + 2 * kinds && output.stride(0) == 1);
+  for (auto tensor : {a16_bytes, output}) {
+    TVM_FFI_ICHECK(tensor.device().device_type == data.device().device_type &&
+                   tensor.device().device_id == data.device().device_id);
+  }
+  ffi::CUDADeviceGuard guard(data.device().device_id);
+  mixed_kv_arena_capacity_kernel<<<kinds + 1, 256, 0, get_stream(data.device())>>>(
+      arena, static_cast<const uint32_t*>(a16_bytes.data_ptr()), kinds,
+      static_cast<int64_t*>(output.data_ptr()));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_kv_quant, nvfp4_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bsfp8_kv_quant, bsfp8_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_quant_pages, mixed_kv_quant_pages);
@@ -1311,3 +1380,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_quant_pages, mixed_kv_quant_pages);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_arena_update, mixed_kv_arena_update);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_arena_blocks, mixed_kv_arena_blocks);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_arena_capacity, mixed_kv_arena_capacity);
