@@ -991,15 +991,23 @@ __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, c
   }
 }
 
+template <typename Row>
+__device__ __forceinline__ void mixed_kv_completed_rows(int page_size,
+                                                        const int32_t* completed_count,
+                                                        int capacity, Row row) {
+  const int count = min(capacity, *completed_count);
+  // The graph reserves token capacity. Reuse those CTAs for completed page rows
+  // instead of launching page_size times as many mostly empty blocks.
+  for (int64_t event_token = blockIdx.x; event_token < int64_t(count) * page_size;
+       event_token += gridDim.x) {
+    row(event_token / page_size, event_token % page_size);
+  }
+}
+
 template <typename InType, int THREADS = 128>
-__global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
-                                            const int32_t* completed,
-                                            const int32_t* completed_count, float* partials,
-                                            int capacity) {
-  const int event_token = blockIdx.x;
-  const int event = event_token / storage.geometry.tokens;
-  if (event >= capacity || event >= *completed_count) return;
-  const int token = event_token % storage.geometry.tokens;
+__device__ __forceinline__ void mixed_kv_arena_route_row(flashinfer::KVPageStorage storage,
+                                                         const int32_t* completed, float* partials,
+                                                         int event, int token) {
   const int head = blockIdx.y;
   const auto address = storage.address(completed[event]);
   if (!address.allocated() || address.format() != flashinfer::KVPageFormat::kA16) return;
@@ -1007,9 +1015,21 @@ __global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
     auto* input = reinterpret_cast<const InType*>(storage.payload(address, row_token, head, is_v));
     return mixed_kv_to_float(input[dim]);
   };
-  const int64_t partial = (int64_t(event_token) * storage.geometry.heads + head) * 4;
+  const int64_t partial =
+      ((int64_t(event) * storage.geometry.tokens + token) * storage.geometry.heads + head) * 4;
   mixed_kv_route_row<THREADS>(token, storage.geometry.tokens, storage.geometry.head_dim, load,
                               partials + partial);
+}
+
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
+                                            const int32_t* completed,
+                                            const int32_t* completed_count, float* partials,
+                                            int capacity) {
+  mixed_kv_completed_rows(
+      storage.geometry.tokens, completed_count, capacity, [&](int event, int token) {
+        mixed_kv_arena_route_row<InType, THREADS>(storage, completed, partials, event, token);
+      });
 }
 
 __global__ void mixed_kv_arena_select_kernel(flashinfer::KVPageStorage storage,
@@ -1034,14 +1054,11 @@ __global__ void mixed_kv_arena_select_kernel(flashinfer::KVPageStorage storage,
 }
 
 template <typename InType, int THREADS = 128>
-__global__ void mixed_kv_arena_quant_kernel(flashinfer::KVPageStorage storage,
-                                            const int32_t* completed,
-                                            const int32_t* completed_count, const uint64_t* pending,
-                                            const float* global_scales, int capacity) {
-  const int event_token = blockIdx.x;
-  const int event = event_token / storage.geometry.tokens;
-  if (event >= capacity || event >= *completed_count) return;
-  const int token = event_token % storage.geometry.tokens;
+__device__ __forceinline__ void mixed_kv_arena_quant_row(flashinfer::KVPageStorage storage,
+                                                         const int32_t* completed,
+                                                         const uint64_t* pending,
+                                                         const float* global_scales, int event,
+                                                         int token) {
   const int head = blockIdx.y;
   const auto source = storage.address(completed[event]);
   const flashinfer::KVPageAddress destination{pending[event]};
@@ -1071,6 +1088,18 @@ __global__ void mixed_kv_arena_quant_kernel(flashinfer::KVPageStorage storage,
       }
     }
   }
+}
+
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_quant_kernel(flashinfer::KVPageStorage storage,
+                                            const int32_t* completed,
+                                            const int32_t* completed_count, const uint64_t* pending,
+                                            const float* global_scales, int capacity) {
+  mixed_kv_completed_rows(storage.geometry.tokens, completed_count, capacity,
+                          [&](int event, int token) {
+                            mixed_kv_arena_quant_row<InType, THREADS>(storage, completed, pending,
+                                                                      global_scales, event, token);
+                          });
 }
 
 __global__ void mixed_kv_arena_publish_kernel(flashinfer::KVPageStorage storage,
@@ -1307,7 +1336,7 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
           slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
     }
     if (capacity) {
-      const dim3 rows(capacity * page_size, k.size(1));
+      const dim3 rows(capacity, k.size(1));
       mixed_kv_arena_route_kernel<c_type>
           <<<rows, 128, 0, stream>>>(storage, sealed, sealed_count, route_partials, capacity);
       mixed_kv_finalize_route_kernel<128, true><<<capacity, 128, 0, stream>>>(
