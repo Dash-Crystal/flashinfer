@@ -58,9 +58,9 @@ An optional `peer_output` maps an equally shaped peer allocation into the
 producer's CUDA address space. A CUTLASS output iterator writes the same
 epilogue fragment to local output and peer storage. The mainloop, rounding,
 visibility and tile geometry are shared with the local-only specialization.
-Each publishing thread executes a system fence before kernel completion.
-The caller orders the consumer launch after GEMM and performs a cross-rank
-rendezvous before reading the received contribution. Peer readers must finish
+The caller orders the consumer launch after GEMM completion and publishes
+that completion through system-scope release/acquire synchronization before
+reading the received contribution. Peer readers must finish
 before the producer reuses that slot. This API does not allocate, register,
 copy or synchronize peer buffers on the host.
 
@@ -73,4 +73,17 @@ SM120 module build completes. The full-model numerical campaign completes at
 20:51:30 UTC with 14 samples and 82,909,440 values per rank: zero measured
 relative RMS, maximum absolute error and nonfinite count. Projection samples
 cover 1,761 rows, K=2,048/4,096/7,680 and N=3,840. This uncaptured numerical
-mode has no padded rows. Graph and adaptive serving measurements are pending.
+mode has no padded rows. Graph and adaptive serving measurements also complete.
+
+Attempt 22's completed matched serving measurements show +8.55%, +4.99% and
++1.94% latency at capacities 512/1,024/2,048 versus the local-only producer
+composition, with working errors undefined/0.78/0.69 percentage points. Its
+per-thread system fence holds GEMM CTAs until remote traffic is drained.
+The next composition removes this redundant fence: kernel/stream/graph
+dependencies order producer completion before the consumer, whose flag
+exchange uses system release stores and acquire loads. This establishes the
+handoff before peer reads, and the same protocol orders readers before slot
+reuse. Attempt 23's full-model numerical campaign completes at 21:11:53 UTC:
+14 samples and 60,894,720 values per rank, with zero measured relative RMS,
+maximum absolute error and nonfinite count. Its projection samples have 1,218
+rows. Graph and adaptive serving measurements are pending.

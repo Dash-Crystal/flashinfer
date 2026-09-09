@@ -28,7 +28,8 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
     the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
     Operands are A row-major, B column-major, and output row-major, aligned to
     eight FP16/BF16 values. An optional peer mapping receives the same epilogue
-    stores with system ordering. Its owner must order peer readers and reuse.
+    stores. Its owner must publish kernel completion to peer readers with system
+    synchronization, and order reuse after the readers finish.
     No preparation tensor or launch is introduced.
     """
     if (

@@ -91,9 +91,8 @@ __global__ __launch_bounds__(Gemm<Element, Publish>::kThreadCount) void MaskedGe
   extern __shared__ char storage[];
   Gemm<Element, Publish>()(
       params, *reinterpret_cast<typename Gemm<Element, Publish>::SharedStorage*>(storage));
-  // Every publishing thread completes its peer stores before the consumer's
-  // stream dependency and cross-rank rendezvous can release local readers.
-  if constexpr (Publish) __threadfence_system();
+  // Kernel completion orders every producer thread before dependent work.
+  // The caller's system release/acquire handoff then publishes peer stores.
 }
 
 template <typename Element, bool Publish>
