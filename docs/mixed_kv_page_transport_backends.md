@@ -3257,3 +3257,9 @@ The full-model trace's 6,288-block D512 envelope measures median host launch
 intervals of 22.52 us after sharing versus 687.59 us before sharing, with ten
 intervals in each trace. Whole-model latency is reported separately from this
 host-cost reduction.
+
+The final canonical-client comparison records -1.09%/-0.49% matched continuation
+latency at padded 1,024/2,048 and +2.32% at 512 (working errors 0.80/0.78/0.68
+percentage points). Decode comparisons remain mixed: the host improvement does
+not establish a uniform Pareto gain. The corrected implementation is promoted
+in the supervised TP2 service; vLLM's execution review retains full evidence.
