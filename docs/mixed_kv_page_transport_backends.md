@@ -3245,3 +3245,15 @@ decoded stored KV. The query-span samples include 1,542-token continuation and
 D512 split counts 1/3/4. CPU source coverage measured zero missing/duplicate rows
 or capacity overflows over 960 geometries and 7,680 work cases. Whole-sequence
 KL and the serving latency effect are separate measurements.
+
+`xqaGridCapacity` exposes the existing host calculation to serving integration.
+`attention_grid_capacity` carries its result through the typed launch ABI so
+sequential layers can share a single plan per forward. Captured replay uses
+its original launch bound. This removes repeated capacity enumeration from
+uncaptured layer calls; D256/D512 native and query-span instruction streams
+remain identical to the numerically measured build.
+
+The full-model trace's 6,288-block D512 envelope measures median host launch
+intervals of 22.52 us after sharing versus 687.59 us before sharing, with ten
+intervals in each trace. Whole-model latency is reported separately from this
+host-cost reduction.

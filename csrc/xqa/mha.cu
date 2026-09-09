@@ -4267,6 +4267,23 @@ uint32_t xqaResidentSlots(uint32_t multiProcessorCount) {
   return residentSlots(multiProcessorCount);
 }
 
+uint32_t xqaGridCapacity(uint32_t slots, uint32_t heads, uint32_t window, uint32_t maxSeqLen,
+                         uint32_t requests, uint32_t queryTokens, uint32_t queryLength) {
+  uint32_t const tile = hostGeometry.sequenceTile();
+  uint32_t maxTiles = divUp(maxSeqLen, tile);
+  uint32_t jobs = requests;
+#if defined(XQA_MASK_MOD)
+  window = xqa_mask_window_size;
+#endif
+  uint64_t span = window;
+#if XQA_RAGGED_QUERY_SCHEDULE
+  jobs = xqa_work::raggedTileStart(queryTokens, requests, headGrpSize, hostGeometry.splitKV.rows);
+  span += queryLength - 1;
+#endif
+  if (window != 0) maxTiles = std::min<uint64_t>(maxTiles, divUp(span + tile - 1, uint64_t(tile)));
+  return xqa_work::gridCapacity(slots, jobs, heads, maxTiles);
+}
+
 #if XQA_DEVICE_WORK_SCHEDULE
 __global__ void prepareAttentionWork(uint32_t const* lengths, uint32_t requests, uint32_t heads,
                                      uint32_t slots, uint32_t tile, uint32_t window,
@@ -4303,7 +4320,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          uint64_t scratchBytes, uint32_t const* attentionWork,
-                         cudaStream_t stream) {
+                         uint32_t plannedGridCapacity, cudaStream_t stream) {
 #if XQA_RAGGED_QUERY_SCHEDULE
   uint32_t const raggedJobs = qCuSeqLens == nullptr
                                   ? 0
@@ -4375,27 +4392,24 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if XQA_DEVICE_WORK_SCHEDULE
   if (workSlots != 0) {
     uint32_t const tile = hostGeometry.sequenceTile();
-    uint32_t maxTiles = divUp(maxSeqLen, tile);
-    uint32_t jobs = batchSize;
     uint32_t const* queryOffsets = nullptr;
-    uint32_t queryHeads = 0, queryRows = 0;
-    uint64_t window = slidingWinSize;
+    uint32_t queryHeads = 0, queryRows = 0, queryTokensForWork = 0, queryLength = 1;
+    uint32_t window = slidingWinSize;
 #if defined(XQA_MASK_MOD)
     window = xqa_mask_window_size;
 #endif
 #if XQA_RAGGED_QUERY_SCHEDULE
-    jobs = raggedJobs;
     queryOffsets = qCuSeqLens;
     queryHeads = headGrpSize;
     queryRows = hostGeometry.splitKV.rows;
+    queryTokensForWork = queryTokens;
+    queryLength = qSeqLen;
 #endif
-    uint64_t span = window;
-#if XQA_RAGGED_QUERY_SCHEDULE
-    span += qSeqLen - 1;
-#endif
-    if (window != 0)
-      maxTiles = std::min<uint64_t>(maxTiles, divUp(span + tile - 1, uint64_t(tile)));
-    dimGrid = dim3{xqa_work::gridCapacity(workSlots, jobs, nbKHeads, maxTiles), 1, 1};
+    dimGrid =
+        dim3{plannedGridCapacity != 0 ? plannedGridCapacity
+                                      : xqaGridCapacity(workSlots, nbKHeads, window, maxSeqLen,
+                                                        batchSize, queryTokensForWork, queryLength),
+             1, 1};
     uint64_t const partialBytes = uint64_t(dimGrid.x + 1) * hostGeometry.scratchBytes;
     if (attentionWork == nullptr) {
       uint64_t const workBytes = roundUp(uint64_t(batchSize + 2) * sizeof(uint32_t), uint64_t{256});

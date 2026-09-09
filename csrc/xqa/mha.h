@@ -169,6 +169,8 @@ void launchMHA(
     cudaStream_t stream);
 
 uint32_t xqaSequenceTile();
+uint32_t xqaGridCapacity(uint32_t slots, uint32_t heads, uint32_t window, uint32_t maxSeqLen,
+                         uint32_t requests, uint32_t queryTokens, uint32_t queryLength);
 uint32_t xqaResidentSlots(uint32_t multiProcessorCount);
 struct SplitKVGeometry {
   uint32_t scalarBytes;
@@ -203,7 +205,8 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
-                         uint64_t scratchBytes, uint32_t const* attentionWork, cudaStream_t stream);
+                         uint64_t scratchBytes, uint32_t const* attentionWork,
+                         uint32_t plannedGridCapacity, cudaStream_t stream);
 
 void launchHopperF8MHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,

@@ -68,7 +68,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
                  Optional<TensorView> kvScaleTensor, int64_t qSeqLen,
                  Optional<TensorView> qCuSeqLens, Optional<TensorView> mask, TensorView semaphores,
-                 TensorView scratch, bool enable_pdl, Optional<TensorView> attentionWork) {
+                 TensorView scratch, bool enable_pdl, Optional<TensorView> attentionWork,
+                 int64_t plannedGridCapacity) {
+  TVM_FFI_ICHECK(plannedGridCapacity >= 0 && plannedGridCapacity <= UINT32_MAX);
   auto stream = get_stream(output.device());
   if (attentionWork.has_value()) {
     TVM_FFI_ICHECK(attentionWork.value().dtype() == dl_int32 &&
@@ -249,7 +251,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
       scratch.numel() * scratch.dtype().bits / 8,
       attentionWork.has_value() ? static_cast<uint32_t const*>(attentionWork.value().data_ptr())
                                 : nullptr,
-      stream);
+      plannedGridCapacity, stream);
 }
 #endif
 
@@ -258,6 +260,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
 #else
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_sequence_tile, xqaSequenceTile);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_grid_capacity, xqaGridCapacity);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_resident_slots, xqaResidentSlots);
 tvm::ffi::Array<int64_t> xqa_split_kv_geometry() {
   auto const g = xqaSplitKVGeometry();

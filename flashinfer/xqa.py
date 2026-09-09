@@ -170,6 +170,7 @@ def _get_xqa_module_cached(
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
         attention_work: Optional[torch.Tensor],
+        attention_grid_capacity: int,
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -214,6 +215,7 @@ def _get_xqa_module_cached(
             workspace_buffer,
             enable_pdl,
             attention_work,
+            attention_grid_capacity,
         )
 
     @register_fake_op(op_name)
@@ -258,6 +260,7 @@ def _get_xqa_module_cached(
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
         attention_work: Optional[torch.Tensor],
+        attention_grid_capacity: int,
     ) -> None:
         pass
 
@@ -266,6 +269,7 @@ def _get_xqa_module_cached(
         # JIT module URI (== cached_ops directory name), for attribution.
         uri=spec.name,
         sequence_tile=module.xqa_sequence_tile,
+        grid_capacity=module.xqa_grid_capacity,
         resident_slots=module.xqa_resident_slots,
         split_kv_geometry=module.xqa_split_kv_geometry,
     )
@@ -419,6 +423,7 @@ def xqa(
     page_transport_static_format: Optional[int] = None,
     mask_mod: Optional[XQAMaskMod] = None,
     attention_work: Optional[torch.Tensor] = None,
+    attention_grid_capacity: int = 0,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -512,6 +517,9 @@ def xqa(
         Device work prepared with :class:`XQAWork`'s compiled geometry.
         Stores live job count, split count and native decode request indices.
         Query spans use the existing cumulative query offsets for job mapping.
+    attention_grid_capacity : int, default=0
+        Launch bound from the work module's ``grid_capacity`` planner. A serving
+        caller can share this constant across layers; zero plans in the launcher.
 
     Note
     ----
@@ -871,6 +879,7 @@ def xqa(
         q_cu_seq_lens,
         mask,
         attention_work,
+        attention_grid_capacity,
     )
 
 

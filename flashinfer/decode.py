@@ -3548,6 +3548,7 @@ def xqa_batch_decode_with_kv_cache(
     page_transport_static_format: Optional[int] = None,
     mask_mod=None,
     attention_work: Optional[torch.Tensor] = None,
+    attention_grid_capacity: int = 0,
 ) -> torch.Tensor:
     """
     Parameters
@@ -3735,6 +3736,7 @@ def xqa_batch_decode_with_kv_cache(
         page_transport_static_format=page_transport_static_format,
         mask_mod=mask_mod,
         attention_work=attention_work,
+        attention_grid_capacity=attention_grid_capacity,
     )
 
     return out
