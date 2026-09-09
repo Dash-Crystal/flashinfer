@@ -3214,5 +3214,8 @@ softmax and final merge were not the source of that error.
 shared by all three page-advance paths. A compiled CPU enumeration covers
 487,424 transitions with zero mismatches. Full-model attempt 9 uses this
 correction in both candidate and reference, with query-span compaction only
-in candidate and distinct module identities. GPU fidelity and serving
-results from that attempt remain pending.
+in candidate and distinct module identities. Its 36 consumer records measure
+0.146--0.349% RMS with zero nonfinite outputs, including sampled prefill and
+1,645-token continuation. Its D256 4K sample used one split; attempt 10
+keeps single/multi-split captures separately to cover the original failure.
+The corrected serving comparison remains in progress.
