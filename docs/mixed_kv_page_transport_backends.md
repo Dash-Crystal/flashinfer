@@ -3185,3 +3185,34 @@ CPU recombination of native partials matches the native merge within
 the remaining discrepancy before the merge in those captures. Separate
 one-row requests in ragged query-span kernels measure 0.163--0.284% RMS
 at context 4,663. These measurements do not establish whole-sequence KL.
+
+### Ragged query tiles and split-page prefetch (2026-09-09)
+
+Mixed query-span launches now use total query rows plus one guard tile per
+request. Each CTA locates its request in the existing cumulative offsets;
+scratch and semaphore indices use that compact tile ordinal. The old
+request-count times maximum-query envelope is unnecessary. A captured
+49-request batch with 817 total query tokens needs 151/457 per-head tiles
+for D256/D512 instead of 4,753/18,865. No metadata kernel is added.
+
+SM120 query-span copy, expansion and MMA loops share their compiled bodies.
+In the full-model modules, D256 instructions decrease 18,336 to 7,528 and
+D512 30,624 to 7,640; registers are 177/230 with zero stack/local memory.
+Four sampled rows of a 288-token continuation have 0.185--0.225% relative
+RMS against stored-KV attention, with zero nonfinite outputs. Instruction
+and grid reductions are not themselves latency measurements.
+
+The same full-server capture isolated a prefetch defect introduced in
+`fecae4bfe`: the prefetched V page is one iteration ahead, but the split
+boundary decision used the current iteration. Native D256's 16-token V
+tiles could consequently read the adjacent split's values. At 4K context
+and two splits, RMS errors were 68.93/111.42%; CPU reconstruction of the
+exact wrong reads matches these outputs within 0.247/0.227% RMS. The
+softmax and final merge were not the source of that error.
+
+`xqa_work::nextSplitPage` determines the jump from the page being advanced,
+shared by all three page-advance paths. A compiled CPU enumeration covers
+487,424 transitions with zero mismatches. Full-model attempt 9 uses this
+correction in both candidate and reference, with query-span compaction only
+in candidate and distinct module identities. GPU fidelity and serving
+results from that attempt remain pending.

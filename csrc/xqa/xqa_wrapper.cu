@@ -237,7 +237,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
       reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
 #if SPEC_DEC
-      qSeqLen, qCuSeqLensPtr, maskPtr,
+      qSeqLen, qCuSeqLensPtr, maskPtr, q.size(0),
 #endif
       reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
       reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,

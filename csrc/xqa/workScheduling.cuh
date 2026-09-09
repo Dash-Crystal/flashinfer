@@ -5,6 +5,30 @@
 
 namespace xqa_work {
 
+__host__ __device__ inline uint32_t nextSplitPage(uint32_t page, uint32_t step,
+                                                  uint32_t pagesPerTile, uint32_t splits) {
+  return page + step + (page % pagesPerTile + step) / pagesPerTile * pagesPerTile * (splits - 1);
+}
+
+// One guard tile per request makes independently rounded query segments disjoint.
+__host__ __device__ inline uint32_t raggedTileStart(uint32_t queryOffset, uint32_t request,
+                                                    uint32_t heads, uint32_t rows) {
+  return uint64_t(queryOffset) * heads / rows + request;
+}
+
+__device__ inline uint32_t raggedRequest(uint32_t const* queryOffsets, uint32_t requests,
+                                         uint32_t tile, uint32_t heads, uint32_t rows) {
+  uint32_t begin = 0, end = requests;
+  while (begin + 1 < end) {
+    uint32_t const middle = begin + (end - begin) / 2;
+    if (raggedTileStart(queryOffsets[middle], middle, heads, rows) <= tile)
+      begin = middle;
+    else
+      end = middle;
+  }
+  return begin;
+}
+
 struct SplitCost {
   uint64_t numerator;
   uint32_t splits;

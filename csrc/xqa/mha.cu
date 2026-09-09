@@ -30,6 +30,7 @@
 #include "workScheduling.cuh"
 
 #define XQA_DEVICE_DECODE_SCHEDULE (ENABLE_MIXED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1)
+#define XQA_RAGGED_QUERY_SCHEDULE (ENABLE_MIXED_KV_CACHE && SPEC_DEC && BEAM_WIDTH == 1)
 #if defined(XQA_MASK_MOD)
 #include "mask_mod.cuh"
 static_assert(SPEC_DEC && SLIDING_WINDOW);
@@ -196,7 +197,7 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #endif
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210) && \
-    CACHE_ELEM_ENUM == 5 && !SPEC_DEC
+    CACHE_ELEM_ENUM == 5
 #define MIXED_COMPACT_TILE_LOOPS 1
 #endif
 #ifndef MIXED_COMPACT_TILE_LOOPS
@@ -2153,12 +2154,30 @@ CUBIN_EXPORT __global__
         ,
         uint32_t const* decodeWork = nullptr
 #endif
+#if XQA_RAGGED_QUERY_SCHEDULE
+        ,
+        uint32_t raggedJobs = 0
+#endif
     ) {
 
   dim3 workGrid = gridDim;
   uint3 workBlock = blockIdx;
   uint32_t workBatchSize = batchSize;
   uint32_t request = blockIdx.z;
+#if XQA_RAGGED_QUERY_SCHEDULE
+  uint32_t queryRowOffset = 0;
+  if (raggedJobs != 0) {
+    uint32_t const splits = gridDim.x / (raggedJobs * nbKHeads);
+    uint32_t const tile = blockIdx.x / (splits * nbKHeads);
+    workGrid = dim3{splits, nbKHeads, raggedJobs};
+    workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, tile};
+    workBatchSize = raggedJobs;
+    request = xqa_work::raggedRequest(qCuSeqLens, batchSize, tile, headGrpSize, rowsPerBlock);
+    queryRowOffset = (tile - xqa_work::raggedTileStart(qCuSeqLens[request], request, headGrpSize,
+                                                       rowsPerBlock)) *
+                     rowsPerBlock;
+  }
+#endif
 #if XQA_DEVICE_DECODE_SCHEDULE
   if (decodeWork != nullptr) {
     uint32_t const requests = decodeWork[0];
@@ -2277,12 +2296,14 @@ CUBIN_EXPORT __global__
 
   uint32_t const nbTokenBlocksPerGrp = workGrid.y / nbKHeads;
   uint32_t const idxHeadGrp = workBlock.y / nbTokenBlocksPerGrp;  // inside one request
-  uint32_t const idxHeadTokenInGrp = (workBlock.y % nbTokenBlocksPerGrp) * warpTile.y;
+  uint32_t const idxHeadTokenInGrp =
+#if XQA_RAGGED_QUERY_SCHEDULE
+      raggedJobs != 0 ? queryRowOffset :
+#endif
+                      (workBlock.y % nbTokenBlocksPerGrp) * warpTile.y;
   uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
-#if defined(XQA_MASK_MOD)
   // Captured grids cover the query-span envelope, including empty request tiles.
   if (idxHeadTokenInGrp >= totalNbHeadTokensInGrp) return;
-#endif
   uint32_t const nbValidHeadTokens =
       idxHeadTokenInGrp > totalNbHeadTokensInGrp
           ? 0u
@@ -3062,9 +3083,7 @@ CUBIN_EXPORT __global__
         if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1 &&
             (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
           auto const step = 1;  // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
-          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
-                             : step);
+          idxPageBeg = xqa_work::nextSplitPage(idxPageBeg, step, nbPagesPerCtaTile, nbSubSeqPerSeq);
           assert(beamWidth == 1 ||
                  cacheVTileSeqStride <= tokensPerPage &&
                      "todo: need to substrate from idxPageBeg for beam switching");
@@ -3088,9 +3107,7 @@ CUBIN_EXPORT __global__
         }
         // idxPageBeg already names the prefetched window. Advance that window,
         // including the interleaved split-KV jump, only when this tile crosses a page.
-        idxPageBeg += idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
-                          ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + 1
-                          : 1;
+        idxPageBeg = xqa_work::nextSplitPage(idxPageBeg, 1, nbPagesPerCtaTile, nbSubSeqPerSeq);
 #else
         idxPageBeg = seqOffsetNext / tokensPerPage;
 #endif
@@ -3098,6 +3115,13 @@ CUBIN_EXPORT __global__
         return true;
       } else {
         constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
+#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1
+        // The page window is prefetched one step ahead of vIter. Its own position
+        // determines the split boundary; the current tile's phase is unrelated.
+        idxPageBeg =
+            xqa_work::nextSplitPage(idxPageBeg, step_per_viter, nbPagesPerCtaTile, nbSubSeqPerSeq);
+        loadPages(idxPageBeg);
+#else
         bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
         bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
         if (isLastVIter && isLastBeam) {
@@ -3112,6 +3136,7 @@ CUBIN_EXPORT __global__
           idxPageBeg += step_per_viter;
           loadPages(idxPageBeg);
         }
+#endif
         return true;
       }
     };
@@ -3993,6 +4018,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
     ,
     uint32_t const* decodeWork = nullptr
 #endif
+#if XQA_RAGGED_QUERY_SCHEDULE
+    ,
+    uint32_t raggedJobs = 0
+#endif
 ) {
 #if SPEC_DEC
   kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -4023,6 +4052,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if XQA_DEVICE_DECODE_SCHEDULE
                   ,
                   decodeWork
+#endif
+#if XQA_RAGGED_QUERY_SCHEDULE
+                  ,
+                  raggedJobs
 #endif
   );
 }
@@ -4196,6 +4229,10 @@ void launchMHA(
                      ,
                      static_cast<uint32_t const*>(nullptr)
 #endif
+#if XQA_RAGGED_QUERY_SCHEDULE
+                         ,
+                     uint32_t{0}
+#endif
   );
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
@@ -4249,6 +4286,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          float const* kvScalePtr,
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+                         uint32_t queryTokens,
 #endif
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
@@ -4256,6 +4294,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          uint64_t scratchBytes, uint32_t const* decodeWork, cudaStream_t stream) {
+#if XQA_RAGGED_QUERY_SCHEDULE
+  uint32_t const raggedJobs = qCuSeqLens == nullptr
+                                  ? 0
+                                  : xqa_work::raggedTileStart(queryTokens, batchSize, headGrpSize,
+                                                              hostGeometry.splitKV.rows);
+#endif
 #if XQA_DEVICE_DECODE_SCHEDULE
   auto const splitOverride = std::getenv("XQA_NB_SUB_SEQ");
   uint32_t const decodeSlots =
@@ -4278,7 +4322,11 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
       }
     }
 #if SPEC_DEC
-    uint32_t const nbSeq = batchSize * nbKHeads * divUp(qSeqLen * headGrpSize, rowsPerBlock);
+    uint32_t const nbSeq =
+#if XQA_RAGGED_QUERY_SCHEDULE
+        raggedJobs != 0 ? nbKHeads * raggedJobs :
+#endif
+                        batchSize * nbKHeads * divUp(qSeqLen * headGrpSize, rowsPerBlock);
 #else
     uint32_t const nbSeq = batchSize * nbKHeads;
 #endif
@@ -4300,7 +4348,14 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   }();
 #if SPEC_DEC
   const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
-  dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
+  dim3 dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
+#if XQA_RAGGED_QUERY_SCHEDULE
+  if (raggedJobs != 0) {
+    dimGrid = dim3{nbSubSeqPerSeq * nbKHeads * raggedJobs, 1, 1};
+    if (nbSubSeqPerSeq > 1 && scratchBytes < uint64_t(dimGrid.x + 1) * hostGeometry.scratchBytes)
+      throw std::runtime_error("XQA scratch is too small for ragged partials");
+  }
+#endif
 #else
   dim3 dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #if XQA_DEVICE_DECODE_SCHEDULE
@@ -4386,6 +4441,10 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if XQA_DEVICE_DECODE_SCHEDULE
                      ,
                      decodeWork
+#endif
+#if XQA_RAGGED_QUERY_SCHEDULE
+                     ,
+                     raggedJobs
 #endif
   );
   checkCuda(cudaPeekAtLastError());
