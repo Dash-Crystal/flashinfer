@@ -41,21 +41,112 @@ class MixedKVPagedCache(NamedTuple):
     alternate page encodings.
     """
 
-    fp8_k_payload: torch.Tensor
-    fp8_v_payload: torch.Tensor
-    fp8_k_scales: torch.Tensor
-    fp8_v_scales: torch.Tensor
-    fp4_k_payload: torch.Tensor
-    fp4_v_payload: torch.Tensor
-    fp4_k_scales: torch.Tensor
-    fp4_v_scales: torch.Tensor
-    page_format: torch.Tensor
+    fp8_k_payload: torch.Tensor | None
+    fp8_v_payload: torch.Tensor | None
+    fp8_k_scales: torch.Tensor | None
+    fp8_v_scales: torch.Tensor | None
+    fp4_k_payload: torch.Tensor | None
+    fp4_v_payload: torch.Tensor | None
+    fp4_k_scales: torch.Tensor | None
+    fp4_v_scales: torch.Tensor | None
+    page_format: torch.Tensor | None
     page_router_stats: torch.Tensor
     routing_thresholds: torch.Tensor
     fp8_k_global_scale: torch.Tensor
     fp8_v_global_scale: torch.Tensor
     fp4_k_global_scale: torch.Tensor
     fp4_v_global_scale: torch.Tensor
+
+    page_storage: torch.Tensor | None = None
+    page_addresses: torch.Tensor | None = None
+    page_geometry: tuple[int, int, int] | None = None
+
+
+class MixedKVPageArena:
+    """One byte allocation with format-tagged addresses and reusable size classes."""
+
+    def __init__(
+        self,
+        capacity_bytes: int,
+        num_blocks: int,
+        pages_per_block: int,
+        page_values: list[int],
+        device: torch.device,
+    ) -> None:
+        from .fp4_quantization import get_fp4_kv_quantization_module
+
+        if not page_values or any(n <= 0 or n % 16 for n in page_values):
+            raise ValueError("Page coefficient counts must be positive multiples of 16")
+        self.classes = sorted(
+            {(extent, n) for n in page_values for extent in self.page_extents(n)}
+        )
+        self.extents = [extent for extent, _ in self.classes]
+        self.slab_bytes = max(1 << 20, 128 * ((max(self.extents) + 127) // 128))
+        num_slabs = capacity_bytes // self.slab_bytes
+        if num_slabs == 0 or num_blocks <= 0 or pages_per_block <= 0:
+            raise ValueError(
+                "The arena must contain at least one slab and logical page"
+            )
+        self.data = torch.empty(capacity_bytes, dtype=torch.uint8, device=device)
+        self.pages = torch.full(
+            (num_blocks, pages_per_block), -1, dtype=torch.int64, device=device
+        )
+        self.slabs = torch.zeros((num_slabs, 4), dtype=torch.int32, device=device)
+        bitmap_words = (self.slab_bytes // min(self.extents) + 63) // 64
+        self.occupied = torch.zeros(
+            (num_slabs, bitmap_words), dtype=torch.int64, device=device
+        )
+        self.available = torch.zeros(
+            (len(self.extents) + 1, (num_slabs + 63) // 64),
+            dtype=torch.int64,
+            device=device,
+        )
+        self.available[-1].fill_(-1)
+        if num_slabs % 64:
+            self.available[-1, -1] = (1 << (num_slabs % 64)) - 1
+        self.hints = torch.zeros(
+            len(self.extents) + 1, dtype=torch.int32, device=device
+        )
+        self.counters = torch.zeros(2, dtype=torch.int64, device=device)
+        module = get_fp4_kv_quantization_module()
+        self.update = module.mixed_kv_arena_update
+        self._blocks = module.mixed_kv_arena_blocks
+        self._block_operands = (
+            self.data,
+            self.pages,
+            self.slabs,
+            self.occupied,
+            self.available,
+            self.hints,
+            self.counters,
+            self.slab_bytes,
+        )
+
+    @staticmethod
+    def page_extents(values: int) -> tuple[int, int, int]:
+        """A16, block-scaled FP8 and FP4 extents, including alignment."""
+        a16, fp8, fp4 = (
+            ((size + 127) // 128) * 128
+            for size in (values * 2, values + values // 16, values // 2 + values // 16)
+        )
+        return a16, fp8, fp4
+
+    def size_classes(self, values: int) -> torch.Tensor:
+        return torch.tensor(
+            [self.classes.index((size, values)) for size in self.page_extents(values)],
+            dtype=torch.int32,
+            device=self.data.device,
+        )
+
+    def reset_blocks(self, blocks: torch.Tensor) -> None:
+        """Release every old layer page before a logical block is reassigned."""
+        self._blocks(*self._block_operands, blocks, None)
+
+    def copy_blocks(
+        self, sources: torch.Tensor, destinations: torch.Tensor, num_blocks: int
+    ) -> None:
+        """Copy committed encodings; subsequent writes promote private pages."""
+        self._blocks(*self._block_operands, destinations, sources)
 
 
 def _check_input(x: torch.Tensor, block_size: int) -> None:

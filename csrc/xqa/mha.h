@@ -66,7 +66,12 @@ using InputHead = IOHead;
 using GMemCacheHead = Vec<CacheElemConverter::ContainerType,
                           exactDiv(validElemsPerHead, CacheElemConverter::ElemsPerContainer)>;
 #if ENABLE_MIXED_KV_CACHE
-using PageTransport = flashinfer::KVPageTransport<InputElem>;
+#ifndef XQA_PAGE_BLOCK_RATIO
+#define XQA_PAGE_BLOCK_RATIO 0
+#define XQA_PAGE_BLOCK_STRIDE 0
+#endif
+using PageTransport =
+    flashinfer::KVPageTransport<InputElem, XQA_PAGE_BLOCK_RATIO, XQA_PAGE_BLOCK_STRIDE>;
 #endif
 #if ENABLE_4BIT_KV_CACHE
 using GMemCacheHeadSf = Vec<CacheElemConverter::ScalingFactorType,

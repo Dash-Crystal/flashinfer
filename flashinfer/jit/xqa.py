@@ -66,6 +66,7 @@ def gen_xqa_module(
     block_scaled_fp8: bool = False,
     mixed_page_static_format: int = -1,
     mask_mod_source: str | None = None,
+    page_table_geometry: tuple[int, int] = (0, 0),
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -172,11 +173,15 @@ def gen_xqa_module(
     flag_mixed_page_static_format = [
         f"-DMIXED_PAGE_STATIC_FORMAT={mixed_page_static_format}"
     ]
+    page_ratio, page_stride = page_table_geometry
+    page_flags = [
+        f"-DXQA_PAGE_BLOCK_RATIO={page_ratio}",
+        f"-DXQA_PAGE_BLOCK_STRIDE={page_stride}",
+    ]
 
     sources = [
         jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
         jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
-        jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
     ]
 
     # The Hopper GMMA source currently has only A16/global-E4M3 storage
@@ -210,9 +215,10 @@ def gen_xqa_module(
             f"-I{header.parent}",
             f"-I{Path(torch.__file__).parent / 'include'}",
         ]
-    module_name = f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{mask_suffix}"
-    if mask_mod_source is not None:
-        module_name = f"xqa_mask_{hashlib.sha256(module_name.encode()).hexdigest()}"
+    module_name = f"xqa_page_address_v1_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{mask_suffix}"
+    module_name += f"_page_table_{page_ratio}_{page_stride}"
+    if mask_mod_source is not None or len(module_name) > 200:
+        module_name = f"xqa_{hashlib.sha256(module_name.encode()).hexdigest()}"
     return gen_jit_spec(
         module_name,
         sources,
@@ -229,6 +235,7 @@ def gen_xqa_module(
         + flag_mla_wrapper
         + flag_sm90_mha
         + flag_mixed_page_static_format
+        + page_flags
         + mask_flags,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
@@ -284,7 +291,6 @@ def gen_xqa_module_mla(
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mla_sm120.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
         ],
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags

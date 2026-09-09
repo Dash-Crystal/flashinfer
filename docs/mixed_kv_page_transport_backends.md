@@ -16,6 +16,42 @@ mixed-KV-page branch. It exists because of the following review finding, quoted 
 
 ## Design specification
 
+### Packed storage integration, September 9
+
+`page_storage.cuh` adds one byte arena with format-sized extents and one
+address table whose low bits identify the committed encoding. The SM120 XQA
+transport resolves those addresses into compact token/head rows and scale
+planes. It retains the existing copy, dequantization and MMA schedule. The
+row router and scale-search codec are shared with the original producer;
+publication releases the old extent after encoding. Slabs are reassigned
+between extent sizes when empty. Block copies preserve the encoding, and a
+subsequent private-page write promotes that page to A16.
+
+Two complete Gemma4 12B W16/A16 TP2 SVG/video campaigns on two RTX 5090s
+measured 9.40–10.89 bits per resident KV value, including compressed scales.
+The address census and allocator bytes reconcile exactly with zero duplicate
+addresses and allocation failures. These are residency snapshots, including
+writable tails and retained prefix cache, rather than prescribed mixtures.
+The second campaign has 31.91–32.57% less resident payload storage than A16.
+The arena itself remains reserved, with address and allocator metadata and
+producer scratch allocated separately.
+
+At matched counterfactual batch 64, 4K/8K/12K input and 1K output, the two
+packed full-model response fits give 25.87–26.51 / 30.28–33.33 /
+34.70–40.15 ms, versus the retained fixed-slot mixed implementation's
+23.38 / 29.46 / 35.54 ms. This does not establish a Pareto latency gain.
+The longer-context coordinates extrapolate fitted marginal costs. Receipts,
+source hashes and replayable joint moments are retained on ws-1 under
+`/data/h3-runtime/mixed-kv-arena-20260909/campaign-{1,2}` and in vLLM's
+`docs/design/mixed_kv_page_transport_transcript_design.md`.
+
+Outstanding integration includes physical-budget admission and expanded
+logical capacity, mandatory-allocation failure feedback, packed numerical
+quality measurements, and SM90 TMA address lowering. Packed SM90 currently
+selects the generic consumer explicitly; no SM90 packed performance is claimed.
+
+### Original producer/consumer specification
+
 The producer/consumer data flow, its stall-freedom conditions, and the
 invariants an implementation must satisfy are fixed in
 `mixed_kv_page_transport_dataflow.md`. Kernels are written once from that

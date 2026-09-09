@@ -65,6 +65,7 @@ def get_xqa_module(
     block_scaled_fp8: bool = False,
     mixed_page_static_format: int = -1,
     mask_mod_source: str | None = None,
+    page_table_geometry: tuple[int, int] = (0, 0),
 ):
     # Ragged Q must reuse the uniform module unless it changes the compile
     # flags; a second cache entry would re-register the same torch op.
@@ -83,6 +84,7 @@ def get_xqa_module(
         block_scaled_fp8,
         mixed_page_static_format,
         mask_mod_source,
+        page_table_geometry,
     )
 
 
@@ -101,6 +103,7 @@ def _get_xqa_module_cached(
     block_scaled_fp8: bool,
     mixed_page_static_format: int,
     mask_mod_source: str | None,
+    page_table_geometry: tuple[int, int],
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -116,6 +119,7 @@ def _get_xqa_module_cached(
         block_scaled_fp8,
         mixed_page_static_format,
         mask_mod_source,
+        page_table_geometry,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -148,6 +152,8 @@ def _get_xqa_module_cached(
         fp4_k_scales: Optional[torch.Tensor],
         fp4_v_scales: Optional[torch.Tensor],
         page_format: Optional[torch.Tensor],
+        page_storage: Optional[torch.Tensor],
+        page_addresses: Optional[torch.Tensor],
         fp8_k_global_scale: Optional[torch.Tensor],
         fp8_v_global_scale: Optional[torch.Tensor],
         fp4_k_global_scale: Optional[torch.Tensor],
@@ -188,6 +194,8 @@ def _get_xqa_module_cached(
             fp4_k_scales,
             fp4_v_scales,
             page_format,
+            page_storage,
+            page_addresses,
             fp8_k_global_scale,
             fp8_v_global_scale,
             fp4_k_global_scale,
@@ -230,6 +238,8 @@ def _get_xqa_module_cached(
         fp4_k_scales: Optional[torch.Tensor],
         fp4_v_scales: Optional[torch.Tensor],
         page_format: Optional[torch.Tensor],
+        page_storage: Optional[torch.Tensor],
+        page_addresses: Optional[torch.Tensor],
         fp8_k_global_scale: Optional[torch.Tensor],
         fp8_v_global_scale: Optional[torch.Tensor],
         fp4_k_global_scale: Optional[torch.Tensor],
@@ -453,6 +463,7 @@ def xqa(
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
     mixed_page = page_transport is not None
+    packed_page = mixed_page and page_transport.page_storage is not None
     if mask_mod is not None:
         if mask is not None or sliding_win_size != 0:
             raise ValueError(
@@ -485,7 +496,47 @@ def xqa(
             or v_sf_cache.dtype != torch.float8_e4m3fn
         ):
             raise TypeError("block-scaled FP8 scale caches must use float8_e4m3fn")
-    if mixed_page:
+    if packed_page:
+        storage = page_transport.page_storage
+        addresses = page_transport.page_addresses
+        if (
+            storage.dtype != torch.uint8
+            or storage.ndim != 1
+            or not storage.is_contiguous()
+        ):
+            raise ValueError("packed KV storage must be a contiguous byte arena")
+        if addresses is None or addresses.dtype != torch.int64 or addresses.ndim != 2:
+            raise ValueError(
+                "packed KV pages require an int64 address-and-format table"
+            )
+        if (
+            addresses.stride(0) <= 0
+            or addresses.stride(1) != 1
+            or addresses.device != q.device
+            or storage.device != q.device
+        ):
+            raise ValueError("packed KV operands must reside on the query device")
+        if page_transport.page_geometry != (page_size, num_kv_heads, head_dim):
+            raise ValueError(
+                "packed KV geometry must match the layer attention geometry"
+            )
+        if k_cache.dtype != q.dtype:
+            raise TypeError("packed KV expands into the query's A16 dtype")
+        for scalar in (
+            page_transport.fp8_k_global_scale,
+            page_transport.fp8_v_global_scale,
+            page_transport.fp4_k_global_scale,
+            page_transport.fp4_v_global_scale,
+        ):
+            if (
+                scalar.dtype != torch.float32
+                or scalar.numel() != 1
+                or scalar.device != q.device
+            ):
+                raise ValueError(
+                    "packed KV global scales must be float32 device scalars"
+                )
+    if mixed_page and not packed_page:
         if k_cache.dtype != q.dtype:
             raise TypeError("mixed-page canonical A16 cache must match the query dtype")
         expected_a16 = k_cache.shape
@@ -563,7 +614,7 @@ def xqa(
         assert output.dtype == q.dtype, "Output and query must have the same dtype"
 
     # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
-    if kv_layout == "HND":
+    if kv_layout == "HND" and not packed_page:
         # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
@@ -584,6 +635,7 @@ def xqa(
             )
     if (
         head_dim <= 256
+        and not packed_page
         and get_compute_capability(q.device)[0] == 9
         and (
             (k_cache.dtype == torch.float8_e4m3fn and not block_scaled_fp8)
@@ -623,6 +675,14 @@ def xqa(
         block_scaled_fp8,
         mixed_page_static_format,
         None if mask_mod is None else mask_mod.source,
+        (
+            (
+                page_transport.page_addresses.shape[1],
+                page_transport.page_addresses.stride(0),
+            )
+            if packed_page
+            else (0, 0)
+        ),
     )
 
     if q_seq_len > 1:
@@ -675,6 +735,8 @@ def xqa(
         None if page_transport is None else page_transport.fp4_k_scales,
         None if page_transport is None else page_transport.fp4_v_scales,
         None if page_transport is None else page_transport.page_format,
+        None if page_transport is None else page_transport.page_storage,
+        None if page_transport is None else page_transport.page_addresses,
         None if page_transport is None else page_transport.fp8_k_global_scale,
         None if page_transport is None else page_transport.fp8_v_global_scale,
         None if page_transport is None else page_transport.fp4_k_global_scale,

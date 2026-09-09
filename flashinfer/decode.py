@@ -3658,7 +3658,11 @@ def xqa_batch_decode_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     # Extract shape parameters based on layout
-    if kv_layout == "NHD":
+    if page_transport is not None and page_transport.page_geometry is not None:
+        page_size, num_kv_heads, stored_head_dim = page_transport.page_geometry
+        if stored_head_dim != query.shape[-1]:
+            raise ValueError("query width differs from packed KV geometry")
+    elif kv_layout == "NHD":
         # NHD: [num_pages, page_size, num_kv_heads, head_dim] for ordinary KV cache
         # or [num_pages, page_size, num_kv_heads, head_dim// 2] for NVFP4 KV cache with packed head dim
         page_size = k_cache.shape[1]

@@ -59,13 +59,14 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  Optional<TensorView> fp8KScales, Optional<TensorView> fp8VScales,
                  Optional<TensorView> fp4KPayload, Optional<TensorView> fp4VPayload,
                  Optional<TensorView> fp4KScales, Optional<TensorView> fp4VScales,
-                 Optional<TensorView> pageFormat, Optional<TensorView> fp8KGlobalScale,
+                 Optional<TensorView> pageFormat, Optional<TensorView> pageStorage,
+                 Optional<TensorView> pageAddresses, Optional<TensorView> fp8KGlobalScale,
                  Optional<TensorView> fp8VGlobalScale, Optional<TensorView> fp4KGlobalScale,
-                 Optional<TensorView> fp4VGlobalScale,
-                 TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
-                 int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
-                 int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
-                 TensorView semaphores, TensorView scratch, bool enable_pdl) {
+                 Optional<TensorView> fp4VGlobalScale, TensorView kvCachePageList,
+                 int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                 Optional<TensorView> kvScaleTensor, int64_t qSeqLen,
+                 Optional<TensorView> qCuSeqLens, Optional<TensorView> mask, TensorView semaphores,
+                 TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -77,9 +78,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                                 ? reinterpret_cast<float const*>(kvScaleTensor.value().data_ptr())
                                 : nullptr;
   // Extract strides from TensorView (in elements, not bytes)
-  uint64_t kv_stride_page = kCacheVLLM.stride(0);
-  uint64_t kv_stride_token = kCacheVLLM.stride(-3);
-  uint64_t kv_stride_head = kCacheVLLM.stride(-2);
+  uint64_t kv_stride_page = pageStorage.has_value() ? 0 : kCacheVLLM.stride(0);
+  uint64_t kv_stride_token = pageStorage.has_value() ? 0 : kCacheVLLM.stride(-3);
+  uint64_t kv_stride_head = pageStorage.has_value() ? 0 : kCacheVLLM.stride(-2);
 #if ENABLE_4BIT_KV_CACHE
   uint64_t sf_stride_page = kv_stride_page;
   uint64_t sf_stride_token = kv_stride_token;
@@ -92,56 +93,77 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #endif
 
 #if ENABLE_MIXED_KV_CACHE
-  TVM_FFI_ICHECK(fp8KPayload.has_value() && fp8VPayload.has_value() &&
-                 fp8KScales.has_value() && fp8VScales.has_value() &&
-                 fp4KPayload.has_value() && fp4VPayload.has_value() &&
-                 fp4KScales.has_value() && fp4VScales.has_value() && pageFormat.has_value() &&
-                 fp8KGlobalScale.has_value() && fp8VGlobalScale.has_value() &&
-                 fp4KGlobalScale.has_value() && fp4VGlobalScale.has_value())
-      << "mixed-page XQA requires all fixed-shape transport operands";
-  auto const byte_stride = [](int64_t elements, uint64_t element_bytes) -> uint32_t {
-    TVM_FFI_ICHECK_GE(elements, 0) << "mixed-page XQA requires nonnegative strides";
-    uint64_t const bytes = uint64_t(elements) * element_bytes;
-    TVM_FFI_ICHECK_LE(bytes, uint64_t{UINT32_MAX})
-        << "mixed-page XQA byte stride exceeds the compact transport descriptor";
-    return static_cast<uint32_t>(bytes);
-  };
   PageTransport pageTransport{};
-  pageTransport.page_format = reinterpret_cast<uint8_t const*>(pageFormat.value().data_ptr());
-  auto& a16 = pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kA16)];
-  a16.k_payload = kCacheVLLM.data_ptr();
-  a16.v_payload = vCacheVLLM.data_ptr();
-  a16.payload_stride = {byte_stride(kCacheVLLM.stride(0), sizeof(InputElem)),
-                        byte_stride(kCacheVLLM.stride(-3), sizeof(InputElem)),
-                        byte_stride(kCacheVLLM.stride(-2), sizeof(InputElem))};
-  auto& fp8 =
-      pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP8)];
-  fp8.k_payload = fp8KPayload.value().data_ptr();
-  fp8.v_payload = fp8VPayload.value().data_ptr();
-  fp8.k_scales = reinterpret_cast<uint8_t const*>(fp8KScales.value().data_ptr());
-  fp8.v_scales = reinterpret_cast<uint8_t const*>(fp8VScales.value().data_ptr());
-  fp8.k_global_scale = reinterpret_cast<float const*>(fp8KGlobalScale.value().data_ptr());
-  fp8.v_global_scale = reinterpret_cast<float const*>(fp8VGlobalScale.value().data_ptr());
-  fp8.payload_stride = {byte_stride(fp8KPayload.value().stride(0), 1),
-                        byte_stride(fp8KPayload.value().stride(-3), 1),
-                        byte_stride(fp8KPayload.value().stride(-2), 1)};
-  fp8.scale_stride = {byte_stride(fp8KScales.value().stride(0), 1),
-                      byte_stride(fp8KScales.value().stride(-3), 1),
-                      byte_stride(fp8KScales.value().stride(-2), 1)};
-  auto& fp4 =
-      pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP4)];
-  fp4.k_payload = fp4KPayload.value().data_ptr();
-  fp4.v_payload = fp4VPayload.value().data_ptr();
-  fp4.k_scales = reinterpret_cast<uint8_t const*>(fp4KScales.value().data_ptr());
-  fp4.v_scales = reinterpret_cast<uint8_t const*>(fp4VScales.value().data_ptr());
-  fp4.k_global_scale = reinterpret_cast<float const*>(fp4KGlobalScale.value().data_ptr());
-  fp4.v_global_scale = reinterpret_cast<float const*>(fp4VGlobalScale.value().data_ptr());
-  fp4.payload_stride = {byte_stride(fp4KPayload.value().stride(0), 1),
-                        byte_stride(fp4KPayload.value().stride(-3), 1),
-                        byte_stride(fp4KPayload.value().stride(-2), 1)};
-  fp4.scale_stride = {byte_stride(fp4KScales.value().stride(0), 1),
-                      byte_stride(fp4KScales.value().stride(-3), 1),
-                      byte_stride(fp4KScales.value().stride(-2), 1)};
+  TVM_FFI_ICHECK(fp8KGlobalScale.has_value() && fp8VGlobalScale.has_value() &&
+                 fp4KGlobalScale.has_value() && fp4VGlobalScale.has_value());
+  if (pageStorage.has_value()) {
+    TVM_FFI_ICHECK(pageAddresses.has_value());
+    auto const data = pageStorage.value();
+    auto const pages = pageAddresses.value();
+    TVM_FFI_ICHECK(data.ndim() == 1 && data.dtype() == dl_uint8 && data.stride(0) == 1);
+    TVM_FFI_ICHECK(pages.ndim() == 2 && pages.dtype() == dl_int64 && pages.stride(0) > 0 &&
+                   pages.stride(0) <= UINT32_MAX && pages.stride(1) == 1 && pages.size(1) > 0);
+    CHECK_DEVICE(data, q);
+    CHECK_DEVICE(pages, q);
+    pageTransport.storage = {static_cast<uint8_t*>(data.data_ptr()),
+                             static_cast<uint64_t*>(pages.data_ptr()),
+                             static_cast<uint32_t>(pages.stride(0)),
+                             static_cast<uint32_t>(pages.size(1)),
+                             {tokensPerPage, static_cast<uint32_t>(nbKHeads), validElemsPerHead}};
+  } else {
+    TVM_FFI_ICHECK(fp8KPayload.has_value() && fp8VPayload.has_value() && fp8KScales.has_value() &&
+                   fp8VScales.has_value() && fp4KPayload.has_value() && fp4VPayload.has_value() &&
+                   fp4KScales.has_value() && fp4VScales.has_value() && pageFormat.has_value() &&
+                   fp8KGlobalScale.has_value() && fp8VGlobalScale.has_value() &&
+                   fp4KGlobalScale.has_value() && fp4VGlobalScale.has_value())
+        << "mixed-page XQA requires all fixed-shape transport operands";
+    auto const byte_stride = [](int64_t elements, uint64_t element_bytes) -> uint32_t {
+      TVM_FFI_ICHECK_GE(elements, 0) << "mixed-page XQA requires nonnegative strides";
+      uint64_t const bytes = uint64_t(elements) * element_bytes;
+      TVM_FFI_ICHECK_LE(bytes, uint64_t{UINT32_MAX})
+          << "mixed-page XQA byte stride exceeds the compact transport descriptor";
+      return static_cast<uint32_t>(bytes);
+    };
+    pageTransport.page_format = reinterpret_cast<uint8_t const*>(pageFormat.value().data_ptr());
+    auto& a16 = pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kA16)];
+    a16.k_payload = kCacheVLLM.data_ptr();
+    a16.v_payload = vCacheVLLM.data_ptr();
+    a16.payload_stride = {byte_stride(kCacheVLLM.stride(0), sizeof(InputElem)),
+                          byte_stride(kCacheVLLM.stride(-3), sizeof(InputElem)),
+                          byte_stride(kCacheVLLM.stride(-2), sizeof(InputElem))};
+    auto& fp8 =
+        pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP8)];
+    fp8.k_payload = fp8KPayload.value().data_ptr();
+    fp8.v_payload = fp8VPayload.value().data_ptr();
+    fp8.k_scales = reinterpret_cast<uint8_t const*>(fp8KScales.value().data_ptr());
+    fp8.v_scales = reinterpret_cast<uint8_t const*>(fp8VScales.value().data_ptr());
+    fp8.payload_stride = {byte_stride(fp8KPayload.value().stride(0), 1),
+                          byte_stride(fp8KPayload.value().stride(-3), 1),
+                          byte_stride(fp8KPayload.value().stride(-2), 1)};
+    fp8.scale_stride = {byte_stride(fp8KScales.value().stride(0), 1),
+                        byte_stride(fp8KScales.value().stride(-3), 1),
+                        byte_stride(fp8KScales.value().stride(-2), 1)};
+    auto& fp4 =
+        pageTransport.formats[static_cast<uint8_t>(flashinfer::KVPageFormat::kBlockScaledFP4)];
+    fp4.k_payload = fp4KPayload.value().data_ptr();
+    fp4.v_payload = fp4VPayload.value().data_ptr();
+    fp4.k_scales = reinterpret_cast<uint8_t const*>(fp4KScales.value().data_ptr());
+    fp4.v_scales = reinterpret_cast<uint8_t const*>(fp4VScales.value().data_ptr());
+    fp4.payload_stride = {byte_stride(fp4KPayload.value().stride(0), 1),
+                          byte_stride(fp4KPayload.value().stride(-3), 1),
+                          byte_stride(fp4KPayload.value().stride(-2), 1)};
+    fp4.scale_stride = {byte_stride(fp4KScales.value().stride(0), 1),
+                        byte_stride(fp4KScales.value().stride(-3), 1),
+                        byte_stride(fp4KScales.value().stride(-2), 1)};
+  }
+  pageTransport.formats[1].k_global_scale =
+      static_cast<const float*>(fp8KGlobalScale.value().data_ptr());
+  pageTransport.formats[1].v_global_scale =
+      static_cast<const float*>(fp8VGlobalScale.value().data_ptr());
+  pageTransport.formats[2].k_global_scale =
+      static_cast<const float*>(fp4KGlobalScale.value().data_ptr());
+  pageTransport.formats[2].v_global_scale =
+      static_cast<const float*>(fp4VGlobalScale.value().data_ptr());
 #endif
 
 #if SPEC_DEC
@@ -218,4 +240,10 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #endif
                       stream);
 }
+#endif
+
+#if MLA_WRAPPER
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
+#else
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
 #endif

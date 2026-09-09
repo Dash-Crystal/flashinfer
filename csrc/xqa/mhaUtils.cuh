@@ -191,7 +191,7 @@ __device__ inline MixedPageFormats<nbPages> gatherMixedPageFormats(
   uint32_t value = 0;
   KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
   if (page != kBAD_PAGE_INDEX) {
-    value = transport.page_format[page];
+    value = transport.format(page);
   }
 #pragma unroll
   for (uint32_t i = 0; i < nbPages; ++i) {
@@ -210,7 +210,7 @@ __device__ inline uint32_t mixedPageTagLane(PageTransport const& transport,
   uint32_t value = 0;
   KVCachePageIndex const page = lane < nbPages ? selectByIndex(pages, lane) : kBAD_PAGE_INDEX;
   if (page != kBAD_PAGE_INDEX) {
-    value = transport.page_format[page];
+    value = transport.format(page);
   }
   return value;
 }
@@ -366,9 +366,9 @@ __device__ inline void copyMixedPartialHeadsAsync(
     constexpr bool isFP8 = format == fp8Format;
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
-    auto const& fmt = transport.formats[format];
+    auto const fmt = transport.span(page, format, page != kBAD_PAGE_INDEX);
     auto const* payload = static_cast<uint8_t const*>(isK ? fmt.k_payload : fmt.v_payload);
-    bool const pageValid = page != kBAD_PAGE_INDEX;
+    bool const pageValid = page != kBAD_PAGE_INDEX && fmt.allocated;
     uint32_t const spanHead0 = span * headsPerSpan;
     uint32_t const token0 = (sourceHeadOffset + spanHead0) % tokensPerPage;
     // The page's own format also for !valid blocks: their payload copies are zero-fills
@@ -516,7 +516,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
 #else
         valid ? selectByIndex(formats.values, localPage) : 0;
 #endif
-    auto const& span = transport.formats[format];
+    auto const span = transport.span(page, format, page != kBAD_PAGE_INDEX);
     bool const compressed = format != static_cast<uint8_t>(flashinfer::KVPageFormat::kA16);
     auto const* scales = isK ? span.k_scales : span.v_scales;
     uint64_t const scaleOffset = valid && compressed
@@ -527,12 +527,13 @@ __device__ inline void copyMixedPartialHeadsAsync(
     auto const* scaleSource =
         compressed
             ? reinterpret_cast<uint8_t const*>(reinterpret_cast<uint64_t>(scales) + scaleOffset)
-            : static_cast<uint8_t const*>(transport.formats[0].k_payload);
+            : static_cast<uint8_t const*>(span.k_payload);
     auto* scaleDestination = dstScales + localHead * scaleLoadBytes;
 #pragma unroll
     for (uint32_t offset = 0; offset < scaleLoadBytes; offset += scaleCopyBytes) {
-      ldgsts::copyAsync<scaleCopyBytes>(scaleDestination + offset, scaleSource + offset,
-                                        valid && compressed ? scaleCopyBytes : 0U);
+      ldgsts::copyAsync<scaleCopyBytes>(
+          scaleDestination + offset, scaleSource + offset,
+          valid && compressed && span.allocated ? scaleCopyBytes : 0U);
     }
   }
 }
@@ -1453,14 +1454,14 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
     constexpr bool isFP8 = format == fp8Format;
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
-    auto const& fmt = transport.formats[format];
+    auto const fmt = transport.span(page, format, page != kBAD_PAGE_INDEX);
     uint8_t const* payload;
     if constexpr (isK) {
       payload = static_cast<uint8_t const*>(fmt.k_payload);
     } else {
       payload = static_cast<uint8_t const*>(fmt.v_payload);
     }
-    bool const pageValid = page != kBAD_PAGE_INDEX;
+    bool const pageValid = page != kBAD_PAGE_INDEX && fmt.allocated;
     uint32_t const spanHead0 = span * headsPerSpan;
     // Byte offset of this lane's block inside the token row, per format.
     uint32_t const elemOff = isA16 ? elem * uint32_t(sizeof(InputElem)) : (isFP8 ? elem : elem / 2);
@@ -1538,14 +1539,14 @@ __device__ inline void copyMixedPartialHeadsAsyncHoisted(
 #endif
     bool const compressed = format != a16Format;
     if (compressed) {
-      auto const& sp = transport.formats[format];
+      auto const sp = transport.span(page, format, page != kBAD_PAGE_INDEX);
       uint8_t const* scales;
       if constexpr (isK) {
         scales = sp.k_scales;
       } else {
         scales = sp.v_scales;
       }
-      bool const valid = localHead >= nbSkipHeads && localHead < nbAvailHeads;
+      bool const valid = sp.allocated && localHead >= nbSkipHeads && localHead < nbAvailHeads;
       uint64_t const scaleOffset = uint64_t(page) * sp.scale_stride.page +
                                    uint64_t(token) * sp.scale_stride.token +
                                    uint64_t(headIdx) * sp.scale_stride.head + scaleGroup;

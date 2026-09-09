@@ -23,6 +23,7 @@
 
 #include <cstdint>
 
+#include "flashinfer/attention/page_storage.cuh"
 #include "tvm_ffi_utils.h"
 
 // Number of elements per block scale group
@@ -459,20 +460,9 @@ __device__ __forceinline__ float mixed_kv_to_float(InType value) {
   }
 }
 
-template <typename InType, int THREADS = 128>
-__global__ void mixed_kv_route_rows_kernel(
-    const InType* __restrict__ k_input, const InType* __restrict__ v_input,
-    const int32_t* __restrict__ completed_pages, const int32_t* __restrict__ completed_count,
-    float* __restrict__ page_router_partials, const int completed_capacity, const int page_size,
-    const int num_heads, const int head_dim, const int64_t in_stride_page,
-    const int64_t in_stride_token, const int64_t in_stride_head, const int64_t in_stride_dim) {
-  const int event_token = blockIdx.x;
-  const int event = event_token / page_size;
-  if (event >= completed_capacity || event >= *completed_count) return;
-  const int token = event_token - event * page_size;
-  const int head = blockIdx.y;
-  const int32_t page = completed_pages[event];
-
+template <int THREADS, typename Load>
+__device__ __forceinline__ void mixed_kv_route_row(int token, int page_size, int head_dim,
+                                                   Load load, float* partials) {
   float neighbor_dot = 0.0f;
   float neighbor_left_sq = 0.0f;
   float neighbor_right_sq = 0.0f;
@@ -480,11 +470,8 @@ __global__ void mixed_kv_route_rows_kernel(
     for (int linear = threadIdx.x; linear < 2 * head_dim; linear += THREADS) {
       const bool is_v = linear >= head_dim;
       const int dim = is_v ? linear - head_dim : linear;
-      const InType* input = is_v ? v_input : k_input;
-      const int64_t offset = page * in_stride_page + token * in_stride_token +
-                             head * in_stride_head + dim * in_stride_dim;
-      const float left = mixed_kv_to_float(input[offset]);
-      const float right = mixed_kv_to_float(input[offset + in_stride_token]);
+      const float left = load(is_v, token, dim);
+      const float right = load(is_v, token + 1, dim);
       neighbor_dot = fmaf(left, right, neighbor_dot);
       neighbor_left_sq = fmaf(left, left, neighbor_left_sq);
       neighbor_right_sq = fmaf(right, right, neighbor_right_sq);
@@ -502,11 +489,8 @@ __global__ void mixed_kv_route_rows_kernel(
   for (int block = warp; block < 2 * blocks_per_kv; block += THREADS / 32) {
     const bool is_v = block >= blocks_per_kv;
     const int dim_block = is_v ? block - blocks_per_kv : block;
-    const InType* input = is_v ? v_input : k_input;
     const int dim = dim_block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane;
-    const int64_t offset = page * in_stride_page + token * in_stride_token + head * in_stride_head +
-                           dim * in_stride_dim;
-    const float value = mixed_kv_to_float(input[offset]);
+    const float value = load(is_v, token, dim);
     float sum_sq = value * value;
     float peak = fabsf(value);
 #pragma unroll
@@ -522,15 +506,38 @@ __global__ void mixed_kv_route_rows_kernel(
   peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
 
   if (threadIdx.x == 0) {
-    const int64_t partial = (static_cast<int64_t>(event_token) * num_heads + head) * 4;
-    page_router_partials[partial + 0] = neighbor_dot;
-    page_router_partials[partial + 1] = neighbor_left_sq;
-    page_router_partials[partial + 2] = neighbor_right_sq;
-    page_router_partials[partial + 3] = peak_rms;
+    partials[0] = neighbor_dot;
+    partials[1] = neighbor_left_sq;
+    partials[2] = neighbor_right_sq;
+    partials[3] = peak_rms;
   }
 }
 
-template <int THREADS = 128>
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_route_rows_kernel(
+    const InType* __restrict__ k_input, const InType* __restrict__ v_input,
+    const int32_t* __restrict__ completed_pages, const int32_t* __restrict__ completed_count,
+    float* __restrict__ page_router_partials, const int completed_capacity, const int page_size,
+    const int num_heads, const int head_dim, const int64_t in_stride_page,
+    const int64_t in_stride_token, const int64_t in_stride_head, const int64_t in_stride_dim) {
+  const int event_token = blockIdx.x;
+  const int event = event_token / page_size;
+  if (event >= completed_capacity || event >= *completed_count) return;
+  const int token = event_token - event * page_size;
+  const int head = blockIdx.y;
+  const int32_t page = completed_pages[event];
+
+  const auto load = [&](bool is_v, int row_token, int dim) {
+    const InType* input = is_v ? v_input : k_input;
+    const int64_t offset = page * in_stride_page + row_token * in_stride_token +
+                           head * in_stride_head + dim * in_stride_dim;
+    return mixed_kv_to_float(input[offset]);
+  };
+  const int64_t partial = (static_cast<int64_t>(event_token) * num_heads + head) * 4;
+  mixed_kv_route_row<THREADS>(token, page_size, head_dim, load, page_router_partials + partial);
+}
+
+template <int THREADS = 128, bool EVENT_INDEXED = false>
 __global__ void mixed_kv_finalize_route_kernel(const int32_t* __restrict__ completed_pages,
                                                const int32_t* __restrict__ completed_count,
                                                const float* __restrict__ page_router_partials,
@@ -556,7 +563,7 @@ __global__ void mixed_kv_finalize_route_kernel(const int32_t* __restrict__ compl
   right_sq = mixed_kv_block_sum<THREADS>(right_sq);
   peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
   if (threadIdx.x == 0) {
-    const int32_t page = completed_pages[event];
+    const int32_t page = EVENT_INDEXED ? event : completed_pages[event];
     const float denom = sqrtf(left_sq * right_sq);
     page_router_stats[page * 2] = denom == 0.0f ? 0.0f : dot / denom;
     page_router_stats[page * 2 + 1] = peak_rms;
@@ -571,6 +578,81 @@ mixed_kv_select_format(const float* __restrict__ page_router_stats, const int32_
   const bool fp4 = neighbor_cos <= routing_thresholds[0] && peak_rms <= routing_thresholds[1];
   const bool fp8 = neighbor_cos <= routing_thresholds[2] && peak_rms <= routing_thresholds[3];
   return fp4 ? 2 : (fp8 ? 1 : 0);
+}
+
+struct MixedKVQuantizedBlock {
+  uint8_t scale;
+  uint8_t payload;
+};
+
+// Both rectangular and packed page writers use the original 16-lane codec.
+__device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float value,
+                                                                         float global_scale,
+                                                                         uint8_t selected_format) {
+  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
+  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
+  float block_max = fabsf(value);
+#pragma unroll
+  for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
+    block_max =
+        fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, BSFP8_BLOCK_SIZE));
+  }
+
+  const float format_max = selected_format == 2 ? 6.0f : 448.0f;
+  const float scale_max = selected_format == 2 ? 448.0f : BSFP8_A16_SCALE_MAX;
+  float sf_value = 0.0f;
+  if (block_max != 0.0f) {
+    const float required_sf = block_max * reciprocal_approximate_ftz(global_scale) *
+                              reciprocal_approximate_ftz(format_max);
+    constexpr float factors[9] = {
+        0.75f, 0.8125f, 0.875f, 0.9375f, 1.0f, 1.0625f, 1.125f, 1.25f, 1.5f,
+    };
+    float best_objective = __int_as_float(0x7f800000);
+#pragma unroll
+    for (int candidate = 0; candidate < 9; ++candidate) {
+      float candidate_sf = fminf(fmaxf(required_sf * factors[candidate], 0x1p-9f), scale_max);
+      __nv_fp8_e4m3 candidate_sf_fp8 = __nv_fp8_e4m3(candidate_sf);
+      candidate_sf = static_cast<float>(candidate_sf_fp8);
+      const float encode_scale = reciprocal_approximate_ftz(global_scale * candidate_sf);
+      float reconstructed;
+      if (selected_format == 2) {
+        reconstructed = decode_e2m1_nibble(encode_e2m1_nibble(value * encode_scale)) *
+                        candidate_sf * global_scale;
+      } else {
+        __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
+        reconstructed = static_cast<float>(encoded) * candidate_sf * global_scale;
+      }
+      const float residual = fabsf(reconstructed - value);
+      float sum_squared = residual * residual;
+      float max_residual = residual;
+#pragma unroll
+      for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
+        sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, BSFP8_BLOCK_SIZE);
+        max_residual = fmaxf(
+            max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset, BSFP8_BLOCK_SIZE));
+      }
+      const float objective =
+          sum_squared / float(BSFP8_BLOCK_SIZE) + 0.05f * max_residual * max_residual;
+      if (objective < best_objective) {
+        best_objective = objective;
+        sf_value = candidate_sf;
+      }
+    }
+  }
+  __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
+  const float encode_scale =
+      sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
+  uint8_t payload;
+  if (selected_format == 1) {
+    payload = __nv_fp8_e4m3(value * encode_scale).__x;
+  } else {
+    const int pair_lane = lane & (BSFP8_BLOCK_SIZE / 2 - 1);
+    const float low = __shfl_sync(subgroup_mask, value, pair_lane * 2, BSFP8_BLOCK_SIZE);
+    const float high = __shfl_sync(subgroup_mask, value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE);
+    payload =
+        encode_e2m1_nibble(low * encode_scale) | (encode_e2m1_nibble(high * encode_scale) << 4);
+  }
+  return {sf_fp8.__x, payload};
 }
 
 // Match the existing bsfp8_quant_kernel / NVIDIA NVFP4 producer geometry:
@@ -610,7 +692,6 @@ __global__ void mixed_kv_quant_rows_kernel(
   constexpr int GROUPS_PER_CTA = THREADS / BSFP8_BLOCK_SIZE;
   const int subgroup = threadIdx.x / BSFP8_BLOCK_SIZE;
   const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
-  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
   const int dim_blocks = head_dim / BSFP8_BLOCK_SIZE;
 
   __shared__ float global_scales[4];
@@ -638,84 +719,28 @@ __global__ void mixed_kv_quant_rows_kernel(
       const int64_t input_offset = page * in_stride_page + token * in_stride_token +
                                    head * in_stride_head + dim * in_stride_dim;
       const float value = valid ? mixed_kv_to_float(input[input_offset]) : 0.0f;
-      float block_max = fabsf(value);
-#pragma unroll
-      for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
-        block_max =
-            fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, BSFP8_BLOCK_SIZE));
-      }
-
-      const float format_max = selected_format == 2 ? 6.0f : 448.0f;
-      const float scale_max = selected_format == 2 ? 448.0f : BSFP8_A16_SCALE_MAX;
-      float sf_value = 0.0f;
-      if (block_max != 0.0f) {
-        const float required_sf = block_max * reciprocal_approximate_ftz(global_scale) *
-                                  reciprocal_approximate_ftz(format_max);
-        constexpr float factors[9] = {
-            0.75f, 0.8125f, 0.875f, 0.9375f, 1.0f, 1.0625f, 1.125f, 1.25f, 1.5f,
-        };
-        float best_objective = __int_as_float(0x7f800000);
-#pragma unroll
-        for (int candidate = 0; candidate < 9; ++candidate) {
-          float candidate_sf = fminf(fmaxf(required_sf * factors[candidate], 0x1p-9f), scale_max);
-          __nv_fp8_e4m3 candidate_sf_fp8 = __nv_fp8_e4m3(candidate_sf);
-          candidate_sf = static_cast<float>(candidate_sf_fp8);
-          const float encode_scale = reciprocal_approximate_ftz(global_scale * candidate_sf);
-          float reconstructed;
-          if (selected_format == 2) {
-            reconstructed = decode_e2m1_nibble(encode_e2m1_nibble(value * encode_scale)) *
-                            candidate_sf * global_scale;
-          } else {
-            __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
-            reconstructed = static_cast<float>(encoded) * candidate_sf * global_scale;
-          }
-          const float residual = fabsf(reconstructed - value);
-          float sum_squared = residual * residual;
-          float max_residual = residual;
-#pragma unroll
-          for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
-            sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, BSFP8_BLOCK_SIZE);
-            max_residual = fmaxf(max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset,
-                                                               BSFP8_BLOCK_SIZE));
-          }
-          const float objective =
-              sum_squared / float(BSFP8_BLOCK_SIZE) + 0.05f * max_residual * max_residual;
-          if (objective < best_objective) {
-            best_objective = objective;
-            sf_value = candidate_sf;
-          }
-        }
-      }
+      const auto encoded = mixed_kv_quantize_block(value, global_scale, selected_format);
       // All source lanes have read before an in-place compressed store.
       __syncthreads();
-      __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
       const int64_t sf_offset = page * sf_stride_page + token * sf_stride_token +
                                 head * sf_stride_head + dim_block * sf_stride_dim;
       if (valid && lane == 0) {
         if (selected_format == 2) {
-          fp4_scales[sf_offset] = sf_fp8.__x;
+          fp4_scales[sf_offset] = encoded.scale;
         } else {
-          fp8_scales[sf_offset] = sf_fp8.__x;
+          fp8_scales[sf_offset] = encoded.scale;
         }
       }
-      const float encode_scale =
-          sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
       if (selected_format == 1) {
-        __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
         if (valid)
           fp8_output[page * fp8_stride_page + token * fp8_stride_token + head * fp8_stride_head +
-                     dim * fp8_stride_dim] = encoded.__x;
+                     dim * fp8_stride_dim] = encoded.payload;
       } else {
-        const int pair_lane = lane & (BSFP8_BLOCK_SIZE / 2 - 1);
-        const float low = __shfl_sync(subgroup_mask, value, pair_lane * 2, BSFP8_BLOCK_SIZE);
-        const float high = __shfl_sync(subgroup_mask, value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE);
         if (valid && lane < BSFP8_BLOCK_SIZE / 2) {
-          const uint8_t packed = encode_e2m1_nibble(low * encode_scale) |
-                                 (encode_e2m1_nibble(high * encode_scale) << 4);
           const int packed_dim = dim_block * (BSFP8_BLOCK_SIZE / 2) + lane;
           const int64_t output_offset = page * fp4_stride_page + token * fp4_stride_token +
                                         head * fp4_stride_head + packed_dim * fp4_stride_dim;
-          fp4_output[output_offset] = packed;
+          fp4_output[output_offset] = encoded.payload;
         }
       }
     }
@@ -895,6 +920,394 @@ void mixed_kv_quant_pages(
   });
 }
 
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_prepare_kernel(flashinfer::KVPageStorage storage,
+                                              flashinfer::KVPageArena arena, const int32_t* reused,
+                                              const int32_t* reused_count, const int32_t* classes,
+                                              const float* global_scales, int capacity) {
+  const int event = blockIdx.x;
+  if (event >= capacity || event >= *reused_count) return;
+  const int page = reused[event];
+  const auto source = storage.address(page);
+  if (source.allocated() && source.format() == flashinfer::KVPageFormat::kA16) return;
+  __shared__ uint64_t pending;
+  if (threadIdx.x == 0) {
+    const auto format = flashinfer::KVPageFormat::kA16;
+    pending = arena.allocate(storage.geometry.extent_bytes(format), classes[0], format).value;
+  }
+  __syncthreads();
+  const flashinfer::KVPageAddress destination{pending};
+  if (!destination.allocated()) return;
+  if (source.allocated()) {
+    const auto format = source.format();
+    const auto* payload = storage.data + source.offset();
+    const auto* scales = payload + storage.geometry.payload_bytes(format);
+    auto* output = reinterpret_cast<InType*>(storage.data + destination.offset());
+    for (uint64_t i = threadIdx.x; i < storage.geometry.values(); i += THREADS) {
+      __nv_fp8_e4m3 scale;
+      scale.__x = scales[i / BSFP8_BLOCK_SIZE];
+      float value;
+      if (format == flashinfer::KVPageFormat::kBlockScaledFP8) {
+        __nv_fp8_e4m3 encoded;
+        encoded.__x = payload[i];
+        value = float(encoded);
+      } else {
+        value = decode_e2m1_nibble((payload[i / 2] >> ((i % 2) * 4)) & 15);
+      }
+      const int kv = (i / storage.geometry.head_dim) % 2;
+      const int scale_index = (static_cast<int>(format) - 1) * 2 + kv;
+      const InType block_scale = InType(float(scale) * global_scales[scale_index]);
+      output[i] = InType(value * mixed_kv_to_float(block_scale));
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    storage.entry(page) = destination.value;
+    arena.release(source);
+  }
+}
+
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, const InType* k,
+                                            const InType* v, const int64_t* slots, int tokens,
+                                            int64_t k_token_stride, int64_t k_head_stride,
+                                            int64_t v_token_stride, int64_t v_head_stride) {
+  const int input_token = blockIdx.x;
+  if (input_token >= tokens) return;
+  const int64_t slot = slots[input_token];
+  if (slot < 0) return;
+  const int page = slot / storage.geometry.tokens;
+  const int token = slot % storage.geometry.tokens;
+  const int head = blockIdx.y;
+  const auto address = storage.address(page);
+  if (!address.allocated() || address.format() != flashinfer::KVPageFormat::kA16) return;
+  auto* dst_k = reinterpret_cast<InType*>(storage.payload(address, token, head, false));
+  auto* dst_v = reinterpret_cast<InType*>(storage.payload(address, token, head, true));
+  for (int dim = threadIdx.x; dim < storage.geometry.head_dim; dim += THREADS) {
+    dst_k[dim] = k[int64_t(input_token) * k_token_stride + head * k_head_stride + dim];
+    dst_v[dim] = v[int64_t(input_token) * v_token_stride + head * v_head_stride + dim];
+  }
+}
+
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
+                                            const int32_t* completed,
+                                            const int32_t* completed_count, float* partials,
+                                            int capacity) {
+  const int event_token = blockIdx.x;
+  const int event = event_token / storage.geometry.tokens;
+  if (event >= capacity || event >= *completed_count) return;
+  const int token = event_token % storage.geometry.tokens;
+  const int head = blockIdx.y;
+  const auto address = storage.address(completed[event]);
+  if (!address.allocated()) return;
+  const auto load = [&](bool is_v, int row_token, int dim) {
+    auto* input = reinterpret_cast<const InType*>(storage.payload(address, row_token, head, is_v));
+    return mixed_kv_to_float(input[dim]);
+  };
+  const int64_t partial = (int64_t(event_token) * storage.geometry.heads + head) * 4;
+  mixed_kv_route_row<THREADS>(token, storage.geometry.tokens, storage.geometry.head_dim, load,
+                              partials + partial);
+}
+
+__global__ void mixed_kv_arena_select_kernel(flashinfer::KVPageStorage storage,
+                                             flashinfer::KVPageArena arena,
+                                             const int32_t* completed,
+                                             const int32_t* completed_count, const int32_t* classes,
+                                             const float* stats, const float* thresholds,
+                                             uint64_t* pending, int capacity) {
+  const int event = blockIdx.x;
+  if (threadIdx.x != 0 || event >= capacity || event >= *completed_count) return;
+  const int page = completed[event];
+  const uint8_t format = mixed_kv_select_format(stats, event, thresholds);
+  const auto source = storage.address(page);
+  if (format == 0 || !source.allocated()) {
+    pending[event] = source.value;
+    return;
+  }
+  const auto encoded_format = static_cast<flashinfer::KVPageFormat>(format);
+  pending[event] =
+      arena.allocate(storage.geometry.extent_bytes(encoded_format), classes[format], encoded_format)
+          .value;
+}
+
+template <typename InType, int THREADS = 128>
+__global__ void mixed_kv_arena_quant_kernel(flashinfer::KVPageStorage storage,
+                                            const int32_t* completed,
+                                            const int32_t* completed_count, const uint64_t* pending,
+                                            const float* global_scales, int capacity) {
+  const int event_token = blockIdx.x;
+  const int event = event_token / storage.geometry.tokens;
+  if (event >= capacity || event >= *completed_count) return;
+  const int token = event_token % storage.geometry.tokens;
+  const int head = blockIdx.y;
+  const auto source = storage.address(completed[event]);
+  const flashinfer::KVPageAddress destination{pending[event]};
+  if (!destination.allocated() || destination.value == source.value) return;
+  const auto format = static_cast<uint8_t>(destination.format());
+  const int subgroup = threadIdx.x / BSFP8_BLOCK_SIZE;
+  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
+  const int dim_blocks = storage.geometry.head_dim / BSFP8_BLOCK_SIZE;
+#pragma unroll
+  for (int kv = 0; kv < 2; ++kv) {
+    const auto* input = reinterpret_cast<const InType*>(storage.payload(source, token, head, kv));
+    auto* payload = storage.payload(destination, token, head, kv);
+    auto* scales = storage.scales(destination, token, head, kv);
+    const float global_scale = global_scales[(format - 1) * 2 + kv];
+    for (int base = 0; base < dim_blocks; base += THREADS / BSFP8_BLOCK_SIZE) {
+      const int block = base + subgroup;
+      const bool valid = block < dim_blocks;
+      const int dim = block * BSFP8_BLOCK_SIZE + lane;
+      const float value = valid ? mixed_kv_to_float(input[dim]) : 0.0f;
+      const auto encoded = mixed_kv_quantize_block(value, global_scale, format);
+      if (valid && lane == 0) scales[block] = encoded.scale;
+      if (format == 1) {
+        if (valid) payload[dim] = encoded.payload;
+      } else {
+        if (valid && lane < BSFP8_BLOCK_SIZE / 2)
+          payload[block * (BSFP8_BLOCK_SIZE / 2) + lane] = encoded.payload;
+      }
+    }
+  }
+}
+
+__global__ void mixed_kv_arena_publish_kernel(flashinfer::KVPageStorage storage,
+                                              flashinfer::KVPageArena arena,
+                                              const int32_t* completed,
+                                              const int32_t* completed_count,
+                                              const uint64_t* pending, int capacity) {
+  const int event = blockIdx.x;
+  if (threadIdx.x != 0 || event >= capacity || event >= *completed_count) return;
+  const int page = completed[event];
+  const flashinfer::KVPageAddress destination{pending[event]};
+  const auto source = storage.address(page);
+  if (!destination.allocated() || destination.value == source.value) return;
+  // Quantization has completed on this stream before the address is published.
+  storage.entry(page) = destination.value;
+  arena.release(source);
+}
+
+flashinfer::KVPageArena make_mixed_kv_arena(TensorView data, TensorView pages, TensorView slabs,
+                                            TensorView occupied, TensorView available,
+                                            TensorView hints, TensorView counters,
+                                            int64_t slab_bytes) {
+  CHECK_CUDA(data);
+  TVM_FFI_ICHECK(data.ndim() == 1 && data.dtype() == dl_uint8 && data.stride(0) == 1);
+  TVM_FFI_ICHECK(pages.ndim() == 2 && pages.dtype() == dl_int64 && pages.stride(0) > 0 &&
+                 pages.stride(1) == 1 && pages.size(1) > 0);
+  TVM_FFI_ICHECK(slabs.ndim() == 2 && slabs.size(1) == 4 && slabs.dtype() == dl_int32);
+  TVM_FFI_ICHECK(slabs.stride(1) == 1 && slabs.stride(0) == 4);
+  TVM_FFI_ICHECK(slab_bytes > 0 && slab_bytes % flashinfer::kKVPageAlignment == 0);
+  TVM_FFI_ICHECK(data.numel() / slab_bytes == slabs.size(0) && slabs.size(0) > 0);
+  TVM_FFI_ICHECK(occupied.ndim() == 2 && occupied.dtype() == dl_int64 &&
+                 occupied.size(0) == slabs.size(0));
+  TVM_FFI_ICHECK(occupied.stride(1) == 1 && occupied.stride(0) == occupied.size(1));
+  TVM_FFI_ICHECK(available.ndim() == 2 && available.dtype() == dl_int64 && available.size(0) >= 2);
+  TVM_FFI_ICHECK(available.size(1) == (slabs.size(0) + 63) / 64);
+  TVM_FFI_ICHECK(available.stride(1) == 1 && available.stride(0) == available.size(1));
+  TVM_FFI_ICHECK(hints.ndim() == 1 && hints.dtype() == dl_int32 &&
+                 hints.numel() == available.size(0) && hints.stride(0) == 1);
+  TVM_FFI_ICHECK(counters.ndim() == 1 && counters.dtype() == dl_int64 && counters.numel() == 2 &&
+                 counters.stride(0) == 1);
+  TVM_FFI_ICHECK(slab_bytes <= UINT32_MAX && slabs.size(0) <= UINT32_MAX &&
+                 pages.stride(0) <= UINT32_MAX);
+  for (auto tensor : {pages, slabs, occupied, available, hints, counters}) {
+    TVM_FFI_ICHECK(tensor.device().device_type == data.device().device_type &&
+                   tensor.device().device_id == data.device().device_id);
+  }
+  flashinfer::KVPageArena arena{static_cast<flashinfer::KVPageSlab*>(slabs.data_ptr()),
+                                static_cast<uint64_t*>(occupied.data_ptr()),
+                                static_cast<unsigned long long*>(available.data_ptr()),
+                                static_cast<uint32_t*>(hints.data_ptr()),
+                                static_cast<unsigned long long*>(counters.data_ptr()),
+                                static_cast<unsigned long long*>(counters.data_ptr()) + 1,
+                                static_cast<uint32_t>(slabs.size(0)),
+                                static_cast<uint32_t>(slab_bytes),
+                                static_cast<uint32_t>(occupied.size(1)),
+                                static_cast<uint32_t>(available.size(0) - 1)};
+  return arena;
+}
+
+// Copy a committed encoding verbatim. A later write promotes only that private
+// page to A16; compressed prefixes never need a second persistent encoding.
+template <bool COPY, int THREADS = 128>
+__global__ void mixed_kv_arena_blocks_kernel(uint8_t* data, uint64_t* pages, uint32_t page_stride,
+                                             flashinfer::KVPageArena arena,
+                                             const int64_t* destinations,
+                                             int64_t destination_stride, const int64_t* sources,
+                                             int64_t source_stride) {
+  const int event = blockIdx.x;
+  const int column = blockIdx.y;
+  const int64_t destination_block = destinations[int64_t(event) * destination_stride];
+  auto* destination_entry = pages + destination_block * page_stride + column;
+  __shared__ uint64_t destination;
+  __shared__ uint64_t source;
+  __shared__ uint32_t bytes;
+  if (threadIdx.x == 0) {
+    auto const previous = atomicExch(reinterpret_cast<unsigned long long*>(destination_entry),
+                                     flashinfer::kUnallocatedKVPage);
+    arena.release({previous});
+    if constexpr (COPY) {
+      const int64_t source_block = sources[int64_t(event) * source_stride];
+      const flashinfer::KVPageAddress address{pages[source_block * page_stride + column]};
+      source = address.value;
+      destination = flashinfer::kUnallocatedKVPage;
+      if (address.allocated()) {
+        auto const& slab = arena.slabs[address.offset() / arena.slab_bytes];
+        bytes = slab.slot_bytes;
+        destination = arena.allocate(bytes, slab.size_class, address.format()).value;
+      }
+    }
+  }
+  if constexpr (COPY) {
+    __syncthreads();
+    const flashinfer::KVPageAddress src{source}, dst{destination};
+    if (!dst.allocated()) return;
+    auto const* input = reinterpret_cast<uint4 const*>(data + src.offset());
+    auto* output = reinterpret_cast<uint4*>(data + dst.offset());
+    for (uint32_t i = threadIdx.x; i < bytes / sizeof(uint4); i += THREADS) output[i] = input[i];
+    __syncthreads();
+    if (threadIdx.x == 0) *destination_entry = dst.value;
+  }
+}
+
+void mixed_kv_arena_blocks(TensorView data, TensorView pages, TensorView slabs, TensorView occupied,
+                           TensorView available, TensorView hints, TensorView counters,
+                           int64_t slab_bytes, TensorView destinations,
+                           ffi::Optional<TensorView> sources) {
+  auto arena =
+      make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters, slab_bytes);
+  TVM_FFI_ICHECK(destinations.ndim() == 1 && destinations.dtype() == dl_int64 &&
+                 destinations.stride(0) > 0);
+  CHECK_CUDA(destinations);
+  TVM_FFI_ICHECK(destinations.device().device_id == data.device().device_id);
+  ffi::CUDADeviceGuard device_guard(data.device().device_id);
+  auto stream = get_stream(data.device());
+  if (destinations.numel() == 0) return;
+  auto const grid = dim3(destinations.numel(), pages.size(1));
+  if (sources.has_value()) {
+    auto const src = sources.value();
+    TVM_FFI_ICHECK(src.ndim() == 1 && src.dtype() == dl_int64 && src.stride(0) > 0 &&
+                   src.numel() == destinations.numel());
+    CHECK_CUDA(src);
+    TVM_FFI_ICHECK(src.device().device_id == data.device().device_id);
+    mixed_kv_arena_blocks_kernel<true><<<grid, 128, 0, stream>>>(
+        static_cast<uint8_t*>(data.data_ptr()), static_cast<uint64_t*>(pages.data_ptr()),
+        pages.stride(0), arena, static_cast<const int64_t*>(destinations.data_ptr()),
+        destinations.stride(0), static_cast<const int64_t*>(src.data_ptr()), src.stride(0));
+  } else {
+    mixed_kv_arena_blocks_kernel<false><<<grid, 32, 0, stream>>>(
+        static_cast<uint8_t*>(data.data_ptr()), static_cast<uint64_t*>(pages.data_ptr()),
+        pages.stride(0), arena, static_cast<const int64_t*>(destinations.data_ptr()),
+        destinations.stride(0), nullptr, 0);
+  }
+}
+
+void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorView reused,
+                           TensorView reused_count, TensorView completed,
+                           TensorView completed_count, TensorView data, TensorView pages,
+                           TensorView slabs, TensorView occupied, TensorView available,
+                           TensorView hints, TensorView counters, TensorView classes,
+                           TensorView partials, TensorView stats, TensorView pending,
+                           TensorView global_scales, TensorView thresholds, int64_t page_size,
+                           int64_t slab_bytes) {
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
+  CHECK_DIM(3, k);
+  CHECK_DIM(3, v);
+  TVM_FFI_ICHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2));
+  TVM_FFI_ICHECK(k.stride(2) == 1 && v.stride(2) == 1 && k.dtype() == v.dtype());
+  TVM_FFI_ICHECK(page_size > 0 && k.size(1) > 0 && k.size(2) > 0 && k.size(2) % 16 == 0);
+  TVM_FFI_ICHECK(slots.ndim() == 1 && slots.dtype() == dl_int64 && slots.stride(0) == 1);
+  TVM_FFI_ICHECK(slots.size(0) <= k.size(0));
+  TVM_FFI_ICHECK(classes.ndim() == 1 && classes.dtype() == dl_int32 && classes.numel() == 3 &&
+                 classes.stride(0) == 1);
+  for (auto list : {reused, completed}) {
+    TVM_FFI_ICHECK(list.ndim() == 1 && list.dtype() == dl_int32 && list.stride(0) == 1);
+  }
+  for (auto count : {reused_count, completed_count}) {
+    TVM_FFI_ICHECK(count.numel() == 1 && count.dtype() == dl_int32);
+  }
+  TVM_FFI_ICHECK(partials.ndim() == 4 && partials.dtype() == dl_float32);
+  TVM_FFI_ICHECK(partials.size(0) == completed.numel() && partials.size(1) == page_size &&
+                 partials.size(2) == k.size(1) && partials.size(3) == 4);
+  TVM_FFI_ICHECK(partials.stride(3) == 1 && partials.stride(2) == 4 &&
+                 partials.stride(1) == k.size(1) * 4 &&
+                 partials.stride(0) == page_size * k.size(1) * 4);
+  TVM_FFI_ICHECK(stats.ndim() == 2 && stats.dtype() == dl_float32 &&
+                 stats.size(0) == completed.numel() && stats.size(1) == 2);
+  TVM_FFI_ICHECK(stats.stride(1) == 1 && stats.stride(0) == 2);
+  TVM_FFI_ICHECK(pending.ndim() == 1 && pending.dtype() == dl_int64 &&
+                 pending.numel() == completed.numel() && pending.stride(0) == 1);
+  TVM_FFI_ICHECK(global_scales.numel() == 4 && global_scales.ndim() == 1 &&
+                 global_scales.dtype() == dl_float32 && global_scales.stride(0) == 1);
+  TVM_FFI_ICHECK(thresholds.numel() == 4 && thresholds.ndim() == 1 &&
+                 thresholds.dtype() == dl_float32 && thresholds.stride(0) == 1);
+  for (auto tensor :
+       {v, slots, reused, reused_count, completed, completed_count, data, pages, slabs, occupied,
+        available, hints, counters, classes, partials, stats, pending, global_scales, thresholds}) {
+    TVM_FFI_ICHECK(tensor.device().device_type == k.device().device_type &&
+                   tensor.device().device_id == k.device().device_id);
+  }
+  flashinfer::KVPageStorage storage{
+      static_cast<uint8_t*>(data.data_ptr()),
+      static_cast<uint64_t*>(pages.data_ptr()),
+      static_cast<uint32_t>(pages.stride(0)),
+      static_cast<uint32_t>(pages.size(1)),
+      {static_cast<uint32_t>(page_size), static_cast<uint32_t>(k.size(1)),
+       static_cast<uint32_t>(k.size(2))}};
+  TVM_FFI_ICHECK(storage.geometry.extent_bytes(flashinfer::KVPageFormat::kA16) <=
+                 uint64_t(slab_bytes));
+  TVM_FFI_ICHECK(slab_bytes <= UINT32_MAX && slabs.size(0) <= UINT32_MAX &&
+                 pages.stride(0) <= UINT32_MAX);
+  auto arena =
+      make_mixed_kv_arena(data, pages, slabs, occupied, available, hints, counters, slab_bytes);
+  ffi::CUDADeviceGuard device_guard(k.device().device_id);
+  cudaStream_t stream = get_stream(k.device());
+  const auto* reset = static_cast<const int32_t*>(reused.data_ptr());
+  const auto* reset_count = static_cast<const int32_t*>(reused_count.data_ptr());
+  const auto* sealed = static_cast<const int32_t*>(completed.data_ptr());
+  const auto* sealed_count = static_cast<const int32_t*>(completed_count.data_ptr());
+  const auto* size_classes = static_cast<const int32_t*>(classes.data_ptr());
+  auto* route_stats = static_cast<float*>(stats.data_ptr());
+  auto* route_partials = static_cast<float*>(partials.data_ptr());
+  auto* destinations = static_cast<uint64_t*>(pending.data_ptr());
+  const int capacity = completed.numel();
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
+    if (reused.numel()) {
+      mixed_kv_arena_prepare_kernel<c_type><<<reused.numel(), 128, 0, stream>>>(
+          storage, arena, reset, reset_count, size_classes,
+          static_cast<const float*>(global_scales.data_ptr()), reused.numel());
+    }
+    if (slots.numel()) {
+      mixed_kv_arena_write_kernel<c_type><<<dim3(slots.numel(), k.size(1)), 128, 0, stream>>>(
+          storage, static_cast<const c_type*>(k.data_ptr()),
+          static_cast<const c_type*>(v.data_ptr()), static_cast<const int64_t*>(slots.data_ptr()),
+          slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
+    }
+    if (capacity) {
+      const dim3 rows(capacity * page_size, k.size(1));
+      mixed_kv_arena_route_kernel<c_type>
+          <<<rows, 128, 0, stream>>>(storage, sealed, sealed_count, route_partials, capacity);
+      mixed_kv_finalize_route_kernel<128, true><<<capacity, 128, 0, stream>>>(
+          sealed, sealed_count, route_partials, route_stats, capacity, page_size, k.size(1));
+      mixed_kv_arena_select_kernel<<<capacity, 32, 0, stream>>>(
+          storage, arena, sealed, sealed_count, size_classes, route_stats,
+          static_cast<const float*>(thresholds.data_ptr()), destinations, capacity);
+      mixed_kv_arena_quant_kernel<c_type>
+          <<<rows, 128, 0, stream>>>(storage, sealed, sealed_count, destinations,
+                                     static_cast<const float*>(global_scales.data_ptr()), capacity);
+      mixed_kv_arena_publish_kernel<<<capacity, 32, 0, stream>>>(
+          storage, arena, sealed, sealed_count, destinations, capacity);
+    }
+    return true;
+  });
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_kv_quant, nvfp4_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bsfp8_kv_quant, bsfp8_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_quant_pages, mixed_kv_quant_pages);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_arena_update, mixed_kv_arena_update);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_arena_blocks, mixed_kv_arena_blocks);
