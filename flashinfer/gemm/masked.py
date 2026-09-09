@@ -1,0 +1,69 @@
+# Copyright (c) 2026 by FlashInfer team.
+# Licensed under the Apache License, Version 2.0.
+"""CUTLASS matrix multiplication with caller-owned row visibility."""
+
+from functools import cache
+
+import torch
+
+from ..jit.gemm.core import gen_masked_gemm_module
+
+
+@cache
+def get_masked_gemm_module():
+    return gen_masked_gemm_module().build_and_load()
+
+
+@cache
+def _prepared_module(device: int, dtype: torch.dtype):
+    module = get_masked_gemm_module()
+    module.prepare(device, dtype == torch.bfloat16)
+    return module
+
+
+def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0):
+    """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
+
+    The caller must consume outputs with the same row mask. Arbitrary holes in
+    the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
+    Operands are A row-major, B column-major, and output row-major, aligned to
+    eight FP16/BF16 values. No preparation tensor or launch is introduced.
+    """
+    if (
+        x.dtype not in (torch.float16, torch.bfloat16)
+        or weight.dtype != x.dtype
+        or out.dtype != x.dtype
+        or any(t.device != x.device for t in (weight, out, is_padding))
+        or x.device.type != "cuda"
+        or any(t.ndim != 2 for t in (x, weight, out))
+        or x.shape[1] != weight.shape[0]
+        or out.shape != (x.shape[0], weight.shape[1])
+        or x.stride(1) != 1
+        or weight.stride(0) != 1
+        or out.stride(1) != 1
+        or x.stride(0) < x.shape[1]
+        or weight.stride(1) < weight.shape[0]
+        or out.stride(0) < out.shape[1]
+        or any(
+            s % 8
+            for s in (
+                x.shape[1],
+                weight.shape[1],
+                x.stride(0),
+                weight.stride(1),
+                out.stride(0),
+            )
+        )
+        or any(t.data_ptr() % 16 for t in (x, weight, out))
+        or is_padding.dtype != torch.bool
+        or is_padding.ndim != 1
+        or not is_padding.is_contiguous()
+        or row_offset < 0
+        or row_offset + x.shape[0] > is_padding.numel()
+    ):
+        raise ValueError("Expected aligned CUDA TN GEMM operands and logical row mask")
+    if x.shape[0] and weight.shape[1]:
+        _prepared_module(x.device.index, x.dtype).run(
+            x, weight, out, is_padding, row_offset
+        )
+    return out

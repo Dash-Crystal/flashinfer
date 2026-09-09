@@ -76,6 +76,7 @@ from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
+    gen_masked_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
@@ -506,6 +507,20 @@ def gen_all_modules(
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
+
+    if any(
+        (
+            has_sm80,
+            has_sm90,
+            has_sm100,
+            has_sm103,
+            has_sm107,
+            has_sm110,
+            has_sm120,
+            has_sm121,
+        )
+    ):
+        jit_specs.append(gen_masked_gemm_module())
 
     jit_specs += list(
         gen_attention(

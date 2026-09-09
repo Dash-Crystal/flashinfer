@@ -3,6 +3,7 @@ from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
 from .gemm_base import mm_bf16 as mm_bf16
+from .masked import mm_masked_tiles as mm_masked_tiles
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
