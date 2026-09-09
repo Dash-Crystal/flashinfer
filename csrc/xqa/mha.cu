@@ -2100,59 +2100,6 @@ __device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
 }
 #endif
 
-#if XQA_DEVICE_DECODE_SCHEDULE
-struct DecodeWorkTile {
-  uint32_t requests;
-  uint32_t splits;
-  uint32_t request;
-};
-
-__device__ inline DecodeWorkTile decodeWorkTile(KVCacheList<usePagedKVCache> const& cacheList,
-                                                uint32_t batchSize, uint32_t nbKHeads,
-                                                uint32_t slots, uint32_t window) {
-  extern __shared__ char smemByteBuf[];
-  auto& shared = *reinterpret_cast<DecodeWorkTile*>(smemByteBuf);
-  if (threadIdx.x < warp_size && threadIdx.y == 0 && threadIdx.z == 0) {
-    uint32_t const lane = laneId();
-    uint32_t requests = 0;
-    uint32_t maxTiles = 0;
-    for (uint32_t r = lane; r < batchSize; r += warp_size) {
-      uint32_t const len = getCacheSeqLen(cacheList, r);
-      uint32_t const begin = len > window ? len - window : 0;
-      requests += len != 0;
-      maxTiles = mha::max(maxTiles, divUp(len, ctaTile.x) - begin / ctaTile.x);
-    }
-    requests = __reduce_add_sync(~0U, requests);
-    maxTiles = __reduce_max_sync(~0U, maxTiles);
-    uint32_t const splits =
-        allowMultiBlockMode ? xqa_work::chooseSplitsWarp(slots, requests * nbKHeads, maxTiles) : 1;
-    uint32_t const ordinal = blockIdx.x / (splits * nbKHeads);
-    uint32_t request = batchSize;
-    if (ordinal < requests) {
-      uint32_t remaining = ordinal;
-      for (uint32_t r0 = 0; r0 < batchSize; r0 += warp_size) {
-        uint32_t const r = r0 + lane;
-        bool const active = r < batchSize && getCacheSeqLen(cacheList, r) != 0;
-        uint32_t const activeMask = __ballot_sync(~0U, active);
-        uint32_t const count = __popc(activeMask);
-        if (remaining < count) {
-          uint32_t const before = __popc(activeMask & ((1U << lane) - 1));
-          uint32_t const owner = __ballot_sync(~0U, active && before == remaining);
-          request = r0 + __ffs(owner) - 1;
-          break;
-        }
-        remaining -= count;
-      }
-    }
-    if (lane == 0) shared = {requests, splits, request};
-  }
-  __syncthreads();
-  DecodeWorkTile const result = shared;
-  __syncthreads();  // The attention prologue reuses this shared-memory region.
-  return result;
-}
-#endif
-
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -2200,7 +2147,7 @@ CUBIN_EXPORT __global__
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
 #if XQA_DEVICE_DECODE_SCHEDULE
         ,
-        uint32_t decodeSlots = 0
+        uint32_t const* decodeWork = nullptr
 #endif
     ) {
 
@@ -2209,19 +2156,15 @@ CUBIN_EXPORT __global__
   uint32_t workBatchSize = batchSize;
   uint32_t request = blockIdx.z;
 #if XQA_DEVICE_DECODE_SCHEDULE
-  if (decodeSlots != 0) {
-#if SLIDING_WINDOW
-    uint32_t const window = slidingWinSize;
-#else
-    uint32_t const window = ~0U;
-#endif
-    DecodeWorkTile const work = decodeWorkTile(cacheList, batchSize, nbKHeads, decodeSlots, window);
-    if (work.request == batchSize) return;
-    workGrid = dim3{work.splits, nbKHeads, work.requests};
-    workBlock = uint3{blockIdx.x % work.splits, (blockIdx.x / work.splits) % nbKHeads,
-                      blockIdx.x / (work.splits * nbKHeads)};
-    workBatchSize = work.requests;
-    request = work.request;
+  if (decodeWork != nullptr) {
+    uint32_t const requests = decodeWork[0];
+    uint32_t const splits = decodeWork[1];
+    uint32_t const ordinal = blockIdx.x / (splits * nbKHeads);
+    if (ordinal >= requests) return;
+    workGrid = dim3{splits, nbKHeads, requests};
+    workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, ordinal};
+    workBatchSize = requests;
+    request = decodeWork[2 + ordinal];
   }
 #endif
   assert(allowMultiBlockMode || workGrid.x == 1);
@@ -4041,7 +3984,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr
 #if XQA_DEVICE_DECODE_SCHEDULE
     ,
-    uint32_t decodeSlots = 0
+    uint32_t const* decodeWork = nullptr
 #endif
 ) {
 #if SPEC_DEC
@@ -4072,7 +4015,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
                   semaphores, scratch
 #if XQA_DEVICE_DECODE_SCHEDULE
                   ,
-                  decodeSlots
+                  decodeWork
 #endif
   );
 }
@@ -4080,8 +4023,13 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 static constexpr auto kernel_mha = kernel_mha_impl;
 #endif
 
+CUBIN_EXPORT __device__ constexpr uint32_t scratchBytesPerCta =
+    2 * sizeof(SMemWarpRowMax) +
+    nbValidRows * SharedMem::XSmemBuffer::cols * sizeof(LdGrain) * gemm1WarpsPerGrp * nbHeadSplits;
+
 struct KernelLaunchGeometry {
   uint32_t sharedBytes;
+  uint32_t scratchBytes;
   uint3 warps;
 
   dim3 block() const { return {warp_size * warps.x, warps.y, warps.z}; }
@@ -4092,6 +4040,8 @@ struct KernelLaunchGeometry {
 static KernelLaunchGeometry const hostGeometry = []() {
   KernelLaunchGeometry geometry;
   checkCuda(cudaMemcpyFromSymbol(&geometry.sharedBytes, smemSize, sizeof(smemSize)));
+  checkCuda(
+      cudaMemcpyFromSymbol(&geometry.scratchBytes, scratchBytesPerCta, sizeof(scratchBytesPerCta)));
   checkCuda(cudaMemcpyFromSymbol(&geometry.warps, ctaShapeInWarps, sizeof(ctaShapeInWarps)));
   checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  geometry.sharedBytes));
@@ -4230,7 +4180,7 @@ void launchMHA(
                      semaphores, scratch
 #if XQA_DEVICE_DECODE_SCHEDULE
                      ,
-                     0U
+                     static_cast<uint32_t const*>(nullptr)
 #endif
   );
   checkCuda(cudaPeekAtLastError());
@@ -4253,6 +4203,19 @@ static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSe
   uint32_t const nbTiles = std::max(1U, divUp(maxSeqLen, hostGeometry.sequenceTile()));
   return xqa_work::chooseSplits(residentSlots(multiProcessorCount), nbSeq, nbTiles);
 }
+
+uint32_t xqaSequenceTile() { return hostGeometry.sequenceTile(); }
+uint32_t xqaResidentSlots(uint32_t multiProcessorCount) {
+  return residentSlots(multiProcessorCount);
+}
+
+#if XQA_DEVICE_DECODE_SCHEDULE
+__global__ void prepareDecodeWork(uint32_t const* lengths, uint32_t requests, uint32_t heads,
+                                  uint32_t slots, uint32_t tile, uint32_t window,
+                                  uint32_t* output) {
+  xqa_work::prepareWarp(lengths, requests, heads, slots, tile, window, output);
+}
+#endif
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,
@@ -4278,12 +4241,13 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if ENABLE_4BIT_KV_CACHE
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
-                         cudaStream_t stream) {
+                         uint64_t scratchBytes, uint32_t const* decodeWork, cudaStream_t stream) {
 #if XQA_DEVICE_DECODE_SCHEDULE
   auto const splitOverride = std::getenv("XQA_NB_SUB_SEQ");
-  uint32_t const decodeSlots = (splitOverride == nullptr || std::stoi(splitOverride) <= 0)
-                                   ? residentSlots(multiProcessorCount)
-                                   : 0;
+  uint32_t const decodeSlots =
+      allowMultiBlockMode && (splitOverride == nullptr || std::stoi(splitOverride) <= 0)
+          ? residentSlots(multiProcessorCount)
+          : 0;
 #endif
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
@@ -4333,8 +4297,24 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
     maxTiles = std::min(maxTiles, divUp(slidingWinSize + tile - 1, tile));
 #endif
     dimGrid = dim3{xqa_work::gridCapacity(decodeSlots, batchSize, nbKHeads, maxTiles), 1, 1};
+    uint64_t const partialBytes = uint64_t(dimGrid.x + 1) * hostGeometry.scratchBytes;
+    if (decodeWork == nullptr) {
+      uint64_t const workBytes = roundUp(uint64_t(batchSize + 2) * sizeof(uint32_t), uint64_t{256});
+      if (scratchBytes < partialBytes + workBytes)
+        throw std::runtime_error("XQA scratch is too small for partials and decode work");
+      auto* const work =
+          reinterpret_cast<uint32_t*>(static_cast<char*>(scratch) + scratchBytes - workBytes);
+      prepareDecodeWork<<<1, 32, 0, stream>>>(seqLen, batchSize, nbKHeads, decodeSlots, tile,
+                                              slidingWinSize, work);
+      decodeWork = work;
+    } else if (scratchBytes < partialBytes) {
+      throw std::runtime_error("XQA scratch is too small for partials");
+    }
   }
 #endif
+#endif
+#if XQA_DEVICE_DECODE_SCHEDULE
+  if (decodeSlots == 0) decodeWork = nullptr;
 #endif
   auto const launchCfg = makeLaunchConfig(dimGrid, hostGeometry.block(), hostGeometry.sharedBytes,
                                           stream, enable_pdl && !ENABLE_MIXED_KV_CACHE);
@@ -4391,7 +4371,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      semaphores, scratch
 #if XQA_DEVICE_DECODE_SCHEDULE
                      ,
-                     decodeSlots
+                     decodeWork
 #endif
   );
   checkCuda(cudaPeekAtLastError());

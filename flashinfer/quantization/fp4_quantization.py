@@ -2164,6 +2164,7 @@ def get_fp4_kv_quantization_module():
         mixed_kv_arena_update=module.mixed_kv_arena_update,
         mixed_kv_arena_blocks=module.mixed_kv_arena_blocks,
         mixed_kv_arena_capacity=module.mixed_kv_arena_capacity,
+        mixed_kv_prepare_metadata=module.mixed_kv_prepare_metadata,
     )
 
 

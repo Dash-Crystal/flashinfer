@@ -169,6 +169,7 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        decode_work: Optional[torch.Tensor],
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -212,6 +213,7 @@ def _get_xqa_module_cached(
             semaphores,
             workspace_buffer,
             enable_pdl,
+            decode_work,
         )
 
     @register_fake_op(op_name)
@@ -255,6 +257,7 @@ def _get_xqa_module_cached(
         q_seq_len: int,
         q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        decode_work: Optional[torch.Tensor],
     ) -> None:
         pass
 
@@ -262,7 +265,44 @@ def _get_xqa_module_cached(
         xqa=xqa,
         # JIT module URI (== cached_ops directory name), for attribution.
         uri=spec.name,
+        sequence_tile=module.xqa_sequence_tile,
+        resident_slots=module.xqa_resident_slots,
     )
+
+
+class XQADecodeWork:
+    """Graph-stable live work for a native mixed-page decode specialization."""
+
+    def __init__(
+        self, max_requests, input_dtype, num_q_heads, page_transport, window_left
+    ):
+        page_size, heads, head_dim = page_transport.page_geometry
+        addresses = page_transport.page_addresses
+        self.window = window_left + 1 if window_left >= 0 else 0
+        module = get_xqa_module(
+            input_dtype,
+            input_dtype,
+            page_size,
+            head_dim,
+            num_q_heads // heads,
+            self.window > 0,
+            input_dtype,
+            1,
+            False,
+            True,
+            False,
+            -1,
+            None,
+            (addresses.shape[1], addresses.stride(0)),
+        )
+        self.sequence_tile = module.sequence_tile()
+        self.resident_slots = module.resident_slots(
+            get_device_sm_count(addresses.device)
+        )
+        self.heads = heads
+        self.buffer = torch.empty(
+            max_requests + 2, dtype=torch.int32, device=addresses.device
+        )
 
 
 # Kernel family and JIT module of the most recent xqa() call (set right before
@@ -306,6 +346,7 @@ def xqa(
     page_transport: Optional[MixedKVPagedCache] = None,
     page_transport_static_format: Optional[int] = None,
     mask_mod: Optional[XQAMaskMod] = None,
+    decode_work: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -752,6 +793,7 @@ def xqa(
         q_seq_len,
         q_cu_seq_lens,
         mask,
+        decode_work,
     )
 
 

@@ -53,6 +53,31 @@ __device__ inline uint32_t chooseSplitsWarp(uint32_t slots, uint32_t sequences, 
   return select(best, single);
 }
 
+// One warp produces [live requests, splits, compact-to-input request indices].
+__device__ inline void prepareWarp(uint32_t const* lengths, uint32_t requests, uint32_t heads,
+                                   uint32_t slots, uint32_t tile, uint32_t window,
+                                   uint32_t* output) {
+  uint32_t const lane = threadIdx.x % 32;
+  uint32_t live = 0;
+  uint32_t maxTiles = 0;
+  for (uint32_t first = 0; first < requests; first += 32) {
+    uint32_t const r = first + lane;
+    uint32_t const len = r < requests ? lengths[r] : 0;
+    uint32_t const begin = window != 0 && len > window ? len - window : 0;
+    uint32_t const tiles = (len + tile - 1) / tile - begin / tile;
+    maxTiles = max(maxTiles, tiles);
+    uint32_t const mask = __ballot_sync(~0U, len != 0);
+    if (len != 0) output[2 + live + __popc(mask & ((1U << lane) - 1))] = r;
+    live += __popc(mask);
+  }
+  maxTiles = __reduce_max_sync(~0U, maxTiles);
+  uint32_t const splits = chooseSplitsWarp(slots, live * heads, maxTiles);
+  if (lane == 0) {
+    output[0] = live;
+    output[1] = splits;
+  }
+}
+
 // Increasing the tile count can only select an equal or larger split count:
 // within a wave the largest n wins; successive winning waves have lower slopes.
 // Reserve the largest live grid, rather than requests * storage-capacity tiles.
