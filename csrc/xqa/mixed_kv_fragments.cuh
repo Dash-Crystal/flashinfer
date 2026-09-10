@@ -31,34 +31,43 @@ __device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint
                                         uint32_t block, uint32_t part, uint8_t const* scales,
                                         float globalScale) {
   if constexpr (format == KVPageFormat::kA16) {
-    return loadInstInMat<2, 2, true, false, false>(this_warp(), tile, row, block * 2);
+    InstInMat<2, 2> result;
+    uint32_t const quad = laneId() & 3U;
+#pragma unroll
+    for (uint32_t n = 0; n < 2; ++n) {
+      uint32_t const token = row + n * 8 + laneId() / 4;
+      uint32_t const address =
+          smemAddr(&tile.template at<true>(token, block * 2 + quad / 2)) + (quad % 2) * 8;
+      ldsB64(address, result.data[n][0], result.data[n][1]);
+    }
+    return result;
   } else {
     constexpr uint32_t blocksPerPart = kHeadPartBytes / 32;
     constexpr uint32_t scaleStride = mha::max(4U, blocksPerPart);
     uint32_t const scaleColumn = (part * blocksPerPart + block) % scaleStride;
-    uint32_t const pair = (laneId() & 3U) * 2;
+    auto const* address = &tile.template at<true>(row + laneId() % 16, block);
+    auto const packed = [&]() {
+      if constexpr (format == KVPageFormat::kBlockScaledFP8) {
+        return ldmatrix<false, 2>(address);
+      } else {
+        return ldmatrix_8x16_4x_unpack_4b<2>(address);
+      }
+    }();
     InstInMat<2, 2> result;
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
       uint32_t const token = row + n * 8 + laneId() / 4;
-      uint32_t const packed = smemAddr(&tile.template at<true>(token, block));
       uint8_t const scale = ldsU8(smemAddr(scales) + token * scaleStride + scaleColumn);
-      uint32_t low, high;
-      if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        low = ldsU16(packed + pair);
-        high = ldsU16(packed + pair + 8);
-      } else {
-        low = ldsU8(packed + pair / 2);
-        high = ldsU8(packed + pair / 2 + 4);
-      }
       uint32_t const sf =
           broadcastA16Scale<InputElem>(convertE4M3ScaleToA16Bits<InputElem>(scale, globalScale));
+      uint32_t const word = packed[n];
       if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        result.data[n][0] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(low), sf);
-        result.data[n][1] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(high), sf);
+        result.data[n][0] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(word), sf);
+        result.data[n][1] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(word >> 16), sf);
       } else {
-        result.data[n][0] = mulA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(low), sf);
-        result.data[n][1] = mulA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(high), sf);
+        uint32_t const pairs = word | (word >> 4);
+        result.data[n][0] = mulA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(pairs), sf);
+        result.data[n][1] = mulA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(pairs >> 16), sf);
       }
     }
     return result;

@@ -80,8 +80,10 @@ adds traffic and a producer/consumer boundary that the implementation must remov
 The historical expansion measurements above remain receipts, not a requirement
 to retain that staging scheme.
 
-SM12x now lowers mixed pages through `xqa/mixed_kv_fragments.cuh`. K consumes
-packed pairs and reuses each converted block scale. V uses native transposed
+SM12x now lowers mixed pages through `xqa/mixed_kv_fragments.cuh`. K uses native
+packed matrix loads and reuses each converted block scale. The existing Q
+permutation puts coefficients into the packed K fragment order once per CTA;
+A16 pages gather four contiguous coefficients into the same order. V uses native transposed
 8-bit matrix loads, including hardware nibble unpacking for FP4. Its asynchronous
 copy permutes token rows within each 16-token tile into MMA pair order; A16 loads
 use the same row mapping, while scales retain logical token indexing. No expanded
@@ -94,6 +96,10 @@ dispatches a page format outside K's rolled reduction loop, retains static
 accumulator indices, and indexes V's head slice separately from its token tile.
 It covers D256/page16 and D512/page32, including grouped V copies with their
 per-warp scale-row gaps. Full-model graph execution, task outputs, latency, and
-compiled register/local-memory use are the validation surface. Performance of
-this replacement has not yet been measured. Other architecture paths still
+compiled register/local-memory use are the validation surface. The first
+register-consumer full-model trace retained 673 kernels per decode execution,
+with no local-memory spills (D256: 148 registers; D512: 217). Its early
+short-context graph span remained about 33 ms. That revision still used narrow
+K gathers; the native K matrix-load followup requires a separate full-model
+measurement. Other architecture paths still
 require equivalent removal of shared expansion.

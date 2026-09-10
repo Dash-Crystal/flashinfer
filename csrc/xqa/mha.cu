@@ -2411,7 +2411,8 @@ CUBIN_EXPORT __global__
     auto& qBar = smem.qBarrier[warpIdx.y];
     qBar.wait_parity(qBarParityNext);
     qBarParityNext = !qBarParityNext;
-    constexpr bool reorderForKCache = (useKVCache && inputElemSize == 2 && cacheElemSize == 1);
+    constexpr bool reorderForKCache =
+        useKVCache && inputElemSize == 2 && (cacheElemSize == 1 || compactMixedPages);
     if constexpr (reorderForKCache) {
       reorder16bQHeadsToMatch8bKCache<ctaShapeInWarps.x, qkSwizzle, true>(warpIdx.x,
                                                                           smem.q[warpIdx.y][0]);
