@@ -2318,8 +2318,8 @@ CUBIN_EXPORT __global__
       if (laneId() == 0) {
         smem.kPages[warpIdx.x][idxNextSMemKBuf] = pageReferences;
       }
-      uint32_t const nbHeadsAvail =
-          seqOffset < cacheSeqLen ? mha::min(cacheSeqLen - seqOffset, warpTile.x) : 0U;
+      uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
+      uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
       copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false, true>(
           dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset, cacheList.transport,
           pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip, nbHeadsAvail);
