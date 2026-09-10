@@ -27,14 +27,15 @@ __device__ inline void visit(uint8_t format, Function const& function) {
 }
 
 template <KVPageFormat format>
-using KFragment =
+using Fragment =
     mha::conditional_t<format == KVPageFormat::kA16, InstInMat<2, 2>, Vec<uint32_t, 2>>;
 
-template <uint32_t count, typename Load, typename Consume>
+template <uint32_t count, bool unroll = false, typename Load, typename Consume>
 __device__ inline void pipelineFragments(Load const& load, Consume const& consume) {
   static_assert(count > 0);
+  constexpr uint32_t unrollCount = unroll ? count : 1;
   auto current = load(0);
-#pragma unroll 1
+#pragma unroll(unrollCount)
   for (uint32_t block = 0; block + 1 < count; ++block) {
     auto const next = load(block + 1);
     consume(current, block);
@@ -44,11 +45,11 @@ __device__ inline void pipelineFragments(Load const& load, Consume const& consum
 }
 
 template <KVPageFormat format>
-__device__ inline KFragment<format> fetchK(SharedMem::KSmemBuffer const& tile, uint32_t row,
-                                           uint32_t block, uint32_t part,
-                                           flashinfer::KVPageFormatSpan const& page, uint32_t head,
-                                           uint32_t tokenBase, uint32_t skipTokens,
-                                           uint32_t cacheSeqLen) {
+__device__ inline Fragment<format> fetchK(SharedMem::KSmemBuffer const& tile, uint32_t row,
+                                          uint32_t block, uint32_t part,
+                                          flashinfer::KVPageFormatSpan const& page, uint32_t head,
+                                          uint32_t tokenBase, uint32_t skipTokens,
+                                          uint32_t cacheSeqLen) {
   if constexpr (format == KVPageFormat::kA16) {
     InstInMat<2, 2> result;
     uint32_t const quad = laneId() & 3U;
@@ -80,7 +81,7 @@ __device__ inline KFragment<format> fetchK(SharedMem::KSmemBuffer const& tile, u
 }
 
 template <KVPageFormat format>
-__device__ inline InstInMat<2, 2> convertK(KFragment<format> const& fragment,
+__device__ inline InstInMat<2, 2> convertK(Fragment<format> const& fragment,
                                            Vec<uint32_t, 2> const& scaleWords, uint32_t scaleColumn,
                                            float globalScale) {
   if constexpr (format == KVPageFormat::kA16) {
@@ -116,35 +117,41 @@ __device__ inline uint32_t vScaleRow(uint32_t token) {
 }
 
 template <KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadV(SharedMem::VSmemBuffer const& tile, uint32_t row,
-                                        uint32_t block, uint8_t const* scales, float globalScale) {
+__device__ inline Fragment<format> fetchV(SharedMem::VSmemBuffer const& tile, uint32_t row,
+                                          uint32_t block) {
   if constexpr (format == KVPageFormat::kA16) {
     return loadInstInMat<2, 2, false, true, false>(
         this_warp(), tile, row, block * 2, [](uint32_t token) { return mixedVFragmentRow(token); });
   } else {
-    constexpr uint32_t scaleStride = mha::max(4U, SharedMem::VSmemBuffer::rowBytes / 32);
     auto const* address = &tile.template at<true>(row + laneId() % 16, block);
-    auto const packed = [&]() {
-      if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        return ldmatrix_16x16_trans<1>(address);
-      } else {
-        return ldmatrix_16x16_trans_unpack_4b<1>(address);
-      }
-    }();
+    if constexpr (format == KVPageFormat::kBlockScaledFP8) {
+      return ldmatrix_16x16_trans<1>(address);
+    } else {
+      return ldmatrix_16x16_trans_unpack_4b<1>(address);
+    }
+  }
+}
+
+template <KVPageFormat format>
+__device__ inline InstInMat<2, 2> convertV(Fragment<format> const& fragment,
+                                           Vec<uint32_t, 4> const& scaleWords, uint32_t scaleColumn,
+                                           float globalScale) {
+  if constexpr (format == KVPageFormat::kA16) {
+    return fragment;
+  } else {
     uint32_t sf[2];
 #pragma unroll
     for (uint32_t half = 0; half < 2; ++half) {
-      uint32_t const token = row + half * 8 + (laneId() & 3U) * 2;
       uint16_t const low = convertE4M3ScaleToA16Bits<InputElem>(
-          ldsU8(smemAddr(scales) + vScaleRow(token) * scaleStride + block), globalScale);
+          scaleWords[half * 2] >> (scaleColumn * 8), globalScale);
       uint16_t const high = convertE4M3ScaleToA16Bits<InputElem>(
-          ldsU8(smemAddr(scales) + vScaleRow(token + 1) * scaleStride + block), globalScale);
+          scaleWords[half * 2 + 1] >> (scaleColumn * 8), globalScale);
       sf[half] = uint32_t(low) | (uint32_t(high) << 16);
     }
     InstInMat<2, 2> result;
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
-      uint32_t const word = packed[n];
+      uint32_t const word = fragment[n];
 #pragma unroll
       for (uint32_t half = 0; half < 2; ++half) {
         uint32_t converted;
@@ -251,10 +258,29 @@ __device__ inline void smemXVPartGemmMixed(Warp const& warp, WarpAcc& acc, bool 
       constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
       float const scale =
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
+      static_assert(warpTile.x <= 64);
+      constexpr uint32_t blocks = warpTile.x / 16;
+      uint32_t const firstBlock = headSlice * blocks;
+      Vec<uint32_t, 4> scaleWords;
+      if constexpr (format != flashinfer::KVPageFormat::kA16) {
+        constexpr uint32_t scaleStride = mha::max(4U, SharedMem::VSmemBuffer::rowBytes / 32);
 #pragma unroll
-      for (uint32_t block = 0; block < warpTile.x / 16; ++block) {
-        auto const b = mixed_kv_fragments::loadV<format>(
-            v, tile * 16, headSlice * (warpTile.x / 16) + block, scales, scale);
+        for (uint32_t half = 0; half < 2; ++half) {
+          uint32_t const token = tile * 16 + half * 8 + (laneId() & 3U) * 2;
+#pragma unroll
+          for (uint32_t adjacent = 0; adjacent < 2; ++adjacent) {
+            uint32_t const row = mixed_kv_fragments::vScaleRow(token + adjacent);
+            scaleWords[half * 2 + adjacent] =
+                *reinterpret_cast<uint32_t const*>(scales + row * scaleStride + (firstBlock & ~3U));
+          }
+        }
+      }
+      auto const fetch = [&](uint32_t block) {
+        return mixed_kv_fragments::fetchV<format>(v, tile * 16, firstBlock + block);
+      };
+      auto const consume = [&](auto const& fragment, uint32_t block) {
+        auto const b = mixed_kv_fragments::convertV<format>(fragment, scaleWords,
+                                                            (firstBlock + block) % 4, scale);
 #pragma unroll
         for (uint32_t i = 0; i < rows; ++i) {
 #pragma unroll
@@ -263,7 +289,9 @@ __device__ inline void smemXVPartGemmMixed(Warp const& warp, WarpAcc& acc, bool 
             mma<InputElem>(acc(i, block * 2 + n).data, a(i, 0).data, operand);
           }
         }
-      }
+      };
+      // The output block must stay static so accumulators remain in registers.
+      mixed_kv_fragments::pipelineFragments<blocks, true>(fetch, consume);
     });
   }
 }

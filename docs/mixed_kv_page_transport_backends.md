@@ -128,7 +128,7 @@ The compressed consumer does not expand either operand into A16 shared tiles.
 V69's full Gemma4 12B TP2 server and loaded-binary receipts establish this
 instruction path. V70 distributes D256 work over twice as many resident warps
 within the same shared footprint; its binary uses 121 registers without spills.
-The subsequent register pipeline fetches the next K operand before converting
+The subsequent register pipeline fetches the next K/V operand before converting
 and multiplying the current one, and reuses word-sized scale loads. That
 followup still needs full-model measurement. Current results and source revisions
 are recorded in `mixed_kv_page_transport_targets.md` and vLLM's

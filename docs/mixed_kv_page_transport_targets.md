@@ -187,3 +187,10 @@ before multiplying the payload. The final iteration consumes the last fragment
 without an out-of-range prefetch. No shared expansion or additional barrier is
 introduced. Full-model compilation, resource placement and performance are
 pending for this followup; the V70 binary does not contain it.
+
+V uses the same fragment pipeline with compile-time unrolling, preserving static
+output-accumulator indices. Four scale words cover its two adjacent token pairs
+across the output blocks; each byte is extracted from the existing row layout,
+including group-buffer dump rows. K and V retain their distinct matrix-load and
+scale-pair arrangements while sharing the pipeline schedule. The staged K-only
+V71 runtime has not executed; V72 validates the composed K/V change.
