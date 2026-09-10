@@ -78,19 +78,9 @@ constexpr uint32_t grainBytesSf = 4;
 
 constexpr bool enableMicroFastPath = false;
 
-// Two structures for tiles with compressed pages: `compact` converts B
-// fragments in registers inside the MMA loop (per-page runtime dispatch), the
-// default expands the tile to A16 in shared memory once and runs the stock A16
-// GEMM.  With mixed tags per tile the compact form instantiates all three
-// converters inside the unrolled MMA loop (2.7x the code, 5x the branches,
-// local-memory spills) and ran 1.3x slower than plain A16 on sm120; the
-// expansion form runs 1.24x faster than A16 on the same stream.
-// MIXED_COMPACT_PAGES=1 selects the compact form (build flag).
-#ifndef MIXED_COMPACT_PAGES
-#define MIXED_COMPACT_PAGES 0
-#endif
-#if ENABLE_MIXED_KV_CACHE && MIXED_COMPACT_PAGES && TOKENS_PER_PAGE == 16 && \
-    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+// SM12x consumes packed KV directly in matrix operand registers.
+#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
 #define ENABLE_MIXED_COMPACT_PAGES 1
 #else
 #define ENABLE_MIXED_COMPACT_PAGES 0
@@ -101,7 +91,8 @@ constexpr bool compactMixedPages = ENABLE_MIXED_COMPACT_PAGES;
 // copy, so it carries no separate copyPartialHeadsAsync instantiations (their code
 // sat between the hot mixed copy/expansion bodies of a kernel that stalled on
 // instruction fetch). Rectangular static modules keep the stock A16 path.
-constexpr bool kA16CopyFastPath = MIXED_PAGE_STATIC_FORMAT >= 0 && XQA_PAGE_BLOCK_STRIDE == 0;
+constexpr bool kA16CopyFastPath =
+    !compactMixedPages && MIXED_PAGE_STATIC_FORMAT >= 0 && XQA_PAGE_BLOCK_STRIDE == 0;
 
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
@@ -1213,306 +1204,7 @@ __device__ inline auto loadQueryMatrix(Warp const& warp, SharedMem::QSmemBuffer 
 }
 
 #if ENABLE_MIXED_COMPACT_PAGES
-// B-fragment ownership is the native mma.m16n8k16 mapping: a quad owns one
-// output column and its four lanes own the two adjacent K pairs at offsets
-// [0, 8].  Compressed pages therefore need only two narrow shared loads per
-// lane; conversion and the block scale stay in registers.
-template <flashinfer::KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadMixedKPageFragment(SharedMem::KSmemBuffer const& tile,
-                                                         uint32_t pageInTile, uint32_t blockInPart,
-                                                         uint32_t idxPart, uint8_t const* scales,
-                                                         float fp8GlobalScale,
-                                                         float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-  static_assert(format == KVPageFormat::kA16 || format == KVPageFormat::kBlockScaledFP8 ||
-                format == KVPageFormat::kBlockScaledFP4);
-  constexpr uint32_t partBytes = kHeadPartBytes;
-  constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
-  constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
-  constexpr uint32_t fullCols = exactDiv(partBytes, grainBytes);
-  using A16Page = Array2D<LdGrain, tokensPerPage, fullCols>;
-
-  auto const* pageBase =
-      reinterpret_cast<uint8_t const*>(&tile) + uint64_t(pageInTile) * tokensPerPage * partBytes;
-  auto const& a16Page = *reinterpret_cast<A16Page const*>(pageBase);
-  uint32_t const laneInQuad = laneId() & 3U;
-  uint32_t const tokenInHalf = laneId() >> 2;
-  uint32_t const elemInBlock = laneInQuad * 2;
-  uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
-  uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
-  uint8_t const scaleOffset = static_cast<uint8_t>(scaleBlock - scaleGroup);
-
-  InstInMat<2, 2> fragment;
-  if constexpr (format == KVPageFormat::kA16) {
-    return loadInstInMat<2, 2, true, false, false>(this_warp(), a16Page, 0, blockInPart * 2);
-  }
-  if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-    auto const packed =
-        ldmatrix<false, 2>(&a16Page.template at<true>(laneId() % tokensPerPage, blockInPart));
-#pragma unroll
-    for (uint32_t n = 0; n < 2; ++n) {
-      uint32_t const token = n * 8 + tokenInHalf;
-      uint8_t const scaleBits =
-          scales[(pageInTile * tokensPerPage + token) * scaleLoadBytes + scaleOffset];
-      uint32_t const quadBase = laneId() & ~3U;
-      uint32_t const pairLane = laneInQuad >> 1;
-      uint32_t const halfShift = (laneInQuad & 1U) * 16U;
-      uint32_t const lowWord = __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane);
-      uint32_t const highWord = __shfl_sync(0xffffffffU, packed[n], quadBase + pairLane + 2);
-      uint16_t const low = static_cast<uint16_t>(lowWord >> halfShift);
-      uint16_t const high = static_cast<uint16_t>(highWord >> halfShift);
-      fragment.data[n][0] =
-          scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
-      fragment.data[n][1] =
-          scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
-    }
-    return fragment;
-  }
-#pragma unroll
-  for (uint32_t n = 0; n < 2; ++n) {
-    uint32_t const token = n * 8 + tokenInHalf;
-    if constexpr (format != KVPageFormat::kA16) {
-      auto const* packed =
-          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(token, blockInPart));
-      uint8_t const scaleBits =
-          scales[(pageInTile * tokensPerPage + token) * scaleLoadBytes + scaleOffset];
-      if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        uint16_t const low = *reinterpret_cast<uint16_t const*>(packed + elemInBlock);
-        uint16_t const high = *reinterpret_cast<uint16_t const*>(packed + 8 + elemInBlock);
-        fragment.data[n][0] =
-            scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(low), scaleBits, fp8GlobalScale);
-        fragment.data[n][1] =
-            scaleA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(high), scaleBits, fp8GlobalScale);
-      } else {
-        uint8_t const low = packed[elemInBlock / 2];
-        uint8_t const high = packed[4 + elemInBlock / 2];
-        fragment.data[n][0] =
-            scaleA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(low), scaleBits, fp4GlobalScale);
-        fragment.data[n][1] =
-            scaleA16x2<InputElem>(convertE2M1x2ToA16<InputElem>(high), scaleBits, fp4GlobalScale);
-      }
-    }
-  }
-  return fragment;
-}
-
-__device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
-                                           SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
-                                           SharedMem::KSmemBuffer const& k,
-                                           MixedPageFormats<nbPagesPerWarpTile> const& formats,
-                                           uint8_t const* scales, uint32_t idxPart,
-                                           float fp8GlobalScale, float fp4GlobalScale) {
-  static_assert(tokensPerPage == 16);
-  constexpr uint32_t kEx = 2;
-  constexpr uint32_t mnEx = 2;
-  constexpr uint32_t blocksPerPart = exactDiv(kHeadPartBytes, 2 * grainBytes);
-  constexpr uint32_t qSliceRows = exactDiv(warpTile.y, 8 * mnEx);
-
-#pragma unroll
-  for (uint32_t block = 0; block < blocksPerPart; ++block) {
-    auto const qSlice = loadQueryMatrix<kEx, mnEx, qSliceRows, 1>(warp, q, qColBeg + kEx * block);
-#pragma unroll
-    for (uint32_t page = 0; page < nbPagesPerWarpTile; ++page) {
-      auto const loadPage = [&]() {
-        using flashinfer::KVPageFormat;
-#if MIXED_PAGE_STATIC_FORMAT == 0
-        return loadMixedKPageFragment<KVPageFormat::kA16>(k, page, block, idxPart, scales,
-                                                          fp8GlobalScale, fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 1
-        return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP8>(
-            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 2
-        return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP4>(
-            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#else
-        uint8_t const format = formats.values[page];
-        if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-          return loadMixedKPageFragment<KVPageFormat::kA16>(k, page, block, idxPart, scales,
-                                                            fp8GlobalScale, fp4GlobalScale);
-        }
-        if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
-          return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP8>(
-              k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-        }
-        assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
-        return loadMixedKPageFragment<KVPageFormat::kBlockScaledFP4>(
-            k, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#endif
-      };
-      auto const matrixB = loadPage();
-#pragma unroll
-      for (uint32_t i = 0; i < qSliceRows; ++i) {
-#pragma unroll
-        for (uint32_t n = 0; n < 2; ++n) {
-          uint32_t const b[2][1] = {matrixB.data[n][0], matrixB.data[n][1]};
-          mma<InputElem>(acc(i, page * 2 + n).data, qSlice(i, 0).data, b);
-        }
-      }
-    }
-  }
-}
-
-template <flashinfer::KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadMixedVPageFragment(SharedMem::VSmemBuffer const& tile,
-                                                         uint32_t pageInTile, uint32_t blockInPart,
-                                                         uint32_t idxPart, uint8_t const* scales,
-                                                         float fp8GlobalScale,
-                                                         float fp4GlobalScale) {
-  using flashinfer::KVPageFormat;
-  static_assert(format == KVPageFormat::kA16 || format == KVPageFormat::kBlockScaledFP8 ||
-                format == KVPageFormat::kBlockScaledFP4);
-  constexpr uint32_t partBytes = SharedMem::VSmemBuffer::rowBytes;
-  constexpr uint32_t blocksPerPart = exactDiv(partBytes, 2 * grainBytes);
-  constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
-  constexpr uint32_t fullCols = exactDiv(partBytes, grainBytes);
-  using A16Page = Array2D<LdGrain, tokensPerPage, fullCols>;
-
-  auto const* pageBase =
-      reinterpret_cast<uint8_t const*>(&tile) + uint64_t(pageInTile) * tokensPerPage * partBytes;
-  auto const& a16Page = *reinterpret_cast<A16Page const*>(pageBase);
-  uint32_t const laneInQuad = laneId() & 3U;
-  uint32_t const headInHalf = laneId() >> 2;
-  uint32_t const token0 = laneInQuad * 2;
-  uint32_t const token1 = token0 + 1;
-  uint32_t const token8 = token0 + 8;
-  uint32_t const token9 = token1 + 8;
-  uint32_t const scaleBlock = idxPart * blocksPerPart + blockInPart;
-  uint32_t const scaleGroup = scaleBlock & ~(scaleLoadBytes - 1);
-  uint8_t const scaleOffset = static_cast<uint8_t>(scaleBlock - scaleGroup);
-
-  auto loadPair = [&](uint32_t head, uint32_t firstToken, uint32_t secondToken) -> uint32_t {
-    if constexpr (format == KVPageFormat::kA16) {
-      uint32_t const grain = head / (grainBytes / sizeof(InputElem));
-      uint32_t const byte = (head % (grainBytes / sizeof(InputElem))) * sizeof(InputElem);
-      auto const* first =
-          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(firstToken, grain)) + byte;
-      auto const* second =
-          reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(secondToken, grain)) + byte;
-      uint16_t const lo = *reinterpret_cast<uint16_t const*>(first);
-      uint16_t const hi = *reinterpret_cast<uint16_t const*>(second);
-      return uint32_t(lo) | (uint32_t(hi) << 16);
-    }
-
-    uint32_t const grain = head / 16;
-    uint32_t const elem = head % 16;
-    auto const* first =
-        reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(firstToken, grain));
-    auto const* second =
-        reinterpret_cast<uint8_t const*>(&a16Page.template at<true>(secondToken, grain));
-    uint32_t packedA16;
-    if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-      uint16_t const fp8x2 = uint16_t(first[elem]) | (uint16_t(second[elem]) << 8);
-      packedA16 = convertE4M3x2ToA16<InputElem>(fp8x2);
-    } else {
-      uint8_t const shift = static_cast<uint8_t>((elem & 1U) * 4U);
-      uint8_t const fp4x2 = static_cast<uint8_t>(((first[elem / 2] >> shift) & 0xfU) |
-                                                 (((second[elem / 2] >> shift) & 0xfU) << 4));
-      packedA16 = convertE2M1x2ToA16<InputElem>(fp4x2);
-    }
-    uint8_t const scale0 =
-        scales[(pageInTile * tokensPerPage + firstToken) * scaleLoadBytes + scaleOffset];
-    uint8_t const scale1 =
-        scales[(pageInTile * tokensPerPage + secondToken) * scaleLoadBytes + scaleOffset];
-    float const globalScale =
-        format == KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
-    return scaleA16x2Pair<InputElem>(packedA16, scale0, scale1, globalScale);
-  };
-
-  InstInMat<2, 2> fragment;
-#pragma unroll
-  for (uint32_t n = 0; n < 2; ++n) {
-    uint32_t const head = blockInPart * 16 + n * 8 + headInHalf;
-    fragment.data[n][0] = loadPair(head, token0, token1);
-    fragment.data[n][1] = loadPair(head, token8, token9);
-  }
-  return fragment;
-}
-
-__device__ inline void smemXVPartGemmMixed(
-    Warp const& warp, WarpAcc& acc, bool skipXRowRescale, UniformRescaleMask xRowNeedRescaleMask,
-    ThrdRegRowMax xRowScales, SharedMem::XSmemBuffer const& x, uint32_t idxVTilePerXTile,
-    SharedMem::VSmemBuffer const& v, MixedPageFormats<nbPagesPerVTile> const& formats,
-    uint8_t const* scales, uint32_t idxPart, float fp8GlobalScale, float fp4GlobalScale) {
-  unused(xRowNeedRescaleMask);
-  static_assert(tokensPerPage == 16);
-  constexpr uint32_t kEx = 2;
-  constexpr uint32_t mnEx = 2;
-  constexpr uint32_t xSliceRows = exactDiv(warpTile.y, 8 * mnEx);
-  constexpr uint32_t blocksPerPart = exactDiv(SharedMem::VSmemBuffer::rowBytes, 2 * grainBytes);
-
-  Vec<InputElem2, QuadRegRowMax::size> xRowScalesQuad;
-  if (!enableMicroFastPath || !skipXRowRescale) {
-#if INPUT_FP16
-    Vec<InputElem2, ThrdRegRowMax::size> const converted = __float2half2_rn(xRowScales);
-#else
-    Vec<InputElem2, ThrdRegRowMax::size> const converted = __float2bfloat162_rn(xRowScales);
-#endif
-    reinterpret_cast<QuadRegRowMax&>(xRowScalesQuad) =
-        replicateForQuad(warp, reinterpret_cast<ThrdRegRowMax const&>(converted));
-  }
-
-#pragma unroll
-  for (uint32_t page = 0; page < nbPagesPerVTile; ++page) {
-    uint32_t const colBeg =
-        SharedMem::XSmemBuffer::cols / nbCacheVTilesPerXTile * idxVTilePerXTile +
-        exactDiv(inputElemSize * tokensPerPage, grainBytes) * page;
-    auto xSlice =
-        loadMatrix<kEx, mnEx, xSliceRows, 1, false, false, false, false>(warp, x, 0, colBeg);
-    if (!enableMicroFastPath || !skipXRowRescale) {
-#pragma unroll
-      for (uint32_t m = 0; m < xSliceRows; ++m) {
-#pragma unroll
-        for (uint32_t i = 0; i < mnEx; ++i) {
-          uint32_t const row = m * mnEx + i;
-#pragma unroll
-          for (uint32_t j = 0; j < kEx; ++j) {
-            auto& value = reinterpret_cast<InputElem2&>(xSlice(m, 0).data[j][i]);
-            value = skipXRowRescale ? value : value * xRowScalesQuad[row];
-          }
-        }
-      }
-    }
-
-#pragma unroll
-    for (uint32_t block = 0; block < blocksPerPart; ++block) {
-      auto const loadPage = [&]() {
-        using flashinfer::KVPageFormat;
-#if MIXED_PAGE_STATIC_FORMAT == 0
-        return loadMixedVPageFragment<KVPageFormat::kA16>(v, page, block, idxPart, scales,
-                                                          fp8GlobalScale, fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 1
-        return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP8>(
-            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#elif MIXED_PAGE_STATIC_FORMAT == 2
-        return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP4>(
-            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#else
-        uint8_t const format = formats.values[page];
-        if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-          return loadMixedVPageFragment<KVPageFormat::kA16>(v, page, block, idxPart, scales,
-                                                            fp8GlobalScale, fp4GlobalScale);
-        }
-        if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
-          return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP8>(
-              v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-        }
-        assert(format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4));
-        return loadMixedVPageFragment<KVPageFormat::kBlockScaledFP4>(
-            v, page, block, idxPart, scales, fp8GlobalScale, fp4GlobalScale);
-#endif
-      };
-      auto const matrixB = loadPage();
-#pragma unroll
-      for (uint32_t i = 0; i < xSliceRows; ++i) {
-#pragma unroll
-        for (uint32_t n = 0; n < 2; ++n) {
-          uint32_t const b[2][1] = {matrixB.data[n][0], matrixB.data[n][1]};
-          mma<InputElem>(acc(i, block * 2 + n).data, xSlice(i, 0).data, b);
-        }
-      }
-    }
-  }
-}
+#include "mixed_kv_fragments.cuh"
 #endif
 
 // acc is used as both input and output
@@ -2836,16 +2528,10 @@ CUBIN_EXPORT __global__
           // do computation.
 #if ENABLE_MIXED_COMPACT_PAGES
           if constexpr (compactMixedPages) {
-            if (smem.kNeedsExpansion[warpIdx.x][idxCurrSMemKBuf]) {
-              smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
-                                  smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
-                                  &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p,
-                                  fp8KGlobalScale, fp4KGlobalScale);
-            } else {
-              // Preserve the reference XQA A16 mainloop verbatim when the
-              // router selected A16 for every page in this tile.
-              smemQKPartGemm<CacheElem>(warp, acc, smemQ, smemQOffset, smemKPart);
-            }
+            smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
+                                smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
+                                &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p, fp8KGlobalScale,
+                                fp4KGlobalScale);
           } else
 #endif
           {
@@ -3618,18 +3304,11 @@ CUBIN_EXPORT __global__
 #if BEAM_WIDTH == 1
 #if ENABLE_MIXED_COMPACT_PAGES
               if constexpr (compactMixedPages) {
-                if (needsExpansion) {
-                  smemXVPartGemmMixed(
-                      warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile,
-                      idxVTile, smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                      &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
-                      idxNSplit, fp8VGlobalScale, fp4VGlobalScale);
-                } else {
-                  // A16 pages retain FlashInfer's original consumer and its
-                  // established ldmatrix/MMA register footprint.
-                  smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask,
-                                            xRowScales, smemXTile, idxVTile, smemVTile, idxNSplit);
-                }
+                smemXVPartGemmMixed(
+                    warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile,
+                    idxVTile, smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
+                    &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
+                    idxNSplit, fp8VGlobalScale, fp4VGlobalScale);
               } else
 #endif
               {

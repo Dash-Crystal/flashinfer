@@ -313,6 +313,12 @@ constexpr uint32_t mixedPageLoopUnroll(uint32_t nbPageSpans) {
   return MIXED_PAGE_STATIC_FORMAT < 0 ? 1U : nbPageSpans;
 }
 
+// Native transposed b8 ldmatrix owns four consecutive K values per lane.
+// Store V rows in MMA's two-pair order so conversion needs no lane shuffles.
+__device__ inline uint32_t mixedVFragmentRow(uint32_t token) {
+  return (token & ~15U) | ((token & 6U) << 1) | ((token & 8U) >> 2) | (token & 1U);
+}
+
 // Preserve copyPartialHeadsAsync's warp ownership and circular-buffer
 // schedule. Each lane owns one 16-value block. Compressed payload occupies
 // the first A16 grain; its single scale byte is staged in the second grain.
@@ -341,8 +347,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
   constexpr uint32_t blocksPerSpan = headsPerSpan * blocksPerPart;
   constexpr uint32_t iterationsPerSpan = divUp(blocksPerSpan, nbThreads);
   constexpr uint32_t pageLoopUnroll = mixedPageLoopUnroll(nbSpans);
-  static_assert(!compactPages || tokensPerPage == 16,
-                "compact mixed-page fragments require the vLLM 16-token page unit");
+  static_assert(!compactPages || tokensPerPage % 16 == 0);
   assert(idxWarp < nbWarps);
   using flashinfer::KVPageFormat;
   const auto formats = references.formats();
@@ -385,21 +390,22 @@ __device__ inline void copyMixedPartialHeadsAsync(
                                 payloadElemOffset;
 
       if constexpr (compactPages) {
+        uint32_t const row =
+            isK ? dstHeadOffset + localHead : mixedVFragmentRow(dstHeadOffset + localHead);
         if constexpr (isA16) {
-          auto* first = &dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2);
-          auto* second = &dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart * 2 + 1);
+          auto* first = &dst.template at<swizzle>(row, blockInPart * 2);
+          auto* second = &dst.template at<swizzle>(row, blockInPart * 2 + 1);
           ldgsts::copyAsync<grainBytes>(first, firstSource, valid ? grainBytes : 0U);
           ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes, valid ? grainBytes : 0U);
         } else {
           // Retain the native tile row stride and place the compressed block in
           // the low half of that row.  This preserves ldmatrix-compatible row
           // addressing while keeping each page in a fixed-size slot.
-          auto* packed = &dst.template at<swizzle>(dstHeadOffset + localHead, blockInPart);
+          auto* packed = &dst.template at<swizzle>(row, blockInPart);
           if constexpr (isFP4) {
             ldgsts::copyAsync<8>(packed, firstSource, valid ? 8U : 0U);
-            ldgsts::copyAsync<8>(reinterpret_cast<uint8_t*>(packed) + 8, firstSource + 8, 0U);
           } else {
-            ldgsts::copyAsync<grainBytes>(packed, firstSource, valid ? grainBytes : 0U);
+            ldgsts::copyAsyncCa16(packed, firstSource, valid ? grainBytes : 0U);
           }
         }
       } else {

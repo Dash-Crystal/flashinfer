@@ -74,10 +74,26 @@ When pages stream from a host tier (PCIe / NVLink) rather than local device
 memory, the byte ratio is the wall: the link is 10-100x slower than DRAM, so
 FP4/FP8 pages decide between a pipeline stall and none, and the on-device
 request-pattern effects (sector utilization, L2 neighbour hits) are second order.
-Requirement carried by every host, independent of whether it is currently
-request-pattern-bound: the expansion path must consume packed pages at whatever
-rate they land without adding a stall of its own - lean, issue-light,
-shared-window `LDS`/`STS` with immediate offsets and independent block bodies,
-verified in SASS (no generic `LD.E`/`ST.E` for the expansion, no `LDL`/`STL`).
-On sm120 the compute warps are the expanders, so a lean expansion returns issue
-slots to the MMA directly; Track W's [29] adopts the same discipline as FA3's [23].
+The streaming contract keeps payloads packed through shared memory and converts
+them directly into matrix operand registers. A tile-wide A16 shared expansion
+adds traffic and a producer/consumer boundary that the implementation must remove.
+The historical expansion measurements above remain receipts, not a requirement
+to retain that staging scheme.
+
+SM12x now lowers mixed pages through `xqa/mixed_kv_fragments.cuh`. K consumes
+packed pairs and reuses each converted block scale. V uses native transposed
+8-bit matrix loads, including hardware nibble unpacking for FP4. Its asynchronous
+copy permutes token rows within each 16-token tile into MMA pair order; A16 loads
+use the same row mapping, while scales retain logical token indexing. No expanded
+KV tile is written back to shared memory. The existing global double buffering,
+mask closure, codecs, and page-format decisions are retained.
+
+The former dormant packed consumer duplicated converters inside unrolled
+block/page loops and assumed a 16-token page and one V head slice. The replacement
+dispatches a page format outside K's rolled reduction loop, retains static
+accumulator indices, and indexes V's head slice separately from its token tile.
+It covers D256/page16 and D512/page32, including grouped V copies with their
+per-warp scale-row gaps. Full-model graph execution, task outputs, latency, and
+compiled register/local-memory use are the validation surface. Performance of
+this replacement has not yet been measured. Other architecture paths still
+require equivalent removal of shared expansion.

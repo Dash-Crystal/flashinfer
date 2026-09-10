@@ -85,7 +85,7 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 
 // 0: half/bf16; 1: int8_t; 2: __nv_fp8_e4m3; 3: block-scaled
 // NVFP4; 4: block-scaled FP8 E4M3; 5: page-routed A16 / block-scaled FP8 / block-scaled FP4.  Enum
-// 5 changes storage transport only: shared-memory tiles and attention math are INPUT_ELEM.
+// 5 retains page format through transport; attention operands and math are INPUT_ELEM.
 #ifndef CACHE_ELEM_ENUM
 #define CACHE_ELEM_ENUM 2
 #endif
