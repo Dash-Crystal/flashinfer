@@ -103,3 +103,12 @@ short-context graph span remained about 33 ms. That revision still used narrow
 K gathers; the native K matrix-load followup requires a separate full-model
 measurement. Other architecture paths still
 require equivalent removal of shared expansion.
+
+The completed-page producer also distributes the original 16-lane codec across
+32 warps per page, reducing the serialized codec iterations eightfold for
+Gemma's 32768-value pages. Routing reuses one coefficient read for the adjacent
+token moments and block signature, and reduces the four moments together.
+Thresholds, nine-candidate scale selection, and encoded formats are unchanged.
+The rectangular producer uses the same flattened K/V signature indexing as the
+arena, including head widths divisible by 16 but not 32. This followup needs
+full-model latency, output, and page-distribution measurements.

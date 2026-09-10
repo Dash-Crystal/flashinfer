@@ -430,23 +430,28 @@ __device__ __forceinline__ T mixed_kv_block_sum(T value) {
   return value;
 }
 
-template <int THREADS>
-__device__ __forceinline__ float mixed_kv_block_max(float value) {
+__device__ __forceinline__ float4 mixed_kv_warp_moments(float4 value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {
-    value = fmaxf(value, __shfl_down_sync(uint32_t(-1), value, offset));
+    value.x += __shfl_down_sync(uint32_t(-1), value.x, offset);
+    value.y += __shfl_down_sync(uint32_t(-1), value.y, offset);
+    value.z += __shfl_down_sync(uint32_t(-1), value.z, offset);
+    value.w = fmaxf(value.w, __shfl_down_sync(uint32_t(-1), value.w, offset));
   }
-  __shared__ float warp_values[THREADS / 32];
+  return value;
+}
+
+template <int THREADS>
+__device__ __forceinline__ float4 mixed_kv_block_moments(float4 value) {
+  value = mixed_kv_warp_moments(value);
+  __shared__ float4 warp_values[THREADS / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   if (lane == 0) warp_values[warp] = value;
   __syncthreads();
   if (warp == 0) {
-    value = lane < THREADS / 32 ? warp_values[lane] : 0.0f;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-      value = fmaxf(value, __shfl_down_sync(uint32_t(-1), value, offset));
-    }
+    value =
+        mixed_kv_warp_moments(lane < THREADS / 32 ? warp_values[lane] : make_float4(0, 0, 0, 0));
   }
   __syncthreads();
   return value;
@@ -468,22 +473,19 @@ __device__ __forceinline__ void mixed_kv_route_moments(int64_t pair_values,
   float neighbor_dot = 0.0f;
   float neighbor_left_sq = 0.0f;
   float neighbor_right_sq = 0.0f;
-  for (int64_t linear = threadIdx.x; linear < pair_values; linear += THREADS) {
-    const auto pair = neighbor(linear);
-    neighbor_dot = fmaf(pair.x, pair.y, neighbor_dot);
-    neighbor_left_sq = fmaf(pair.x, pair.x, neighbor_left_sq);
-    neighbor_right_sq = fmaf(pair.y, pair.y, neighbor_right_sq);
-  }
-  neighbor_dot = mixed_kv_block_sum<THREADS>(neighbor_dot);
-  neighbor_left_sq = mixed_kv_block_sum<THREADS>(neighbor_left_sq);
-  neighbor_right_sq = mixed_kv_block_sum<THREADS>(neighbor_right_sq);
-
   static_assert(THREADS % 32 == 0);
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   float peak_rms = 0.0f;
   for (int64_t block = warp; block < signature_blocks; block += THREADS / 32) {
     const float value = signature(block, lane);
+    const int64_t linear = block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane;
+    if (linear < pair_values) {
+      const float next = neighbor(linear);
+      neighbor_dot = fmaf(value, next, neighbor_dot);
+      neighbor_left_sq = fmaf(value, value, neighbor_left_sq);
+      neighbor_right_sq = fmaf(next, next, neighbor_right_sq);
+    }
     float sum_sq = value * value;
     float peak = fabsf(value);
 #pragma unroll
@@ -496,31 +498,30 @@ __device__ __forceinline__ void mixed_kv_route_moments(int64_t pair_values,
       peak_rms = fmaxf(peak_rms, rms == 0.0f ? 0.0f : peak / rms);
     }
   }
-  peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
+  const auto reduced = mixed_kv_block_moments<THREADS>(
+      make_float4(neighbor_dot, neighbor_left_sq, neighbor_right_sq, peak_rms));
 
   if (threadIdx.x == 0) {
-    partials[0] = neighbor_dot;
-    partials[1] = neighbor_left_sq;
-    partials[2] = neighbor_right_sq;
-    partials[3] = peak_rms;
+    partials[0] = reduced.x;
+    partials[1] = reduced.y;
+    partials[2] = reduced.z;
+    partials[3] = reduced.w;
   }
 }
 
 template <int THREADS, typename Load>
 __device__ __forceinline__ void mixed_kv_route_row(int token, int page_size, int head_dim,
                                                    Load load, float* partials) {
-  const int blocks_per_kv = head_dim / MIXED_KV_SIGNATURE_BLOCK_SIZE;
+  const auto value = [&](int64_t linear, int row) {
+    const bool is_v = linear >= head_dim;
+    const int dim = is_v ? linear - head_dim : linear;
+    return load(is_v, row, dim);
+  };
   mixed_kv_route_moments<THREADS>(
-      token + 1 < page_size ? 2 * head_dim : 0, 2 * blocks_per_kv,
-      [&](int64_t linear) {
-        const bool is_v = linear >= head_dim;
-        const int dim = is_v ? linear - head_dim : linear;
-        return make_float2(load(is_v, token, dim), load(is_v, token + 1, dim));
-      },
+      token + 1 < page_size ? 2 * head_dim : 0, 2 * head_dim / MIXED_KV_SIGNATURE_BLOCK_SIZE,
+      [&](int64_t linear) { return value(linear, token + 1); },
       [&](int64_t block, int lane) {
-        const bool is_v = block >= blocks_per_kv;
-        const int dim_block = is_v ? block - blocks_per_kv : block;
-        return load(is_v, token, dim_block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane);
+        return value(block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane, token);
       },
       partials);
 }
@@ -567,11 +568,9 @@ __device__ __forceinline__ float2 mixed_kv_reduce_route(const float* partials, i
     right_sq += partials[row * 4 + 2];
     peak_rms = fmaxf(peak_rms, partials[row * 4 + 3]);
   }
-  dot = mixed_kv_block_sum<THREADS>(dot);
-  left_sq = mixed_kv_block_sum<THREADS>(left_sq);
-  right_sq = mixed_kv_block_sum<THREADS>(right_sq);
-  peak_rms = mixed_kv_block_max<THREADS>(peak_rms);
-  return mixed_kv_route_stats(dot, left_sq, right_sq, peak_rms);
+  const auto reduced =
+      mixed_kv_block_moments<THREADS>(make_float4(dot, left_sq, right_sq, peak_rms));
+  return mixed_kv_route_stats(reduced.x, reduced.y, reduced.z, reduced.w);
 }
 
 template <int THREADS = 128>
@@ -1018,13 +1017,13 @@ __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, c
   }
 }
 
-template <typename InType, int THREADS = 128>
-__global__ void mixed_kv_arena_seal_kernel(flashinfer::KVPageStorage storage,
-                                           flashinfer::KVPageArena arena, const int32_t* completed,
-                                           const int32_t* completed_count, const int32_t* classes,
-                                           float* stats, int64_t stats_stride,
-                                           const float* thresholds, const float* global_scales,
-                                           int capacity) {
+constexpr int kMixedKVSealThreads = 1024;
+
+template <typename InType, int THREADS = kMixedKVSealThreads>
+__global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
+    flashinfer::KVPageStorage storage, flashinfer::KVPageArena arena, const int32_t* completed,
+    const int32_t* completed_count, const int32_t* classes, float* stats, int64_t stats_stride,
+    const float* thresholds, const float* global_scales, int capacity) {
   const int event = blockIdx.x;
   if (event >= capacity || event >= *completed_count) return;
   const int page = completed[event];
@@ -1035,14 +1034,12 @@ __global__ void mixed_kv_arena_seal_kernel(flashinfer::KVPageStorage storage,
   const int64_t values = storage.geometry.values();
   __shared__ float moments[4];
   __shared__ uint64_t pending;
-  // A page owns its decision, encoding, and publication. No inter-CTA partials
-  // or completion counters are needed to join the page back together.
+  // A page owns its decision, encoding, and publication. A full CTA distributes
+  // codec blocks across 32 warps; 128 threads serialized 256 blocks per lane
+  // for Gemma's 32768-value pages.
   mixed_kv_route_moments<THREADS>(
       values - values_per_token, values / MIXED_KV_SIGNATURE_BLOCK_SIZE,
-      [&](int64_t i) {
-        return make_float2(mixed_kv_to_float(input[i]),
-                           mixed_kv_to_float(input[i + values_per_token]));
-      },
+      [&](int64_t i) { return mixed_kv_to_float(input[i + values_per_token]); },
       [&](int64_t block, int lane) {
         return mixed_kv_to_float(input[block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane]);
       },
@@ -1295,7 +1292,7 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
           slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
     }
     if ((phase & 2) && capacity) {
-      mixed_kv_arena_seal_kernel<c_type><<<capacity, 128, 0, stream>>>(
+      mixed_kv_arena_seal_kernel<c_type><<<capacity, kMixedKVSealThreads, 0, stream>>>(
           storage, arena, sealed, sealed_count, size_classes, route_stats, stats.stride(0),
           static_cast<const float*>(thresholds.data_ptr()),
           static_cast<const float*>(global_scales.data_ptr()), capacity);
