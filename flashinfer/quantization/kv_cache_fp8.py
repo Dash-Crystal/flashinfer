@@ -7,6 +7,7 @@ loads an E4M3 payload byte and one amortized E4M3 scale byte per 16 values.
 
 from __future__ import annotations
 
+from enum import IntEnum
 from typing import NamedTuple
 
 import torch
@@ -62,8 +63,24 @@ class MixedKVPagedCache(NamedTuple):
     page_geometry: tuple[int, int, int] | None = None
 
 
+class MixedKVPageUpdatePhase(IntEnum):
+    """Host-realized scheduling phases of the arena update ABI."""
+
+    PLACE = 1
+    SEAL = 2
+    PLACE_AND_SEAL = 3
+
+
 class MixedKVPageArena:
-    """One byte allocation with format-tagged addresses and reusable size classes."""
+    """One byte allocation with format-tagged addresses and reusable size classes.
+
+    ``update`` accepts a ``MixedKVPageUpdatePhase`` as its final operand.
+    PLACE prepares writable A16 pages and scatters the new values. SEAL owns
+    each completed page in one CTA, using the original routing metric and
+    codec, and publishes the selected encoding after its writes finish.
+    Consumers must finish reading before SEAL can retire the old encoding;
+    later readers and arena reuse must depend on its stream completion.
+    """
 
     def __init__(
         self,
