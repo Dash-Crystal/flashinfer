@@ -14,7 +14,8 @@
 #define FLASHINFER_GEMM_MASKED_GEMM_CUH_
 
 #include <cutlass/gemm/kernel/default_gemm.h>
-#include <cutlass/gemm/kernel/gemm_universal.h>
+#include <cutlass/gemm/kernel/gemm_universal_streamk.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle_streamk.h>
 #include <cutlass/numeric_types.h>
 
 #include <cuda/atomic>
@@ -133,16 +134,48 @@ cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int l
 
 using ReadyTile = cutlass::gemm::GemmShape<64, 64, 64>;
 
-struct ReadySwizzle : Swizzle {
-  cutlass::gemm::GemmCoord tile;
-  CUTLASS_DEVICE cutlass::gemm::GemmCoord get_tile_offset(int) const { return tile; }
+template <typename Iterator, int TileRows, int Threads>
+struct ReadyIterator : Iterator {
+  using Element = typename Iterator::Element;
+  using TensorCoord = typename Iterator::TensorCoord;
+  struct Params : Iterator::Params {
+    using Iterator::Params::Params;
+    int* readiness = nullptr;
+    int group_rows = 0;
+  };
 
-  CUTLASS_DEVICE void visit(int index, int rows, int columns, int panel_columns) {
-    const int panel = index / (rows * panel_columns);
-    const int first_column = panel * panel_columns;
-    const int width = min(panel_columns, columns - first_column);
-    const int within_panel = index - panel * rows * panel_columns;
-    tile = {within_panel / width, first_column + within_panel % width, 0};
+  CUTLASS_DEVICE ReadyIterator(Params const& params, Element* pointer, TensorCoord extent,
+                               int thread, TensorCoord offset)
+      : Iterator(params, pointer, extent, thread, offset) {
+    const int end = min(offset.row() + TileRows, extent.row());
+    for (int group = offset.row() / params.group_rows + thread;
+         group <= (end - 1) / params.group_rows; group += Threads) {
+      const int expected = min(params.group_rows, extent.row() - group * params.group_rows);
+      cuda::atomic_ref<int, cuda::thread_scope_device> ready(params.readiness[group]);
+      while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
+    }
+    __syncthreads();
+  }
+};
+
+template <typename Base>
+struct ReadyMma : Base {
+  using Base::Base;
+  using IteratorA =
+      ReadyIterator<typename Base::IteratorA, Base::Shape::kM, Base::WarpCount::kCount * 32>;
+};
+
+struct ReadySwizzle : cutlass::gemm::threadblock::ThreadblockSwizzleStreamK {
+  using Base = cutlass::gemm::threadblock::ThreadblockSwizzleStreamK;
+  using Base::Base;
+
+  CUTLASS_DEVICE int get_block_idx() const {
+    extern __shared__ char storage[];
+    const int offset = *reinterpret_cast<int*>(storage);
+    // With one resident worker per available SM, every Stream-K peer is in
+    // the first wave. Preserve CUTLASS's region ordering for that wave; later
+    // virtual waves contain only independent data-parallel work.
+    return offset == 0 ? Base::get_block_idx() : int(blockIdx.x) + offset;
   }
 };
 
@@ -151,39 +184,42 @@ using ReadyBase = LocalGemm<Element, ReadyTile, cutlass::gemm::GemmShape<32, 32,
 
 template <typename Element>
 using ReadyGemm =
-    cutlass::gemm::kernel::GemmUniversal<typename ReadyBase<Element>::Mma,
-                                         typename ReadyBase<Element>::Epilogue, ReadySwizzle>;
+    cutlass::gemm::kernel::GemmUniversalStreamk<ReadyMma<typename ReadyBase<Element>::Mma>,
+                                                typename ReadyBase<Element>::Epilogue,
+                                                ReadySwizzle>;
 
-// The caller reserves SMs for the producer, publishes complete row groups with
-// device-release increments, and joins both kernels before reusing this workspace.
+template <typename Element>
+constexpr size_t ReadySharedBytes() {
+  static_assert(alignof(typename ReadyGemm<Element>::SharedStorage) <= 128);
+  return 128 + sizeof(typename ReadyGemm<Element>::SharedStorage);
+}
+
+template <typename Element>
+constexpr size_t ReadyPartialBytes(int sms) {
+  return (sms * ReadyGemm<Element>::kWorkspaceBytesPerBlock + 127) / 128 * 128;
+}
+
+template <typename Element>
+constexpr size_t ReadyWorkspaceBytes(int sms) {
+  return ReadyPartialBytes<Element>(sms) + (sms * sizeof(int) + 127) / 128 * 128;
+}
+
 template <typename Element>
 __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGemm(
-    typename ReadyGemm<Element>::Params params, int* readiness, int group_rows, int done_index,
-    int panel_columns) {
+    typename ReadyGemm<Element>::Params params, int* readiness, int groups, int done_index,
+    int logical_blocks) {
   extern __shared__ char storage[];
-  auto& shared = *reinterpret_cast<typename ReadyGemm<Element>::SharedStorage*>(storage);
-  ReadySwizzle schedule;
-  const int row_tiles = params.grid_tiled_shape.m();
-  const int column_tiles = params.grid_tiled_shape.n();
-  for (int index = blockIdx.x; index < row_tiles * column_tiles; index += gridDim.x) {
-    schedule.visit(index, row_tiles, column_tiles, panel_columns);
-    const int begin = schedule.tile.m() * ReadyTile::kM;
-    const int end = min(begin + ReadyTile::kM, params.problem_size.m());
-    if (threadIdx.x == 0) {
-      for (int group = begin / group_rows; group <= (end - 1) / group_rows; ++group) {
-        const int expected = min(group_rows, params.problem_size.m() - group * group_rows);
-        cuda::atomic_ref<int, cuda::thread_scope_device> ready(readiness[group]);
-        while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
-      }
-    }
+  auto& shared = *reinterpret_cast<typename ReadyGemm<Element>::SharedStorage*>(storage + 128);
+  for (int offset = 0; int(blockIdx.x) + offset < logical_blocks; offset += gridDim.x) {
+    if (threadIdx.x == 0) *reinterpret_cast<int*>(storage) = offset;
     __syncthreads();
-    ReadyGemm<Element>().run_with_swizzle(params, shared, schedule);
+    ReadyGemm<Element>::invoke(params, shared);
     __syncthreads();
   }
   if (threadIdx.x == 0) {
     cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
     if (done.fetch_add(1, cuda::memory_order_acq_rel) == gridDim.x - 1) {
-      for (int group = 0; group < done_index; ++group) readiness[group] = 0;
+      for (int group = 0; group < groups; ++group) readiness[group] = 0;
       done.store(0, cuda::memory_order_relaxed);
     }
   }
@@ -191,21 +227,28 @@ __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGem
 
 template <typename Element>
 cudaError_t PrepareReady() {
-  return PrepareKernel(ReadyRowsGemm<Element>, sizeof(typename ReadyGemm<Element>::SharedStorage));
+  return PrepareKernel(ReadyRowsGemm<Element>, ReadySharedBytes<Element>());
 }
 
 template <typename Element>
 cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
-                     int ldd, int* readiness, int group_rows, int done_index, int blocks,
-                     int panel_columns, cudaStream_t stream) {
+                     int ldd, int* readiness, int group_rows, int done_index, void* workspace,
+                     int sms, int available_sms, cudaStream_t stream) {
   using Kernel = ReadyGemm<Element>;
   typename Kernel::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
                                   {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),
-                                  int64_t(ldb), int64_t(ldd), int64_t(ldd));
-  typename Kernel::Params params(args, blocks, 1);
-  ReadyRowsGemm<Element>
-      <<<blocks, Kernel::kThreadCount, sizeof(typename Kernel::SharedStorage), stream>>>(
-          params, readiness, group_rows, done_index, panel_columns);
+                                  int64_t(ldb), int64_t(ldd), int64_t(ldd), available_sms);
+  typename Kernel::Params params(args, sms, 1);
+  params.params_A.readiness = readiness;
+  params.params_A.group_rows = group_rows;
+  // Fixed offsets across shapes keep previous FP32 partials out of the barrier
+  // allocation. CUTLASS resets its flags after the consuming peer's reduction.
+  params.partials_workspace = workspace;
+  params.barrier_workspace = static_cast<char*>(workspace) + ReadyPartialBytes<Element>(sms);
+  const int logical_blocks = params.block_mapping.get_num_blocks();
+  const int blocks = min(available_sms, logical_blocks);
+  ReadyRowsGemm<Element><<<blocks, Kernel::kThreadCount, ReadySharedBytes<Element>(), stream>>>(
+      params, readiness, (m + group_rows - 1) / group_rows, done_index, logical_blocks);
   return cudaGetLastError();
 }
 

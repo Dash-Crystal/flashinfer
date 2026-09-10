@@ -3,6 +3,7 @@
 """CUTLASS matrix multiplication with caller-owned row visibility."""
 
 from functools import cache
+from typing import Any, NamedTuple
 
 import torch
 
@@ -92,16 +93,29 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
     return out
 
 
+class ReadyGemmInfo(NamedTuple):
+    module: Any
+    sms: int
+    row_tile: int
+    workspace_bytes: int
+
+
 @cache
-def _prepared_ready_module(device, dtype, m, k, n, reserved_blocks):
+def ready_gemm_info(device: int, dtype: torch.dtype) -> ReadyGemmInfo:
     module = get_masked_gemm_module()
-    blocks, panel_columns = module.prepare_ready(
-        device, dtype == torch.bfloat16, m, k, n, reserved_blocks
+    sms, row_tile, workspace_bytes = module.prepare_ready(
+        device, dtype == torch.bfloat16
     )
-    return module, blocks, panel_columns
+    return ReadyGemmInfo(module, sms, row_tile, workspace_bytes)
 
 
-def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
+def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate one reusable Stream-K workspace before model graph capture."""
+    info = ready_gemm_info(device.index, dtype)
+    return torch.zeros(info.workspace_bytes, dtype=torch.uint8, device=device)
+
+
+def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, workspace):
     """Multiply once, consuming row groups published by a concurrent producer.
 
     Operands follow ``mm_masked_tiles``'s layout contract. The caller initializes
@@ -113,10 +127,10 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
 
     ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
     grid leaves that many SMs available, so readiness waits cannot occupy the
-    producer's execution capacity. Row tiles share weight panels sized from L2;
-    compact projections distribute their rows across CTAs as well as columns.
-    Shape and device preparation are cached;
-    execution introduces no allocation or reset kernel.
+    producer's execution capacity. CUTLASS Stream-K distributes K iterations as
+    well as complete output tiles. ``workspace`` is allocated and zeroed once
+    with ``create_ready_workspace``; FP32 partials and barriers occupy fixed,
+    disjoint regions across shapes. Execution adds no allocation or reset kernel.
     """
     _validate_mm_operands(x, weight, out)
     if (
@@ -130,14 +144,20 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
         or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
+    info = ready_gemm_info(x.device.index, x.dtype)
+    if (
+        workspace.device != x.device
+        or workspace.dtype != torch.uint8
+        or workspace.ndim != 1
+        or not workspace.is_contiguous()
+        or workspace.data_ptr() % 128
+        or workspace.numel() < info.workspace_bytes
+        or any(torch._C._overlaps(workspace, t) for t in (x, weight, out, readiness))
+        or not 0 < reserved_blocks < info.sms
+    ):
+        raise ValueError("Stream-K requires distinct workspace and producer capacity")
     if x.shape[0] and weight.shape[1]:
-        module, blocks, panel_columns = _prepared_ready_module(
-            x.device.index,
-            x.dtype,
-            x.shape[0],
-            x.shape[1],
-            weight.shape[1],
-            reserved_blocks,
+        info.module.run_ready(
+            x, weight, out, readiness, workspace, group_rows, info.sms, reserved_blocks
         )
-        module.run_ready(x, weight, out, readiness, group_rows, blocks, panel_columns)
     return out
