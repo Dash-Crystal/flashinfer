@@ -208,6 +208,17 @@ constexpr size_t ReadyWorkspaceBytes(int slots) {
          (slots * flags_per_slot * sizeof(int) + 127) / 128 * 128;
 }
 
+CUTLASS_DEVICE void FinishReady(int* readiness, int groups, int done_index) {
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
+    const int blocks = gridDim.x * gridDim.y * gridDim.z;
+    if (done.fetch_add(1, cuda::memory_order_acq_rel) == blocks - 1) {
+      for (int group = 0; group < groups; ++group) readiness[group] = 0;
+      done.store(0, cuda::memory_order_relaxed);
+    }
+  }
+}
+
 template <typename Element>
 __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGemm(
     typename ReadyGemm<Element>::Params params, int* readiness, int groups, int done_index,
@@ -220,13 +231,7 @@ __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGem
     ReadyGemm<Element>::invoke(params, shared);
     __syncthreads();
   }
-  if (threadIdx.x == 0) {
-    cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
-    if (done.fetch_add(1, cuda::memory_order_acq_rel) == gridDim.x - 1) {
-      for (int group = 0; group < groups; ++group) readiness[group] = 0;
-      done.store(0, cuda::memory_order_relaxed);
-    }
-  }
+  FinishReady(readiness, groups, done_index);
 }
 
 template <typename Element>

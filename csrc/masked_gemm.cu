@@ -15,6 +15,13 @@
 #include <algorithm>
 #include <flashinfer/gemm/masked_gemm.cuh>
 
+#if FLASHINFER_READY_TMA_SM120
+#include <flashinfer/gemm/ready_tma_gemm.cuh>
+namespace ready_gemm = flashinfer::ready_tma_gemm;
+#else
+namespace ready_gemm = flashinfer::masked_gemm;
+#endif
+
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
@@ -56,17 +63,16 @@ void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView i
 tvm::ffi::Array<int64_t> PrepareReadyGemm(int64_t device, bool bf16) {
   ffi::CUDADeviceGuard guard(device);
   int occupancy;
-  auto status = bf16 ? flashinfer::masked_gemm::PrepareReady<cutlass::bfloat16_t>(&occupancy)
-                     : flashinfer::masked_gemm::PrepareReady<cutlass::half_t>(&occupancy);
+  auto status = bf16 ? ready_gemm::PrepareReady<cutlass::bfloat16_t>(&occupancy)
+                     : ready_gemm::PrepareReady<cutlass::half_t>(&occupancy);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
   int sms;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
   const int slots = sms * occupancy;
-  const size_t bytes =
-      bf16 ? flashinfer::masked_gemm::ReadyWorkspaceBytes<cutlass::bfloat16_t>(slots)
-           : flashinfer::masked_gemm::ReadyWorkspaceBytes<cutlass::half_t>(slots);
-  return {sms, occupancy, flashinfer::masked_gemm::ReadyTile::kM, int64_t(bytes)};
+  const size_t bytes = bf16 ? ready_gemm::ReadyWorkspaceBytes<cutlass::bfloat16_t>(slots)
+                            : ready_gemm::ReadyWorkspaceBytes<cutlass::half_t>(slots);
+  return {sms, occupancy, ready_gemm::ReadyTile::kM, int64_t(bytes)};
 }
 
 void RunReadyGemm(TensorView x, TensorView weight, TensorView out, TensorView readiness,
@@ -77,9 +83,8 @@ void RunReadyGemm(TensorView x, TensorView weight, TensorView out, TensorView re
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
     using Element = std::conditional_t<std::is_same_v<c_type, nv_bfloat16>, cutlass::bfloat16_t,
                                        cutlass::half_t>;
-    TVM_FFI_ICHECK(workspace.size(0) >=
-                   flashinfer::masked_gemm::ReadyWorkspaceBytes<Element>(sms * occupancy));
-    auto status = flashinfer::masked_gemm::RunReady(
+    TVM_FFI_ICHECK(workspace.size(0) >= ready_gemm::ReadyWorkspaceBytes<Element>(sms * occupancy));
+    auto status = ready_gemm::RunReady(
         static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
         static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
         weight.stride(1), out.stride(0), static_cast<int*>(readiness.data_ptr()), group_rows,

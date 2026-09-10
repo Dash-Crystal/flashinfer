@@ -8,11 +8,12 @@ from typing import Any, NamedTuple
 import torch
 
 from ..jit.gemm.core import gen_masked_gemm_module
+from ..utils import get_compute_capability
 
 
 @cache
-def get_masked_gemm_module():
-    return gen_masked_gemm_module().build_and_load()
+def get_masked_gemm_module(*, ready_tma: bool = False):
+    return gen_masked_gemm_module(ready_tma=ready_tma).build_and_load()
 
 
 @cache
@@ -103,7 +104,9 @@ class ReadyGemmInfo(NamedTuple):
 
 @cache
 def ready_gemm_info(device: int, dtype: torch.dtype) -> ReadyGemmInfo:
-    module = get_masked_gemm_module()
+    module = get_masked_gemm_module(
+        ready_tma=get_compute_capability(torch.device("cuda", device))[0] == 12
+    )
     sms, occupancy, row_tile, workspace_bytes = module.prepare_ready(
         device, dtype == torch.bfloat16
     )
@@ -111,7 +114,7 @@ def ready_gemm_info(device: int, dtype: torch.dtype) -> ReadyGemmInfo:
 
 
 def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate one reusable Stream-K workspace before model graph capture."""
+    """Allocate the selected kernel's workspace before model graph capture."""
     info = ready_gemm_info(device.index, dtype)
     return torch.zeros(info.workspace_bytes, dtype=torch.uint8, device=device)
 
@@ -127,12 +130,14 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
     The caller joins both kernels before reusing any operand or workspace.
 
     ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
-    grid leaves that many SMs available and uses the kernel's prepared occupancy
-    on the remaining SMs. Readiness waits cannot occupy the producer's execution
-    capacity. CUTLASS Stream-K distributes K iterations as
-    well as complete output tiles. ``workspace`` is allocated and zeroed once
-    with ``create_ready_workspace``; FP32 partials and barriers occupy fixed,
-    disjoint regions across shapes. Execution adds no allocation or reset kernel.
+    grid leaves that many SMs available. Readiness waits cannot occupy the
+    producer's execution capacity. SM120 uses the native TMA pipeline with
+    separate loading and compute warps. Other architectures use CUTLASS Stream-K.
+    This choice is realized once per device/dtype, before model capture.
+    ``workspace`` is allocated and zeroed once with ``create_ready_workspace``;
+    Stream-K partials and barriers occupy fixed, disjoint regions across shapes.
+    The TMA path needs zero scratch bytes. Execution adds no allocation or
+    reset kernel.
     """
     _validate_mm_operands(x, weight, out)
     if (
