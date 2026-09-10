@@ -172,9 +172,9 @@ struct ReadySwizzle : cutlass::gemm::threadblock::ThreadblockSwizzleStreamK {
   CUTLASS_DEVICE int get_block_idx() const {
     extern __shared__ char storage[];
     const int offset = *reinterpret_cast<int*>(storage);
-    // With one resident worker per available SM, every Stream-K peer is in
-    // the first wave. Preserve CUTLASS's region ordering for that wave; later
-    // virtual waves contain only independent data-parallel work.
+    // The first physical wave holds every Stream-K peer at the prepared
+    // occupancy. Preserve CUTLASS's region ordering for that wave; later
+    // virtual waves contain data-parallel work and reduction epilogues.
     return offset == 0 ? Base::get_block_idx() : int(blockIdx.x) + offset;
   }
 };
@@ -195,13 +195,17 @@ constexpr size_t ReadySharedBytes() {
 }
 
 template <typename Element>
-constexpr size_t ReadyPartialBytes(int sms) {
-  return (sms * ReadyGemm<Element>::kWorkspaceBytesPerBlock + 127) / 128 * 128;
+constexpr size_t ReadyPartialBytes(int slots) {
+  return (slots * ReadyGemm<Element>::kWorkspaceBytesPerBlock + 127) / 128 * 128;
 }
 
 template <typename Element>
-constexpr size_t ReadyWorkspaceBytes(int sms) {
-  return ReadyPartialBytes<Element>(sms) + (sms * sizeof(int) + 127) / 128 * 128;
+constexpr size_t ReadyWorkspaceBytes(int slots) {
+  // Native separate reductions use one flag per accumulator fragment; their
+  // tile count cannot exceed the number of resident Stream-K peers.
+  constexpr int flags_per_slot = ReadyGemm<Element>::Epilogue::kAccumulatorFragments;
+  return ReadyPartialBytes<Element>(slots) +
+         (slots * flags_per_slot * sizeof(int) + 127) / 128 * 128;
 }
 
 template <typename Element>
@@ -226,27 +230,32 @@ __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGem
 }
 
 template <typename Element>
-cudaError_t PrepareReady() {
-  return PrepareKernel(ReadyRowsGemm<Element>, ReadySharedBytes<Element>());
+cudaError_t PrepareReady(int* occupancy) {
+  auto status = PrepareKernel(ReadyRowsGemm<Element>, ReadySharedBytes<Element>());
+  if (status != cudaSuccess) return status;
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(occupancy, ReadyRowsGemm<Element>,
+                                                       ReadyGemm<Element>::kThreadCount,
+                                                       ReadySharedBytes<Element>());
 }
 
 template <typename Element>
 cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
                      int ldd, int* readiness, int group_rows, int done_index, void* workspace,
-                     int sms, int available_sms, cudaStream_t stream) {
+                     int sms, int occupancy, int available_sms, cudaStream_t stream) {
   using Kernel = ReadyGemm<Element>;
   typename Kernel::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
                                   {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),
                                   int64_t(ldb), int64_t(ldd), int64_t(ldd), available_sms);
-  typename Kernel::Params params(args, sms, 1);
+  typename Kernel::Params params(args, sms, occupancy);
   params.params_A.readiness = readiness;
   params.params_A.group_rows = group_rows;
   // Fixed offsets across shapes keep previous FP32 partials out of the barrier
   // allocation. CUTLASS resets its flags after the consuming peer's reduction.
   params.partials_workspace = workspace;
-  params.barrier_workspace = static_cast<char*>(workspace) + ReadyPartialBytes<Element>(sms);
+  params.barrier_workspace =
+      static_cast<char*>(workspace) + ReadyPartialBytes<Element>(sms * occupancy);
   const int logical_blocks = params.block_mapping.get_num_blocks();
-  const int blocks = min(available_sms, logical_blocks);
+  const int blocks = min(available_sms * occupancy, logical_blocks);
   ReadyRowsGemm<Element><<<blocks, Kernel::kThreadCount, ReadySharedBytes<Element>(), stream>>>(
       params, readiness, (m + group_rows - 1) / group_rows, done_index, logical_blocks);
   return cudaGetLastError();

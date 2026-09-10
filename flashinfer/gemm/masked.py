@@ -96,6 +96,7 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
 class ReadyGemmInfo(NamedTuple):
     module: Any
     sms: int
+    occupancy: int
     row_tile: int
     workspace_bytes: int
 
@@ -103,10 +104,10 @@ class ReadyGemmInfo(NamedTuple):
 @cache
 def ready_gemm_info(device: int, dtype: torch.dtype) -> ReadyGemmInfo:
     module = get_masked_gemm_module()
-    sms, row_tile, workspace_bytes = module.prepare_ready(
+    sms, occupancy, row_tile, workspace_bytes = module.prepare_ready(
         device, dtype == torch.bfloat16
     )
-    return ReadyGemmInfo(module, sms, row_tile, workspace_bytes)
+    return ReadyGemmInfo(module, sms, occupancy, row_tile, workspace_bytes)
 
 
 def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -126,8 +127,9 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
     The caller joins both kernels before reusing any operand or workspace.
 
     ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
-    grid leaves that many SMs available, so readiness waits cannot occupy the
-    producer's execution capacity. CUTLASS Stream-K distributes K iterations as
+    grid leaves that many SMs available and uses the kernel's prepared occupancy
+    on the remaining SMs. Readiness waits cannot occupy the producer's execution
+    capacity. CUTLASS Stream-K distributes K iterations as
     well as complete output tiles. ``workspace`` is allocated and zeroed once
     with ``create_ready_workspace``; FP32 partials and barriers occupy fixed,
     disjoint regions across shapes. Execution adds no allocation or reset kernel.
@@ -158,6 +160,14 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
         raise ValueError("Stream-K requires distinct workspace and producer capacity")
     if x.shape[0] and weight.shape[1]:
         info.module.run_ready(
-            x, weight, out, readiness, workspace, group_rows, info.sms, reserved_blocks
+            x,
+            weight,
+            out,
+            readiness,
+            workspace,
+            group_rows,
+            info.sms,
+            info.occupancy,
+            reserved_blocks,
         )
     return out
