@@ -16,7 +16,7 @@ mixed-KV-page branch. It exists because of the following review finding, quoted 
 
 ## Design specification
 
-### Packed storage integration, September 9
+### Packed storage integration, September 9 snapshot
 
 `page_storage.cuh` adds one byte arena with format-sized extents and one
 address table whose low bits identify the committed encoding. The SM120 XQA
@@ -45,7 +45,7 @@ source hashes and replayable joint moments are retained on ws-1 under
 `/data/h3-runtime/mixed-kv-arena-20260909/campaign-{1,2}` and in vLLM's
 `docs/design/mixed_kv_page_transport_transcript_design.md`.
 
-Outstanding integration includes physical-budget admission and expanded
+At that snapshot, outstanding integration included physical-budget admission and expanded
 logical capacity, mandatory-allocation failure feedback, packed numerical
 quality measurements, and SM90 TMA address lowering. Packed SM90 currently
 selects the generic consumer explicitly; no SM90 packed performance is claimed.
@@ -116,7 +116,29 @@ infer from timings. Requirements:
 - Identical **acceptance tests**: bit-exactness against explicit A16 expansion, and the
   roofline targets in `mixed_kv_page_transport_cutlass_references.md`, apply to both.
 
-## sm120 (RTX 5090) state: mixed streams through the XQA host
+## SM120 current consumer
+
+The current SM120 mixed-page path follows the register-fragment specification.
+`mixed_kv_fragments.cuh` consumes packed K/V through native matrix loads and
+converts directly into MMA operands. Compressed K uses half-width shared rows;
+A16 K loads its register fragments directly from the authoritative page address.
+V retains format-dependent packed shared payloads and its existing double buffer.
+The compressed consumer does not expand either operand into A16 shared tiles.
+
+V69's full Gemma4 12B TP2 server and loaded-binary receipts establish this
+instruction path. V70 distributes D256 work over twice as many resident warps
+within the same shared footprint; its binary uses 121 registers without spills.
+The subsequent register pipeline fetches the next K operand before converting
+and multiplying the current one, and reuses word-sized scale loads. That
+followup still needs full-model measurement. Current results and source revisions
+are recorded in `mixed_kv_page_transport_targets.md` and vLLM's
+`docs/design/tp2_execution_review.md`.
+
+## Historical SM120 shared-expansion measurements
+
+The measurements below describe a superseded implementation which violated the
+register-fragment specification. They are retained as historical evidence; they
+do not describe the current source or establish its end-to-end performance.
 
 Measured on an RTX 5090 (B=17, S=4096, 8 KV heads, GQA 4; bursts; 34/34 cases
 bit-exact against explicit A16 expansion):
@@ -138,7 +160,7 @@ A16 (237 µs) to 1.24× faster:
    at every tile part.  Alone this did not change the mixed time (237 → 233 µs);
    it removed a latency chain, not the bottleneck.
 2. **Tiles with compressed pages are expanded to A16 in shared memory and fed to
-   the stock A16 GEMM** (`MIXED_COMPACT_PAGES=0`, now the default).  The
+   the stock A16 GEMM** (`MIXED_COMPACT_PAGES=0`, then the default).  The
    register-side "compact" form dispatched on the page tag per (block, page)
    inside the unrolled MMA loop, instantiating all three fragment converters:
    `cuobjdump` showed 17 688 instructions, 647 branches and 338 local loads for
