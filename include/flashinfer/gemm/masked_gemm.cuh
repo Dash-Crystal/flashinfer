@@ -14,7 +14,10 @@
 #define FLASHINFER_GEMM_MASKED_GEMM_CUH_
 
 #include <cutlass/gemm/kernel/default_gemm.h>
+#include <cutlass/gemm/kernel/gemm_universal.h>
 #include <cutlass/numeric_types.h>
+
+#include <cuda/atomic>
 
 namespace flashinfer::masked_gemm {
 
@@ -23,10 +26,11 @@ using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
 using RowMajor = cutlass::layout::RowMajor;
 using ColumnMajor = cutlass::layout::ColumnMajor;
 
-template <typename Element>
+template <typename Element, typename Shape = Tile,
+          typename WarpShape = cutlass::gemm::GemmShape<64, 32, 64>>
 using LocalGemm = typename cutlass::gemm::kernel::DefaultGemm<
     Element, RowMajor, 8, Element, ColumnMajor, 8, Element, RowMajor, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Tile, cutlass::gemm::GemmShape<64, 32, 64>,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Shape, WarpShape,
     cutlass::gemm::GemmShape<16, 8, 16>,
     cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>, Swizzle, 3, false,
     cutlass::arch::OpMultiplyAdd>::GemmKernel;
@@ -95,15 +99,19 @@ __global__ __launch_bounds__(Gemm<Element, Publish>::kThreadCount) void MaskedGe
   // The caller's system release/acquire handoff then publishes peer stores.
 }
 
+template <typename Kernel>
+cudaError_t PrepareKernel(Kernel kernel, size_t shared_bytes) {
+  auto status =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+  if (status != cudaSuccess) return status;
+  return cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                              cudaSharedmemCarveoutMaxShared);
+}
+
 template <typename Element, bool Publish>
 cudaError_t Prepare() {
-  auto status = cudaFuncSetAttribute(MaskedGemm<Element, Publish>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     sizeof(typename Gemm<Element, Publish>::SharedStorage));
-  if (status != cudaSuccess) return status;
-  return cudaFuncSetAttribute(MaskedGemm<Element, Publish>,
-                              cudaFuncAttributePreferredSharedMemoryCarveout,
-                              cudaSharedmemCarveoutMaxShared);
+  return PrepareKernel(MaskedGemm<Element, Publish>,
+                       sizeof(typename Gemm<Element, Publish>::SharedStorage));
 }
 
 template <typename Element, bool Publish>
@@ -120,6 +128,76 @@ cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int l
       <<<Swizzle::get_grid_shape(grid), Gemm<Element, Publish>::kThreadCount,
          sizeof(typename Gemm<Element, Publish>::SharedStorage), stream>>>(params, is_padding,
                                                                            row_offset);
+  return cudaGetLastError();
+}
+
+using ReadyTile = cutlass::gemm::GemmShape<64, 64, 64>;
+
+struct ReadySwizzle : Swizzle {
+  cutlass::gemm::GemmCoord tile;
+  CUTLASS_DEVICE cutlass::gemm::GemmCoord get_tile_offset(int) const { return tile; }
+};
+
+template <typename Element>
+using ReadyBase = LocalGemm<Element, ReadyTile, cutlass::gemm::GemmShape<32, 32, 64>>;
+
+template <typename Element>
+using ReadyGemm =
+    cutlass::gemm::kernel::GemmUniversal<typename ReadyBase<Element>::Mma,
+                                         typename ReadyBase<Element>::Epilogue, ReadySwizzle>;
+
+// The caller reserves SMs for the producer, publishes complete row groups with
+// device-release increments, and joins both kernels before reusing this workspace.
+template <typename Element>
+__global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGemm(
+    typename ReadyGemm<Element>::Params params, int* readiness, int group_rows, int done_index) {
+  extern __shared__ char storage[];
+  auto& shared = *reinterpret_cast<typename ReadyGemm<Element>::SharedStorage*>(storage);
+  ReadySwizzle schedule;
+  for (int n = blockIdx.x; n < params.grid_tiled_shape.n(); n += gridDim.x) {
+    // Finish the M tiles while this CTA's K x N weight tile can remain in L2.
+    for (int m = 0; m < params.grid_tiled_shape.m(); ++m) {
+      const int begin = m * ReadyTile::kM;
+      const int end = min(begin + ReadyTile::kM, params.problem_size.m());
+      if (threadIdx.x == 0) {
+        for (int group = begin / group_rows; group <= (end - 1) / group_rows; ++group) {
+          const int expected = min(group_rows, params.problem_size.m() - group * group_rows);
+          cuda::atomic_ref<int, cuda::thread_scope_device> ready(readiness[group]);
+          while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
+        }
+      }
+      __syncthreads();
+      schedule.tile = {m, n, 0};
+      ReadyGemm<Element>().run_with_swizzle(params, shared, schedule);
+      __syncthreads();
+    }
+  }
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
+    if (done.fetch_add(1, cuda::memory_order_acq_rel) == gridDim.x - 1) {
+      for (int group = 0; group < done_index; ++group) readiness[group] = 0;
+      done.store(0, cuda::memory_order_relaxed);
+    }
+  }
+}
+
+template <typename Element>
+cudaError_t PrepareReady() {
+  return PrepareKernel(ReadyRowsGemm<Element>, sizeof(typename ReadyGemm<Element>::SharedStorage));
+}
+
+template <typename Element>
+cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
+                     int ldd, int* readiness, int group_rows, int done_index, int blocks,
+                     cudaStream_t stream) {
+  using Kernel = ReadyGemm<Element>;
+  typename Kernel::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
+                                  {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),
+                                  int64_t(ldb), int64_t(ldd), int64_t(ldd));
+  typename Kernel::Params params(args, blocks, 1);
+  ReadyRowsGemm<Element>
+      <<<blocks, Kernel::kThreadCount, sizeof(typename Kernel::SharedStorage), stream>>>(
+          params, readiness, group_rows, done_index);
   return cudaGetLastError();
 }
 

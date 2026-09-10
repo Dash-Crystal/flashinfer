@@ -21,22 +21,12 @@ def _prepared_module(device: int, dtype: torch.dtype, publish: bool):
     return module
 
 
-def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=None):
-    """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
-
-    The caller must consume outputs with the same row mask. Arbitrary holes in
-    the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
-    Operands are A row-major, B column-major, and output row-major, aligned to
-    eight FP16/BF16 values. An optional peer mapping receives the same epilogue
-    stores. Its owner must publish kernel completion to peer readers with system
-    synchronization, and order reuse after the readers finish.
-    No preparation tensor or launch is introduced.
-    """
+def _validate_mm_operands(x, weight, out):
     if (
         x.dtype not in (torch.float16, torch.bfloat16)
         or weight.dtype != x.dtype
         or out.dtype != x.dtype
-        or any(t.device != x.device for t in (weight, out, is_padding))
+        or any(t.device != x.device for t in (weight, out))
         or x.device.type != "cuda"
         or any(t.ndim != 2 for t in (x, weight, out))
         or x.shape[1] != weight.shape[0]
@@ -58,13 +48,32 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
             )
         )
         or any(t.data_ptr() % 16 for t in (x, weight, out))
+        or any(d >= 2**31 for t in (x, weight, out) for d in (*t.shape, *t.stride()))
+    ):
+        raise ValueError("Expected aligned CUDA TN GEMM operands")
+
+
+def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=None):
+    """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
+
+    The caller must consume outputs with the same row mask. Arbitrary holes in
+    the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
+    Operands are A row-major, B column-major, and output row-major, aligned to
+    eight FP16/BF16 values. An optional peer mapping receives the same epilogue
+    stores. Its owner must publish kernel completion to peer readers with system
+    synchronization, and order reuse after the readers finish.
+    No preparation tensor or launch is introduced.
+    """
+    _validate_mm_operands(x, weight, out)
+    if (
+        is_padding.device != x.device
         or is_padding.dtype != torch.bool
         or is_padding.ndim != 1
         or not is_padding.is_contiguous()
         or row_offset < 0
         or row_offset + x.shape[0] > is_padding.numel()
     ):
-        raise ValueError("Expected aligned CUDA TN GEMM operands and logical row mask")
+        raise ValueError("Padding must cover the logical GEMM rows")
     if peer_output is not None and (
         peer_output.device != x.device
         or peer_output.dtype != out.dtype
@@ -80,4 +89,48 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
         _prepared_module(x.device.index, x.dtype, peer_output is not None).run(
             x, weight, out, is_padding, row_offset, peer_output
         )
+    return out
+
+
+@cache
+def _prepared_ready_module(device, dtype, k, n, reserved_blocks):
+    module = get_masked_gemm_module()
+    blocks = module.prepare_ready(
+        device, dtype == torch.bfloat16, k, n, reserved_blocks
+    )
+    return module, blocks
+
+
+def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
+    """Multiply once, consuming row groups published by a concurrent producer.
+
+    Operands follow ``mm_masked_tiles``'s layout contract. The caller initializes
+    the int32 workspace to zero before capture. Each producer row contributes
+    one device-release increment to its group, after storing every column.
+    Padded rows must also be stored and counted. The final workspace element is
+    reserved for consumer completion; the last GEMM CTA resets the workspace.
+    The caller joins both kernels before reusing any operand or workspace.
+
+    ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
+    grid leaves that many SMs available, so readiness waits cannot occupy the
+    producer's execution capacity. Shape and device preparation are cached;
+    execution introduces no allocation or reset kernel.
+    """
+    _validate_mm_operands(x, weight, out)
+    if (
+        readiness.device != x.device
+        or readiness.dtype != torch.int32
+        or readiness.ndim != 1
+        or not readiness.is_contiguous()
+        or group_rows <= 0
+        or group_rows >= 2**31
+        or readiness.numel() < (x.shape[0] + group_rows - 1) // group_rows + 1
+        or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
+    ):
+        raise ValueError("Readiness requires one counter per row group and completion")
+    if x.shape[0] and weight.shape[1]:
+        module, blocks = _prepared_ready_module(
+            x.device.index, x.dtype, x.shape[1], weight.shape[1], reserved_blocks
+        )
+        module.run_ready(x, weight, out, readiness, group_rows, blocks)
     return out
