@@ -69,7 +69,9 @@ def gen_gemm_module() -> JitSpec:
     )
 
 
-def gen_masked_gemm_module(*, ready_tma: bool = False) -> JitSpec:
+def gen_masked_gemm_module(
+    *, ready_tma: bool = False, math_registers: int = 0
+) -> JitSpec:
     source = jit_env.FLASHINFER_CSRC_DIR / "masked_gemm.cu"
     header = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer/gemm/masked_gemm.cuh"
     tma = header.with_name("ready_tma_gemm.cuh")
@@ -79,12 +81,15 @@ def gen_masked_gemm_module(*, ready_tma: bool = False) -> JitSpec:
         + (tma.read_bytes() if ready_tma else b"")
     ).hexdigest()[:16]
     return gen_jit_spec(
-        f"masked_gemm_{identity}_tma{int(ready_tma)}",
+        f"masked_gemm_{identity}_tma{int(ready_tma)}_r{math_registers}",
         [source],
         extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[12] if ready_tma else [8, 9, 10, 11, 12]
         )
-        + [f"-DFLASHINFER_READY_TMA_SM120={int(ready_tma)}"],
+        + [
+            f"-DFLASHINFER_READY_TMA_SM120={int(ready_tma)}",
+            f"-DFLASHINFER_READY_MATH_REGISTERS={math_registers}",
+        ],
     )
 
 

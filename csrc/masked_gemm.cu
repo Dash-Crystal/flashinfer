@@ -60,26 +60,46 @@ void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView i
   });
 }
 
-tvm::ffi::Array<int64_t> PrepareReadyGemm(int64_t device, bool bf16) {
+tvm::ffi::Array<int64_t> PrepareReadyGemm(int64_t device, bool bf16, int64_t producer_registers,
+                                          int64_t producer_shared, int64_t producer_threads) {
   ffi::CUDADeviceGuard guard(device);
   int occupancy;
   auto status = bf16 ? ready_gemm::PrepareReady<cutlass::bfloat16_t>(&occupancy)
                      : ready_gemm::PrepareReady<cutlass::half_t>(&occupancy);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
-  int sms;
-  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  cudaDeviceProp properties;
+  status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
+  const int sms = properties.multiProcessorCount;
   const int slots = sms * occupancy;
   const size_t bytes = bf16 ? ready_gemm::ReadyWorkspaceBytes<cutlass::bfloat16_t>(slots)
                             : ready_gemm::ReadyWorkspaceBytes<cutlass::half_t>(slots);
-  return {sms, occupancy, ready_gemm::ReadyTile::kM, int64_t(bytes)};
+  int math_registers = 0;
+  bool concurrent = false;
+#if FLASHINFER_READY_TMA_SM120
+  if (producer_threads > 0) {
+    status = bf16 ? ready_gemm::PlanReady<cutlass::bfloat16_t>(properties, producer_registers,
+                                                               producer_shared, producer_threads,
+                                                               &math_registers, &concurrent)
+                  : ready_gemm::PlanReady<cutlass::half_t>(properties, producer_registers,
+                                                           producer_shared, producer_threads,
+                                                           &math_registers, &concurrent);
+    TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
+  }
+#endif
+  return {sms,
+          occupancy,
+          ready_gemm::ReadyTile::kM,
+          int64_t(bytes),
+          math_registers,
+          int64_t(concurrent)};
 }
 
 void RunReadyGemm(TensorView x, TensorView weight, TensorView out, TensorView readiness,
                   TensorView workspace, int64_t group_rows, int64_t sms, int64_t occupancy,
                   int64_t reserved_blocks) {
   ffi::CUDADeviceGuard guard(x.device().device_id);
-  TVM_FFI_ICHECK(reserved_blocks > 0 && reserved_blocks < sms);
+  TVM_FFI_ICHECK(reserved_blocks >= 0 && reserved_blocks < sms);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
     using Element = std::conditional_t<std::is_same_v<c_type, nv_bfloat16>, cutlass::bfloat16_t,
                                        cutlass::half_t>;

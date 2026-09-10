@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 """CUTLASS matrix multiplication with caller-owned row visibility."""
 
+import logging
 from functools import cache
 from typing import Any, NamedTuple
 
@@ -12,8 +13,10 @@ from ..utils import get_compute_capability
 
 
 @cache
-def get_masked_gemm_module(*, ready_tma: bool = False):
-    return gen_masked_gemm_module(ready_tma=ready_tma).build_and_load()
+def get_masked_gemm_module(*, ready_tma: bool = False, math_registers: int = 0):
+    return gen_masked_gemm_module(
+        ready_tma=ready_tma, math_registers=math_registers
+    ).build_and_load()
 
 
 @cache
@@ -100,17 +103,35 @@ class ReadyGemmInfo(NamedTuple):
     occupancy: int
     row_tile: int
     workspace_bytes: int
+    concurrent_producer: bool
 
 
 @cache
-def ready_gemm_info(device: int, dtype: torch.dtype) -> ReadyGemmInfo:
-    module = get_masked_gemm_module(
-        ready_tma=get_compute_capability(torch.device("cuda", device))[0] == 12
+def ready_gemm_info(
+    device: int,
+    dtype: torch.dtype,
+    producer: tuple[int, int, int] | None = None,
+) -> ReadyGemmInfo:
+    ready_tma = get_compute_capability(torch.device("cuda", device))[0] == 12
+    module = get_masked_gemm_module(ready_tma=ready_tma)
+    args = (device, dtype == torch.bfloat16, *(producer or (0, 0, 0)))
+    sms, occupancy, row_tile, workspace_bytes, budget, concurrent = (
+        module.prepare_ready(*args)
     )
-    sms, occupancy, row_tile, workspace_bytes = module.prepare_ready(
-        device, dtype == torch.bfloat16
+    if ready_tma and budget:
+        module = get_masked_gemm_module(ready_tma=True, math_registers=budget)
+        sms, occupancy, row_tile, workspace_bytes, _, concurrent = module.prepare_ready(
+            *args
+        )
+        logging.getLogger(__name__).info(
+            "Ready TMA resource plan: producer=%s, math_registers=%d, shared_sm=%s",
+            producer,
+            budget,
+            bool(concurrent),
+        )
+    return ReadyGemmInfo(
+        module, sms, occupancy, row_tile, workspace_bytes, bool(concurrent)
     )
-    return ReadyGemmInfo(module, sms, occupancy, row_tile, workspace_bytes)
 
 
 def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -119,7 +140,9 @@ def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Te
     return torch.zeros(info.workspace_bytes, dtype=torch.uint8, device=device)
 
 
-def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, workspace):
+def mm_ready_rows(
+    x, weight, out, readiness, *, group_rows, reserved_blocks, workspace, producer=None
+):
     """Multiply once, consuming row groups published by a concurrent producer.
 
     Operands follow ``mm_masked_tiles``'s layout contract. The caller initializes
@@ -129,11 +152,14 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
     reserved for consumer completion; the last GEMM CTA resets the workspace.
     The caller joins both kernels before reusing any operand or workspace.
 
-    ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
-    grid leaves that many SMs available. Readiness waits cannot occupy the
-    producer's execution capacity. SM120 uses the native TMA pipeline with
+    ``producer`` gives its compiled registers/thread, shared bytes and threads.
+    SM120 budgets its native register allocation for that producer, then checks
+    both compiled allocations with CUDA's occupancy calculator. A fitting pair
+    shares SMs; otherwise ``reserved_blocks`` leaves producer SMs available.
+    Readiness waits cannot occupy the producer's execution capacity. SM120 uses
+    the native TMA pipeline with
     separate loading and compute warps. Other architectures use CUTLASS Stream-K.
-    This choice is realized once per device/dtype, before model capture.
+    The resource plan is cached per compiled producer before graph replay.
     ``workspace`` is allocated and zeroed once with ``create_ready_workspace``;
     Stream-K partials and barriers occupy fixed, disjoint regions across shapes.
     The TMA path needs zero scratch bytes. Execution adds no allocation or
@@ -151,7 +177,7 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
         or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
-    info = ready_gemm_info(x.device.index, x.dtype)
+    info = ready_gemm_info(x.device.index, x.dtype, producer)
     if (
         workspace.device != x.device
         or workspace.dtype != torch.uint8
@@ -162,7 +188,7 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
         or any(torch._C._overlaps(workspace, t) for t in (x, weight, out, readiness))
         or not 0 < reserved_blocks < info.sms
     ):
-        raise ValueError("Stream-K requires distinct workspace and producer capacity")
+        raise ValueError("Ready GEMM requires distinct workspace and producer capacity")
     if x.shape[0] and weight.shape[1]:
         info.module.run_ready(
             x,
@@ -173,6 +199,6 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks, wor
             group_rows,
             info.sms,
             info.occupancy,
-            reserved_blocks,
+            0 if info.concurrent_producer else reserved_blocks,
         )
     return out

@@ -15,6 +15,7 @@
 #ifndef FLASHINFER_GEMM_READY_TMA_GEMM_CUH_
 #define FLASHINFER_GEMM_READY_TMA_GEMM_CUH_
 
+#include <cuda_occupancy.h>
 #include <cutlass/device_kernel.h>
 
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -30,6 +31,17 @@ using ReadyTile = cutlass::gemm::GemmShape<128, 64, 64>;
 using TileShape = Shape<Int<ReadyTile::kM>, Int<ReadyTile::kN>, Int<ReadyTile::kK>>;
 using ClusterShape = Shape<_1, _1, _1>;
 using InputStride = Stride<int64_t, _1, int64_t>;
+using DefaultRegisterAllocation =
+    cutlass::gemm::kernel::detail::WarpSpecializedRegisterAllocationFor<
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2>, false>::type;
+
+struct ReadySchedule : cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2> {
+#if FLASHINFER_READY_MATH_REGISTERS
+  using RegisterAllocation =
+      cutlass::gemm::WarpSpecializedRegisterAllocation<DefaultRegisterAllocation::LoadRegisters,
+                                                       FLASHINFER_READY_MATH_REGISTERS>;
+#endif
+};
 
 template <typename Base>
 struct ReadyMainloop : Base {
@@ -86,9 +98,8 @@ struct ReadyGemm {
   // Compose the existing typed mainloop directly: the convenience builder's
   // F8/F6/F4 restriction is not a restriction of its TMA pipeline or epilogue.
   using Mainloop = cutlass::gemm::collective::CollectiveMma<
-      cutlass::gemm::MainloopSm120TmaWarpSpecialized<
-          3, 2, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2>>,
-      TileShape, Element, InputStride, Element, InputStride, TiledMma, SM90_TMA_LOAD,
+      cutlass::gemm::MainloopSm120TmaWarpSpecialized<3, 2, ClusterShape, ReadySchedule>, TileShape,
+      Element, InputStride, Element, InputStride, TiledMma, SM90_TMA_LOAD,
       UMMA::Layout_K_SW128_Atom<Element>, Copy_Atom<SM75_U32x4_LDSM_N, Element>, identity,
       SM90_TMA_LOAD, UMMA::Layout_K_SW128_Atom<Element>, Copy_Atom<SM75_U32x4_LDSM_N, Element>,
       identity>;
@@ -122,6 +133,64 @@ cudaError_t PrepareReady(int* occupancy) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(occupancy, cutlass::device_kernel<Kernel>,
                                                        Kernel::MaxThreadsPerBlock,
                                                        Kernel::SharedStorageSize);
+}
+
+template <typename Element>
+cudaError_t PlanReady(cudaDeviceProp const& device, int producer_registers, size_t producer_shared,
+                      int producer_threads, int* math_registers, bool* concurrent) {
+  using Kernel = ReadyKernel<Element>;
+  cudaFuncAttributes consumer;
+  auto status = cudaFuncGetAttributes(&consumer, cutlass::device_kernel<Kernel>);
+  if (status != cudaSuccess) return status;
+  cudaOccDeviceProp hardware(device);
+  cudaOccDeviceState state;
+  state.carveoutConfig = SHAREDMEM_CARVEOUT_MAX_SHARED;
+  cudaOccFuncAttributes consumer_attributes(consumer);
+  cudaOccFuncAttributes producer_attributes;
+  producer_attributes.maxThreadsPerBlock = device.maxThreadsPerBlock;
+  producer_attributes.numRegs = producer_registers;
+  producer_attributes.shmemLimitConfig = FUNC_SHMEM_LIMIT_OPTIN;
+  producer_attributes.maxDynamicSharedSizeBytes = producer_shared;
+  producer_attributes.numBlockBarriers = 1;
+  cudaOccResult consumer_occupancy, producer_occupancy;
+  int granularity, partitions;
+  if (cudaOccRegAllocationGranularity(&granularity, &hardware) != CUDA_OCC_SUCCESS ||
+      cudaOccSubPartitionsPerMultiprocessor(&partitions, &hardware) != CUDA_OCC_SUCCESS ||
+      cudaOccMaxActiveBlocksPerMultiprocessor(&consumer_occupancy, &hardware, &consumer_attributes,
+                                              &state, Kernel::MaxThreadsPerBlock,
+                                              Kernel::SharedStorageSize) != CUDA_OCC_SUCCESS ||
+      cudaOccMaxActiveBlocksPerMultiprocessor(&producer_occupancy, &hardware, &producer_attributes,
+                                              &state, producer_threads,
+                                              producer_shared) != CUDA_OCC_SUCCESS) {
+    return cudaErrorInvalidValue;
+  }
+  const int producer_warps = __occDivideRoundUp(producer_threads, device.warpSize);
+  const int consumer_warps = Kernel::MaxThreadsPerBlock / device.warpSize;
+  const int producer_regs = producer_occupancy.allocatedRegistersPerBlock / producer_warps *
+                            __occRoundUp(producer_warps, partitions);
+  const int consumer_regs = consumer_occupancy.allocatedRegistersPerBlock;
+  const int uniform_registers = (device.regsPerMultiprocessor - producer_regs) / consumer_warps /
+                                granularity * granularity / device.warpSize;
+  constexpr int consumer_threads = Kernel::MaxThreadsPerBlock;
+  constexpr int load_threads = Kernel::NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  constexpr int math_threads = consumer_threads - load_threads;
+  const int budget =
+      (uniform_registers * consumer_threads - int(Kernel::LoadRegisterRequirement) * load_threads) /
+      math_threads;
+  // setmaxnreg encodes registers in multiples of eight. This is a resource
+  // bound from the paired producer, independent of GEMM timing or tile search.
+  *math_registers =
+      budget >= 24 ? std::min(DefaultRegisterAllocation::MathRegisters, budget / 8 * 8) : 0;
+  *concurrent = consumer_occupancy.activeBlocksPerMultiprocessor > 0 &&
+                producer_occupancy.activeBlocksPerMultiprocessor > 0 &&
+                consumer_regs + producer_regs <= device.regsPerMultiprocessor &&
+                consumer_occupancy.allocatedSharedMemPerBlock +
+                        producer_occupancy.allocatedSharedMemPerBlock <=
+                    device.sharedMemPerMultiprocessor &&
+                (consumer_warps + __occRoundUp(producer_warps, partitions)) * device.warpSize <=
+                    device.maxThreadsPerMultiProcessor &&
+                consumer_occupancy.blockLimitBlocks >= 2;
+  return cudaSuccess;
 }
 
 template <typename Element>
