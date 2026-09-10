@@ -97,7 +97,9 @@ constexpr bool kA16CopyFastPath =
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
-CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {4, 1, 2};
+constexpr bool splitD256DecodeCTA =
+    compactMixedPages && !SPEC_DEC && headElems == 256 && headGrpSize * beamWidth <= 8;
+CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {splitD256DecodeCTA ? 2U : 4U, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
 constexpr uint32_t nbWarpsPerCta = ctaShapeInWarps.x * ctaShapeInWarps.y * ctaShapeInWarps.z;
@@ -186,7 +188,10 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #error "perferedKHeadPartBytes not defined"
 #endif
 #endif
-constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
+// Two independent D256 CTAs retain both pipelines within the SM's shared budget:
+// 16 KiB K + 16 KiB V + 4 KiB Q + 4 KiB X, before scales and barriers.
+constexpr uint32_t kHeadPartBytes =
+    mha::min(splitD256DecodeCTA ? 64U : preferedKHeadPartBytes, paddedCacheHeadBytes);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210) && \
     CACHE_ELEM_ENUM == 5
 #define MIXED_COMPACT_TILE_LOOPS 1
@@ -3661,7 +3666,7 @@ constexpr uint32_t nbCtaPerSM = 1;
 #if __CUDA_ARCH__ == 900
 constexpr uint32_t nbCtaPerSM = 2;
 #else
-constexpr uint32_t nbCtaPerSM = 1;
+constexpr uint32_t nbCtaPerSM = splitD256DecodeCTA ? 2 : 1;
 #endif
 #endif
 

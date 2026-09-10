@@ -126,3 +126,13 @@ program turns, zero public exchange failures, MSE 0.10956 and SSIM 0.61863.
 All 111 decoder and 25 encoder graphs captured. Maximum completed SVG prompt
 length is 3,706; the direct >4K end-to-end compression objective remains open.
 The vLLM TP2 execution review records the retained trace and moment artifacts.
+
+The next SM12x D256 decode lowering divides the eight-warp CTA into two
+independent four-warp CTAs. Each keeps two K and V pipeline buffers and owns
+two existing V head slices per PV warp. A 64-byte K part makes the main shared
+arrays 16 KiB K, 16 KiB V, 4 KiB Q and 4 KiB X, leaving space for scales and
+barriers while allowing two CTAs in the SM's shared-memory budget. Launch
+geometry and split-KV planning read the compiled geometry exports. The layer
+shape selects this lowering at compilation; D512 and continuation retain
+their existing plans. Smaller K transfers increase the number of copy rounds,
+so the overlap benefit and register footprint require full-model measurement.
