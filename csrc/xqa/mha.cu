@@ -188,10 +188,11 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #error "perferedKHeadPartBytes not defined"
 #endif
 #endif
-// Two independent D256 CTAs retain both pipelines within the SM's shared budget:
-// 16 KiB K + 16 KiB V + 4 KiB Q + 4 KiB X, before scales and barriers.
 constexpr uint32_t kHeadPartBytes =
-    mha::min(splitD256DecodeCTA ? 64U : preferedKHeadPartBytes, paddedCacheHeadBytes);
+    mha::min(compactMixedPages ? 128U : preferedKHeadPartBytes, paddedCacheHeadBytes);
+// Only compressed K operands use shared staging. A16 pages load their MMA
+// fragments directly, so a 128-byte logical part needs at most 64 shared bytes.
+constexpr uint32_t kSharedPartBytes = kHeadPartBytes / (compactMixedPages ? 2U : 1U);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210) && \
     CACHE_ELEM_ENUM == 5
 #define MIXED_COMPACT_TILE_LOOPS 1
@@ -453,7 +454,7 @@ static_assert(ctaShapeInWarps.y == 1);
 struct alignas(128) SharedMem {
   static constexpr uint32_t qRows = MIXED_COMPACT_Q_ROWS ? 8 : warpTile.y;
   using QSmemBuffer = Array2D<LdGrain, qRows, exactDiv(qHeadPartBytes, grainBytes)>;
-  using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kHeadPartBytes, grainBytes)>;
+  using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kSharedPartBytes, grainBytes)>;
   using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
   using VSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
                               exactDiv(grpLoadV ? headElems : warpVHeadElems, cacheElemsPerGrain)>;
@@ -494,7 +495,11 @@ struct alignas(128) SharedMem {
                                          ? gemm1WarpsPerGrp
                                          : 1U),
                             2 * grainBytes));
+#if ENABLE_MIXED_COMPACT_PAGES
+  MixedPageReferences<nbPagesPerWarpTile> kPages[ctaShapeInWarps.x][nbKBuffers];
+#else
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
+#endif
   MixedPageFormats<nbPagesPerVTile> vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
@@ -2236,7 +2241,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE
       const auto pageReferences =
           broadcastMixedPageReferences<nbPagesPerWarpTile>(pageReferenceLane);
-#if !MIXED_HOISTED_COPY
+#if !MIXED_HOISTED_COPY && !ENABLE_MIXED_COMPACT_PAGES
       const auto pageFormats = pageReferences.formats();
 #endif
 #endif
@@ -2309,6 +2314,16 @@ CUBIN_EXPORT __global__
                                                                    idxPart, nbHeadsAvail);
 #endif
 #else
+#if ENABLE_MIXED_COMPACT_PAGES
+      if (laneId() == 0) {
+        smem.kPages[warpIdx.x][idxNextSMemKBuf] = pageReferences;
+      }
+      uint32_t const nbHeadsAvail =
+          seqOffset < cacheSeqLen ? mha::min(cacheSeqLen - seqOffset, warpTile.x) : 0U;
+      copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false, true>(
+          dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset, cacheList.transport,
+          pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip, nbHeadsAvail);
+#else
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // The mixed copy/expand helpers take no token offset: the warp tile's origin
       // is page-aligned, so a block's page is a compile-time index (C2).
@@ -2355,6 +2370,7 @@ CUBIN_EXPORT __global__
 #endif
         );
       }
+#endif  // ENABLE_MIXED_COMPACT_PAGES
 #endif  // MIXED_HOISTED_COPY
 #else
       if (isFullTile) {
@@ -2480,7 +2496,7 @@ CUBIN_EXPORT __global__
           constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
           uint32_t const smemQOffset = qOffsetPerPart * p;
           SharedMem::KSmemBuffer& smemKPart = getSMemKTile(idxCurrSMemKBuf);
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_KV_CACHE && !ENABLE_MIXED_COMPACT_PAGES
           if constexpr (!compactMixedPages) {
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
             // [45c] static modules: the build constant (fp8 / fp4: every part is expanded; a16:
@@ -2534,8 +2550,10 @@ CUBIN_EXPORT __global__
           // do computation.
 #if ENABLE_MIXED_COMPACT_PAGES
           if constexpr (compactMixedPages) {
+            uint32_t const tokenBase = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
             smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
-                                smem.kFormats[warpIdx.x][idxCurrSMemKBuf],
+                                smem.kPages[warpIdx.x][idxCurrSMemKBuf], cacheList.transport,
+                                idxHeadGrp, tokenBase, nbTotalSkipTokens, cacheSeqLen,
                                 &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p, fp8KGlobalScale,
                                 fp4KGlobalScale);
           } else

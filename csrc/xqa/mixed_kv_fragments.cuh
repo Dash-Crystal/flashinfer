@@ -29,16 +29,27 @@ __device__ inline void visit(uint8_t format, Function const& function) {
 template <KVPageFormat format>
 __device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint32_t row,
                                         uint32_t block, uint32_t part, uint8_t const* scales,
-                                        float globalScale) {
+                                        float globalScale, flashinfer::KVPageFormatSpan const& page,
+                                        uint32_t head, uint32_t tokenBase, uint32_t skipTokens,
+                                        uint32_t cacheSeqLen) {
   if constexpr (format == KVPageFormat::kA16) {
     InstInMat<2, 2> result;
     uint32_t const quad = laneId() & 3U;
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
       uint32_t const token = row + n * 8 + laneId() / 4;
-      uint32_t const address =
-          smemAddr(&tile.template at<true>(token, block * 2 + quad / 2)) + (quad % 2) * 8;
-      ldsB64(address, result.data[n][0], result.data[n][1]);
+      uint32_t const absoluteToken = tokenBase + token;
+      uint32_t const column = part * kHeadPartBytes + block * 32 + quad * 8;
+      uint64_t bits = 0;
+      if (page.allocated && absoluteToken >= skipTokens && absoluteToken < cacheSeqLen &&
+          column + 8 <= validElemsPerHead * sizeof(InputElem)) {
+        auto const* address = static_cast<uint8_t const*>(page.k_payload) +
+                              uint64_t(token % tokensPerPage) * page.payload_stride.token +
+                              uint64_t(head) * page.payload_stride.head + column;
+        bits = __ldg(reinterpret_cast<uint64_t const*>(address));
+      }
+      result.data[n][0] = uint32_t(bits);
+      result.data[n][1] = uint32_t(bits >> 32);
     }
     return result;
   } else {
@@ -130,24 +141,32 @@ __device__ inline InstInMat<2, 2> loadV(SharedMem::VSmemBuffer const& tile, uint
 
 }  // namespace mixed_kv_fragments
 
-__device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
-                                           SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
-                                           SharedMem::KSmemBuffer const& k,
-                                           MixedPageFormats<nbPagesPerWarpTile> const& formats,
-                                           uint8_t const* scales, uint32_t part,
-                                           float fp8GlobalScale, float fp4GlobalScale) {
+__device__ inline void smemQKPartGemmMixed(
+    Warp const& warp, WarpAcc& acc, SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
+    SharedMem::KSmemBuffer const& k, MixedPageReferences<nbPagesPerWarpTile> const& pages,
+    PageTransport const& transport, uint32_t head, uint32_t tokenBase, uint32_t skipTokens,
+    uint32_t cacheSeqLen, uint8_t const* scales, uint32_t part, float fp8GlobalScale,
+    float fp4GlobalScale) {
   constexpr uint32_t rows = warpTile.y / 16;
   // Static accumulator indices, with a single format dispatch outside the rolled
   // reduction loop. The old block/page unrolling replicated every converter.
 #pragma unroll
   for (uint32_t tile = 0; tile < warpTile.x / 16; ++tile) {
-    mixed_kv_fragments::visit(formats.values[tile * 16 / tokensPerPage], [&](auto tag) {
+    flashinfer::KVPageAddress const address{pages.values[tile * 16 / tokensPerPage]};
+    uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
+    mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
       constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
+      flashinfer::KVPageFormatSpan page;
+      if constexpr (format == flashinfer::KVPageFormat::kA16) {
+        page = transport.span(address, static_cast<uint8_t>(format));
+      }
       float const scale =
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
 #pragma unroll 1
       for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
-        auto const b = mixed_kv_fragments::loadK<format>(k, tile * 16, block, part, scales, scale);
+        auto const b =
+            mixed_kv_fragments::loadK<format>(k, tile * 16, block, part, scales, scale, page, head,
+                                              tokenBase, skipTokens, cacheSeqLen);
         auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
 #pragma unroll
         for (uint32_t i = 0; i < rows; ++i) {

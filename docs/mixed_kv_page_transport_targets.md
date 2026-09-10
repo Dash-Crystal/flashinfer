@@ -127,7 +127,7 @@ All 111 decoder and 25 encoder graphs captured. Maximum completed SVG prompt
 length is 3,706; the direct >4K end-to-end compression objective remains open.
 The vLLM TP2 execution review records the retained trace and moment artifacts.
 
-The next SM12x D256 decode lowering divides the eight-warp CTA into two
+The V66 SM12x D256 decode lowering divides the eight-warp CTA into two
 independent four-warp CTAs. Each keeps two K and V pipeline buffers and owns
 two existing V head slices per PV warp. A 64-byte K part makes the main shared
 arrays 16 KiB K, 16 KiB V, 4 KiB Q and 4 KiB X, leaving space for scales and
@@ -136,3 +136,22 @@ geometry and split-KV planning read the compiled geometry exports. The layer
 shape selects this lowering at compilation; D512 and continuation retain
 their existing plans. Smaller K transfers increase the number of copy rounds,
 so the overlap benefit and register footprint require full-model measurement.
+
+V66's full-model trace measures 43,392 shared bytes, 208 registers and zero
+local bytes for D256. Its padded80 decode span is 26.069 ms; D256 attention
+accounts for 8.075 ms and D512 for 3.140 ms. The late padded88 cohort takes
+31.425 ms at 85.57 useful rows and 216,077 causal pairs, compared with V64's
+30.706 ms at 86.40 rows and 224,480 pairs. Extra occupancy alone has not
+established a latency gain. The resident census records 90,848 pages per rank,
+9.070 bits/value on rank zero, and no allocation failures or duplicate addresses.
+
+The following implementation separates K's logical copy extent from its
+physical shared row. SM12x uses 128 logical A16 bytes per part with 64 shared
+bytes for packed FP8/FP4. A16 pages load coalesced 64-bit MMA register fragments
+directly from their authoritative page address. The K ring retains that address,
+including its format, instead of another format-only record. Logical bounds and
+masked tails remain explicit. D256 retains its smaller CTA allocation without
+doubling copy rounds; D512 and continuation also use wider logical parts.
+V's existing packed matrix loads and double buffering are unchanged. Full-model
+compilation, output metrics and latency measurements remain pending for this
+layout; the V66 results do not measure it.

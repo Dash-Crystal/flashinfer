@@ -319,19 +319,17 @@ __device__ inline uint32_t mixedVFragmentRow(uint32_t token) {
   return (token & ~15U) | ((token & 6U) << 1) | ((token & 8U) >> 2) | (token & 1U);
 }
 
-// Preserve copyPartialHeadsAsync's warp ownership and circular-buffer
-// schedule. Each lane owns one 16-value block. Compressed payload occupies
-// the first A16 grain; its single scale byte is staged in the second grain.
+// Logical coefficient extent and physical staging width are separate. Narrow
+// K staging bypasses A16 payload copies; that consumer loads A16 registers.
 template <uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle, bool isFull,
           bool compactPages = false, uint32_t nbWarps = 1, uint32_t dstNbHeads, uint32_t nbPages,
-          typename _LdGrain>
+          typename _LdGrain, uint32_t dstRowGrains>
 __device__ inline void copyMixedPartialHeadsAsync(
-    Array2D<_LdGrain, dstNbHeads,
-            exactDiv(exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead), grainBytes)>& dst,
-    uint8_t* dstScales, uint32_t dstHeadOffset, PageTransport const& transport,
-    MixedPageReferences<nbPages> const& references, uint32_t sourceHeadOffset, uint32_t headIdx,
-    bool isK, uint32_t idxPart, uint32_t nbSkipHeads, uint32_t nbAvailHeads = maxNbCopiedHeads,
-    uint32_t idxWarp = 0, uint8_t* probeScratch = nullptr) {
+    Array2D<_LdGrain, dstNbHeads, dstRowGrains>& dst, uint8_t* dstScales, uint32_t dstHeadOffset,
+    PageTransport const& transport, MixedPageReferences<nbPages> const& references,
+    uint32_t sourceHeadOffset, uint32_t headIdx, bool isK, uint32_t idxPart, uint32_t nbSkipHeads,
+    uint32_t nbAvailHeads = maxNbCopiedHeads, uint32_t idxWarp = 0,
+    uint8_t* probeScratch = nullptr) {
   // The source origin is span-aligned, so headsPerSpan heads lie in one page:
   // pages[] / formats[] are read once per
   // span (a compare/select chain over the register vector, no local memory).
@@ -339,6 +337,8 @@ __device__ inline void copyMixedPartialHeadsAsync(
   constexpr uint32_t partBytes = exactDiv(sizeof(PaddedCacheHead), nbPartsPerHead);
   constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytes);
   constexpr uint32_t blocksPerPart = exactDiv(grainsPerPart, 2);
+  constexpr bool narrowStaging = dstRowGrains < grainsPerPart;
+  static_assert(dstRowGrains == grainsPerPart || (compactPages && dstRowGrains == blocksPerPart));
   constexpr uint32_t nbThreads = nbWarps * warp_size;
   constexpr uint32_t headsPerSpan = mha::min(tokensPerPage, maxNbCopiedHeads);
   static_assert(maxNbCopiedHeads % headsPerSpan == 0 && tokensPerPage % headsPerSpan == 0);
@@ -361,6 +361,7 @@ __device__ inline void copyMixedPartialHeadsAsync(
     constexpr bool isFP8 = format == fp8Format;
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
+    if constexpr (isA16 && narrowStaging) return;
     auto const fmt = transport.span(address, format);
     auto const* payload = static_cast<uint8_t const*>(isK ? fmt.k_payload : fmt.v_payload);
     bool const pageValid = fmt.allocated;
@@ -392,15 +393,12 @@ __device__ inline void copyMixedPartialHeadsAsync(
       if constexpr (compactPages) {
         uint32_t const row =
             isK ? dstHeadOffset + localHead : mixedVFragmentRow(dstHeadOffset + localHead);
-        if constexpr (isA16) {
+        if constexpr (isA16 && !narrowStaging) {
           auto* first = &dst.template at<swizzle>(row, blockInPart * 2);
           auto* second = &dst.template at<swizzle>(row, blockInPart * 2 + 1);
           ldgsts::copyAsync<grainBytes>(first, firstSource, valid ? grainBytes : 0U);
           ldgsts::copyAsync<grainBytes>(second, firstSource + grainBytes, valid ? grainBytes : 0U);
-        } else {
-          // Retain the native tile row stride and place the compressed block in
-          // the low half of that row.  This preserves ldmatrix-compatible row
-          // addressing while keeping each page in a fixed-size slot.
+        } else if constexpr (!isA16) {
           auto* packed = &dst.template at<swizzle>(row, blockInPart);
           if constexpr (isFP4) {
             ldgsts::copyAsync<8>(packed, firstSource, valid ? 8U : 0U);
