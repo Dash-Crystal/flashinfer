@@ -157,7 +157,7 @@ Fully-unrolled containers of fragments indexed by a runtime page format
 per-iteration format switch) are not a compile-time shape any reference uses; they
 produce the multi-hour `ptxas` runs observed on sm90 and are prohibited.
 
-## 6. Quantization / page sealing (producer side) — complete
+## 6. Quantization / page sealing (producer side)
 
 The routing filters — single-pass, linear-time, non-recurrent page statistics that
 separate high-outlier-loss pages (image and poorly-normalized multimodal embeddings)
@@ -170,9 +170,20 @@ and validated:
   `routing_thresholds`, `page_router_stats`, `page_router_partials`
 - Exactness and graph-replay tests pass on sm90 and sm120.
 
-This stage is finished and is not to be reopened by transport-side work. The only
-interface it exposes to the consumer is `page_format` (one byte per page) and the
-payload/scale tensors described in `include/flashinfer/attention/page_transport.cuh`.
+The packed arena producer now composes routing, reduction, and allocation in one
+page CTA. Its parallel row quantizers retain the same nine-candidate block-scale
+codec. A device-scope acquire/release completion counter lets the last row tile
+publish the address and release the A16 source, without a separate publication
+launch or waiting for other CTAs. The first kernel resets each active counter;
+stream order separates routing from quantization. The consumer still receives
+one committed format-tagged address per page.
+
+`mixed_kv_route_moments` supplies the same neighbor-cosine and peak/RMS formulas
+to rectangular and arena producers. Page-wide reduction changes FP32 association;
+it does not change the routing thresholds or scale-search objective. The arena
+workspace holds one row-completion integer per event instead of per-row routing
+partials. Kernel/resource and serving-response measurements must accompany
+performance claims for this lowering.
 
 ## 7. Measurement discipline
 
