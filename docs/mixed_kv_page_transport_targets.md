@@ -141,8 +141,9 @@ V66's full-model trace measures 43,392 shared bytes, 208 registers and zero
 local bytes for D256. Its padded80 decode span is 26.069 ms; D256 attention
 accounts for 8.075 ms and D512 for 3.140 ms. The late padded88 cohort takes
 31.425 ms at 85.57 useful rows and 216,077 causal pairs, compared with V64's
-30.706 ms at 86.40 rows and 224,480 pairs. Extra occupancy alone has not
-established a latency gain. The resident census records 90,848 pages per rank,
+30.706 ms at 86.40 rows and 224,480 pairs. Independent CTA progress has not
+established a latency gain. Two four-warp CTAs still supply eight resident warps,
+the same as the previous eight-warp CTA. The census records 90,848 pages per rank,
 9.070 bits/value on rank zero, and no allocation failures or duplicate addresses.
 
 The following implementation separates K's logical copy extent from its
@@ -155,3 +156,21 @@ doubling copy rounds; D512 and continuation also use wider logical parts.
 V's existing packed matrix loads and double buffering are unchanged. Full-model
 compilation, output metrics and latency measurements remain pending for this
 layout; the V66 results do not measure it.
+
+V68 full-model warmup exposed a device compilation error from binding `mha::min`
+to a host constexpr geometry member. The value-based comparison correction is
+running in V69. Its loaded decode binaries use 208/217 registers for D256/D512
+and zero local bytes; the query-span binaries use 168/223 registers without
+local bytes. Binary receipts are copied while the server runs, because the
+shared JIT directory is rebuilt when the previous serving source is restored.
+
+The following D256 ownership change preserves the 128-token CTA extent and
+128-byte logical K parts, distributing each pipeline over four 32-token warps
+instead of two 64-token warps. The main shared arrays remain 40 KiB. Two such
+CTAs supply sixteen resident warps if the compiler meets the 128-register budget.
+Each PV warp owns 64 output coefficients rather than 128, and each QK warp
+owns half as many token accumulators and page references. This increases the
+available warp concurrency rather than only the CTA count. Page-relative K
+offsets also cover warp tiles smaller than a page; pages wider than the smaller
+CTA retain the wider CTA geometry. Compilation, spill placement and full-model
+performance still need measurement; V69 does not include this ownership change.

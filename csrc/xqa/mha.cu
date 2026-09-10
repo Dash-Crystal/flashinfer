@@ -97,9 +97,9 @@ constexpr bool kA16CopyFastPath =
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
-constexpr bool splitD256DecodeCTA =
-    compactMixedPages && !SPEC_DEC && headElems == 256 && headGrpSize * beamWidth <= 8;
-CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {splitD256DecodeCTA ? 2U : 4U, 1, 2};
+constexpr bool splitD256DecodeCTA = compactMixedPages && !SPEC_DEC && headElems == 256 &&
+                                    headGrpSize * beamWidth <= 8 && tokensPerPage <= 128;
+CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {4, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
 constexpr uint32_t nbWarpsPerCta = ctaShapeInWarps.x * ctaShapeInWarps.y * ctaShapeInWarps.z;
@@ -112,7 +112,9 @@ static_assert(nbValidRows <= 32u);
 #else
 constexpr uint32_t nbValidRows = headGrpSize * beamWidth;
 #endif
-constexpr uint2 warpTile = {64, roundUp(nbValidRows, 16U)};
+// Keep the D256 CTA's 128-token extent while distributing each pipeline over
+// four warps. Two resident CTAs can then supply sixteen warps rather than eight.
+constexpr uint2 warpTile = {splitD256DecodeCTA ? 32U : 64U, roundUp(nbValidRows, 16U)};
 static_assert(nbValidRows <= warpTile.y);
 
 // For headElems > warpTile.x * ctaShapeInWarps.x (i.e. 512), each gemm1 warp owns
@@ -2322,7 +2324,7 @@ CUBIN_EXPORT __global__
       uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
       copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false, true>(
           dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset, cacheList.transport,
-          pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip, nbHeadsAvail);
+          pageReferences, tokenOffset, idxHeadGrp, true, idxPart, nbHeadsSkip, nbHeadsAvail);
 #else
       bool const needsExpansion = needsMixedPageExpansion(pageFormats);
       // The mixed copy/expand helpers take no token offset: the warp tile's origin

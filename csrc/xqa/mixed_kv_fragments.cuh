@@ -44,7 +44,7 @@ __device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint
       if (page.allocated && absoluteToken >= skipTokens && absoluteToken < cacheSeqLen &&
           column + 8 <= validElemsPerHead * sizeof(InputElem)) {
         auto const* address = static_cast<uint8_t const*>(page.k_payload) +
-                              uint64_t(token % tokensPerPage) * page.payload_stride.token +
+                              uint64_t(absoluteToken % tokensPerPage) * page.payload_stride.token +
                               uint64_t(head) * page.payload_stride.head + column;
         bits = __ldg(reinterpret_cast<uint64_t const*>(address));
       }
