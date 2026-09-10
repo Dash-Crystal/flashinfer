@@ -136,6 +136,14 @@ using ReadyTile = cutlass::gemm::GemmShape<64, 64, 64>;
 struct ReadySwizzle : Swizzle {
   cutlass::gemm::GemmCoord tile;
   CUTLASS_DEVICE cutlass::gemm::GemmCoord get_tile_offset(int) const { return tile; }
+
+  CUTLASS_DEVICE void visit(int index, int rows, int columns, int panel_columns) {
+    const int panel = index / (rows * panel_columns);
+    const int first_column = panel * panel_columns;
+    const int width = min(panel_columns, columns - first_column);
+    const int within_panel = index - panel * rows * panel_columns;
+    tile = {within_panel / width, first_column + within_panel % width, 0};
+  }
 };
 
 template <typename Element>
@@ -150,27 +158,27 @@ using ReadyGemm =
 // device-release increments, and joins both kernels before reusing this workspace.
 template <typename Element>
 __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGemm(
-    typename ReadyGemm<Element>::Params params, int* readiness, int group_rows, int done_index) {
+    typename ReadyGemm<Element>::Params params, int* readiness, int group_rows, int done_index,
+    int panel_columns) {
   extern __shared__ char storage[];
   auto& shared = *reinterpret_cast<typename ReadyGemm<Element>::SharedStorage*>(storage);
   ReadySwizzle schedule;
-  for (int n = blockIdx.x; n < params.grid_tiled_shape.n(); n += gridDim.x) {
-    // Finish the M tiles while this CTA's K x N weight tile can remain in L2.
-    for (int m = 0; m < params.grid_tiled_shape.m(); ++m) {
-      const int begin = m * ReadyTile::kM;
-      const int end = min(begin + ReadyTile::kM, params.problem_size.m());
-      if (threadIdx.x == 0) {
-        for (int group = begin / group_rows; group <= (end - 1) / group_rows; ++group) {
-          const int expected = min(group_rows, params.problem_size.m() - group * group_rows);
-          cuda::atomic_ref<int, cuda::thread_scope_device> ready(readiness[group]);
-          while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
-        }
+  const int row_tiles = params.grid_tiled_shape.m();
+  const int column_tiles = params.grid_tiled_shape.n();
+  for (int index = blockIdx.x; index < row_tiles * column_tiles; index += gridDim.x) {
+    schedule.visit(index, row_tiles, column_tiles, panel_columns);
+    const int begin = schedule.tile.m() * ReadyTile::kM;
+    const int end = min(begin + ReadyTile::kM, params.problem_size.m());
+    if (threadIdx.x == 0) {
+      for (int group = begin / group_rows; group <= (end - 1) / group_rows; ++group) {
+        const int expected = min(group_rows, params.problem_size.m() - group * group_rows);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ready(readiness[group]);
+        while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
       }
-      __syncthreads();
-      schedule.tile = {m, n, 0};
-      ReadyGemm<Element>().run_with_swizzle(params, shared, schedule);
-      __syncthreads();
     }
+    __syncthreads();
+    ReadyGemm<Element>().run_with_swizzle(params, shared, schedule);
+    __syncthreads();
   }
   if (threadIdx.x == 0) {
     cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
@@ -189,7 +197,7 @@ cudaError_t PrepareReady() {
 template <typename Element>
 cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
                      int ldd, int* readiness, int group_rows, int done_index, int blocks,
-                     cudaStream_t stream) {
+                     int panel_columns, cudaStream_t stream) {
   using Kernel = ReadyGemm<Element>;
   typename Kernel::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
                                   {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),
@@ -197,7 +205,7 @@ cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, 
   typename Kernel::Params params(args, blocks, 1);
   ReadyRowsGemm<Element>
       <<<blocks, Kernel::kThreadCount, sizeof(typename Kernel::SharedStorage), stream>>>(
-          params, readiness, group_rows, done_index);
+          params, readiness, group_rows, done_index, panel_columns);
   return cudaGetLastError();
 }
 

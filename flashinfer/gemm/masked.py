@@ -93,12 +93,12 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
 
 
 @cache
-def _prepared_ready_module(device, dtype, k, n, reserved_blocks):
+def _prepared_ready_module(device, dtype, m, k, n, reserved_blocks):
     module = get_masked_gemm_module()
-    blocks = module.prepare_ready(
-        device, dtype == torch.bfloat16, k, n, reserved_blocks
+    blocks, panel_columns = module.prepare_ready(
+        device, dtype == torch.bfloat16, m, k, n, reserved_blocks
     )
-    return module, blocks
+    return module, blocks, panel_columns
 
 
 def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
@@ -113,7 +113,9 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
 
     ``reserved_blocks`` is the producer's maximum resident CTA count. The GEMM
     grid leaves that many SMs available, so readiness waits cannot occupy the
-    producer's execution capacity. Shape and device preparation are cached;
+    producer's execution capacity. Row tiles share weight panels sized from L2;
+    compact projections distribute their rows across CTAs as well as columns.
+    Shape and device preparation are cached;
     execution introduces no allocation or reset kernel.
     """
     _validate_mm_operands(x, weight, out)
@@ -129,8 +131,13 @@ def mm_ready_rows(x, weight, out, readiness, *, group_rows, reserved_blocks):
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
     if x.shape[0] and weight.shape[1]:
-        module, blocks = _prepared_ready_module(
-            x.device.index, x.dtype, x.shape[1], weight.shape[1], reserved_blocks
+        module, blocks, panel_columns = _prepared_ready_module(
+            x.device.index,
+            x.dtype,
+            x.shape[0],
+            x.shape[1],
+            weight.shape[1],
+            reserved_blocks,
         )
-        module.run_ready(x, weight, out, readiness, group_rows, blocks)
+        module.run_ready(x, weight, out, readiness, group_rows, blocks, panel_columns)
     return out
