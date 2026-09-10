@@ -99,10 +99,11 @@ per-warp scale-row gaps. Full-model graph execution, task outputs, latency, and
 compiled register/local-memory use are the validation surface. The first
 register-consumer full-model trace retained 673 kernels per decode execution,
 with no local-memory spills (D256: 148 registers; D512: 217). Its early
-short-context graph span remained about 33 ms. That revision still used narrow
-K gathers; the native K matrix-load followup requires a separate full-model
-measurement. Other architecture paths still
-require equivalent removal of shared expansion.
+short-context graph span remained about 33 ms. The native K matrix-load followup
+ran in V63: D256/D512 use 149/217 registers and zero local bytes. Its captured
+padded152 decode graph averages 33.539 ms across 42 executions. This is a
+different work coordinate from V62, not a matched speedup measurement. Other
+architecture paths still require equivalent removal of shared expansion.
 
 The completed-page producer also distributes the original 16-lane codec across
 32 warps per page, reducing the serialized codec iterations eightfold for
@@ -110,5 +111,18 @@ Gemma's 32768-value pages. Routing reuses one coefficient read for the adjacent
 token moments and block signature, and reduces the four moments together.
 Thresholds, nine-candidate scale selection, and encoded formats are unchanged.
 The rectangular producer uses the same flattened K/V signature indexing as the
-arena, including head widths divisible by 16 but not 32. This followup needs
-full-model latency, output, and page-distribution measurements.
+arena, including head widths divisible by 16 but not 32. V64's delayed
+full-model padded96 decode trace averages 26.930 ms across 61 executions.
+Summed sealing time is 3.982 ms per forward; its intervals without another
+kernel name active in the same execution total 0.018 ms. Sealing uses 62
+registers with zero local bytes. V61's earlier padded144 trace recorded
+22.121 ms summed sealing and 2.371 ms exclusive intervals. Those different
+work coordinates demonstrate the overlap mechanism, not a causal speedup.
+
+V64 retained 86,024 pages per rank at 9.001/8.951 bits per value including
+scales and A16 tails, with zero allocation failures and duplicate addresses.
+The canonical persistent SVG/video mixture reports 185 SVG turns, 62 invalid
+program turns, zero public exchange failures, MSE 0.10956 and SSIM 0.61863.
+All 111 decoder and 25 encoder graphs captured. Maximum completed SVG prompt
+length is 3,706; the direct >4K end-to-end compression objective remains open.
+The vLLM TP2 execution review records the retained trace and moment artifacts.
