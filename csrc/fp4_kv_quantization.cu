@@ -1026,7 +1026,7 @@ __device__ __forceinline__ void mixed_kv_completed_rows(int page_size,
   }
 }
 
-template <typename InType, bool PACKED_SIGNATURE, int THREADS = 128>
+template <typename InType, bool PACKED_SIGNATURE, int THREADS>
 __global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
                                             flashinfer::KVPageArena arena, const int32_t* completed,
                                             const int32_t* completed_count, const int32_t* classes,
@@ -1356,10 +1356,12 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
     if (capacity) {
       const dim3 rows(capacity, k.size(1));
       DISPATCH_BOOL(k.size(2) % MIXED_KV_SIGNATURE_BLOCK_SIZE == 0, PACKED_SIGNATURE, [&] {
-        mixed_kv_arena_route_kernel<c_type, PACKED_SIGNATURE><<<capacity, 128, 0, stream>>>(
-            storage, arena, sealed, sealed_count, size_classes, route_stats,
-            static_cast<const float*>(thresholds.data_ptr()), destinations, row_completions,
-            capacity);
+        constexpr int route_threads = 1024;
+        mixed_kv_arena_route_kernel<c_type, PACKED_SIGNATURE, route_threads>
+            <<<capacity, route_threads, 0, stream>>>(
+                storage, arena, sealed, sealed_count, size_classes, route_stats,
+                static_cast<const float*>(thresholds.data_ptr()), destinations, row_completions,
+                capacity);
         return true;
       });
       mixed_kv_arena_quant_kernel<c_type><<<rows, 128, 0, stream>>>(

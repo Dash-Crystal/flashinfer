@@ -193,6 +193,14 @@ work. A geometry-compiled signature layout now reads complete 32-coefficient
 blocks linearly when the head dimension permits it. Ragged signature rows retain
 their coordinate mapping. The arithmetic and routing policy are shared.
 
+V31 removes that address division, but its captured decode route still averages
+59.06 microseconds across 48 layers, compared with V30's 73.83. The page CTA
+has only four warps: each warp serially evaluates 256 signature blocks in these
+64 KiB pages. The page reduction now uses 32 warps, reducing that loop to 32
+blocks per warp. The existing row quantizer retains its original block geometry.
+This changes reduction association, not the signature formula or payload codec;
+end-to-end latency and threshold-sensitive output differences remain measurements.
+
 The completion counter uses the device scope described in NVIDIA's
 [CUDA memory model](https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html).
 Each tile's block barrier precedes its elected lane's acquire/release increment;
