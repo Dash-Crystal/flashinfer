@@ -7,7 +7,12 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <cuda/atomic>
+
 namespace flashinfer {
+
+template <typename T>
+using KVPageAtomic = cuda::atomic_ref<T, cuda::thread_scope_device>;
 
 enum class KVPageFormat : uint8_t {
   kA16 = 0,
@@ -92,6 +97,14 @@ struct KVPageSlab {
   uint32_t slot_bytes;
   uint32_t size_class;
   uint32_t used;
+
+  __device__ bool try_lock() {
+    uint32_t expected = 0;
+    return KVPageAtomic<uint32_t>(lock).compare_exchange_strong(
+        expected, 1U, cuda::memory_order_acquire, cuda::memory_order_relaxed);
+  }
+
+  __device__ void unlock() { KVPageAtomic<uint32_t>(lock).store(0U, cuda::memory_order_release); }
 };
 
 // Slabs are assigned on demand by extent size, not permanently partitioned by
@@ -145,17 +158,19 @@ struct KVPageArena {
       for (uint32_t pass = 0; pass < 2; ++pass) {
         uint32_t const list = pass == 0 ? size_class : size_classes;
         uint32_t const words = availability_words();
-        uint32_t const start = atomicAdd(hints + list, 0U) % words;
+        uint32_t const start =
+            KVPageAtomic<uint32_t>(hints[list]).load(cuda::memory_order_relaxed) % words;
         for (uint32_t i = 0; i < words; ++i) {
           uint32_t const word = (start + i) % words;
           auto* entry = available + uint64_t(list) * words + word;
-          uint64_t candidates = atomicAdd(entry, 0ULL);
+          uint64_t candidates =
+              KVPageAtomic<unsigned long long>(*entry).load(cuda::memory_order_relaxed);
           while (candidates != 0) {
             uint32_t const bit = __ffsll(static_cast<long long>(candidates)) - 1;
             candidates &= candidates - 1;
             uint32_t const index = word * 64 + bit;
             KVPageSlab* slab = slabs + index;
-            if (atomicCAS(&slab->lock, 0U, 1U) != 0U) {
+            if (!slab->try_lock()) {
               contended = true;
               continue;
             }
@@ -177,9 +192,8 @@ struct KVPageArena {
                 slab->used = used + 1;
                 if (used == 0) mark_available(size_classes, index, false);
                 mark_available(size_class, index, used + 1 < slots);
-                __threadfence();
-                atomicExch(&slab->lock, 0U);
-                atomicExch(hints + list, word);
+                slab->unlock();
+                KVPageAtomic<uint32_t>(hints[list]).store(word, cuda::memory_order_relaxed);
                 atomicAdd(allocated_bytes, static_cast<unsigned long long>(extent_bytes));
                 atomicAdd(page_counts + a16_classes[size_class], 1ULL);
                 return KVPageAddress::make(
@@ -187,8 +201,7 @@ struct KVPageArena {
                     format);
               }
             }
-            __threadfence();
-            atomicExch(&slab->lock, 0U);
+            slab->unlock();
           }
         }
       }
@@ -201,7 +214,7 @@ struct KVPageArena {
     if (!address.allocated()) return;
     uint32_t const index = address.offset() / slab_bytes;
     KVPageSlab* slab = slabs + index;
-    while (atomicCAS(&slab->lock, 0U, 1U) != 0U) {
+    while (!slab->try_lock()) {
       __nanosleep(64);
     }
     uint32_t const extent_bytes = slab->slot_bytes;
@@ -211,8 +224,7 @@ struct KVPageArena {
     uint32_t const used = --slab->used;
     mark_available(slab->size_class, index, used != 0);
     if (used == 0) mark_available(size_classes, index, true);
-    __threadfence();
-    atomicExch(&slab->lock, 0U);
+    slab->unlock();
     atomicAdd(allocated_bytes, 0ULL - static_cast<unsigned long long>(extent_bytes));
     atomicAdd(page_counts + a16_class, UINT64_MAX);
   }

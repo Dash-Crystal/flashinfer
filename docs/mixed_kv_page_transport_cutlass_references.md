@@ -215,28 +215,28 @@ The completion counter uses the device scope described in NVIDIA's
 Each tile's block barrier precedes its elected lane's acquire/release increment;
 the last increment acquires the earlier releases before publishing the page.
 
+`KVPageSlab` now owns device-scope acquire/release locking for allocation and
+release. The prior relaxed CAS acquired no ordering for the protected slab and
+bitmap reads; unlock used a separate fence and atomic exchange. The shared lock
+primitive supplies that ordering directly. Availability and hint reads use atomic
+loads, and hint publication uses an atomic store. None needs a read-modify-write
+operation. Slot selection, extent pricing, ownership counters, and the codec are
+unchanged. End-to-end measurement determines the resulting latency difference.
+
 ## 7. Measurement discipline
 
-Two conditions on the shared test hosts silently invalidate numbers:
+Measure the complete model through the configured serving supervisor and
+canonical adaptive client. Profiling decorates the same serving command and
+operator configuration, including CUDA graphs. Report workload-adjusted latency
+and Pareto comparisons, with output error measured as RMS/KL and nonfinite counts.
 
-1. **Import path.** The venvs carry an editable install of another checkout.
-   `python -m pytest` from a checkout imports that checkout (cwd is on
-   `sys.path`), but `python benchmarks/foo.py` puts the *script directory* on
-   `sys.path` and imports the editable one — the JIT then compiles the other
-   tree's `csrc`. Every measurement process must pin `PYTHONPATH` to the
-   checkout under test and print `flashinfer.__file__` and
-   `flashinfer.jit.env.FLASHINFER_CSRC_DIR`; the benchmark does this itself.
-   Confirm with the `-c` source paths in the workspace's `build.ninja`.
-2. **Co-tenant time slicing.** When another process holds the GPU (e.g. a
-   `VLLM::EngineCore` at 99% SM), kernels are time-sliced with it once a burst
-   exceeds roughly half a millisecond, and every sustained number is inflated
-   ~2x — memory-bound and compute-carrying kernels alike, with the threshold
-   depending on the burst length. Check `nvidia-smi pmon -s u`. On such a host
-   report short bursts (`--no-cuda-graph --repeats 3 --trials 15`) and treat
-   graph-replay medians as lower-quality; clocks and throttle reasons are not
-   the explanation (verify with `nvidia-smi --query-gpu=clocks.sm,...`).
+Pin imported source and JIT paths to their committed revisions: editable installs
+can otherwise select another checkout. Record source paths and the generated
+build's inputs. Record co-tenant utilization, clocks, and throttling alongside
+the measured interval; contention is an observed condition, not a reason to
+disable graphs or replace serving with a short standalone burst.
 
-## 8. Acceptance targets and current state
+## 8. Historical targets and measurements
 
 B = 17, S = 4096, H_kv = 8, D = 128, K+V, BF16 math. Bytes: A16 285 MB, E4M3 152 MB
 (payload + scales), E2M1 80 MB.
@@ -246,17 +246,15 @@ B = 17, S = 4096, H_kv = 8, D = 128, K+V, BF16 math. Bytes: A16 285 MB, E4M3 152
 | H200 / sm90 (~4.8 TB/s) | 88-91 µs | 3.2 TB/s | ≤ 60 µs | ≤ 35 µs |
 | RTX 5090 / sm120 (~1.8 TB/s) | 177 µs | 1.6 TB/s | ≤ 95 µs | ≤ 55 µs |
 
-Targets are the A16 kernel's *achieved* bandwidth applied to the compressed byte count,
-with a 5–10% allowance for decode on sm120 and ~15% on sm90. A compressed-format result
-is accepted only when (a) it is bit-exact against explicit A16 expansion, (b) the
-asserted kernel family matches the architecture (see `mixed_kv_page_transport_backends.md`),
-and (c) the same-run A16 baseline is within 10% of the figure above, so that the
-compressed result can be expressed as achieved bandwidth rather than as a ratio to a
-drifting baseline.
+These historical estimates apply the A16 kernel's achieved bandwidth to compressed
+byte counts, with a 5–10% allowance on sm120 and about 15% on sm90. They describe
+that kernel shape, not a serving acceptance threshold. Retain numerical and
+latency observations and compare them within the actual architecture, workload,
+and execution configuration.
 
 ### sm90 state (TMA loader + converter warps, this branch)
 
-H200 burst measurements (Section 7 discipline; co-tenant present), q = 1, all 34
+Historical H200 burst measurements (co-tenant present), q = 1, all 34
 transport cases bit-exact:
 
 | mode | cp.async gather (start) | now | note |
