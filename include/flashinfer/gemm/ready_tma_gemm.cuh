@@ -77,17 +77,17 @@ struct ReadyGemm {
   using MmaAtom = std::conditional_t<std::is_same_v<Element, cutlass::bfloat16_t>,
                                      SM80_16x8x16_F32BF16BF16F32_TN, SM80_16x8x16_F32F16F16F32_TN>;
   using TiledMma =
-      decltype(make_tiled_mma(MmaAtom{}, Layout<Shape<_4, _2, _1>>{}, Tile<_128, _32, _16>{}));
+      decltype(make_tiled_mma(MmaAtom{}, Layout<Shape<_2, _2, _1>>{}, Tile<_128, _32, _16>{}));
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto, float, float, void,
       cutlass::layout::RowMajor, 8, Element, cutlass::layout::RowMajor, 8,
-      cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+      cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
   // Compose the existing typed mainloop directly: the convenience builder's
   // F8/F6/F4 restriction is not a restriction of its TMA pipeline or epilogue.
   using Mainloop = cutlass::gemm::collective::CollectiveMma<
       cutlass::gemm::MainloopSm120TmaWarpSpecialized<
-          3, 2, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedCooperativeSm120<2>>,
+          3, 2, ClusterShape, cutlass::gemm::KernelTmaWarpSpecializedPingpongSm120<2>>,
       TileShape, Element, InputStride, Element, InputStride, TiledMma, SM90_TMA_LOAD,
       UMMA::Layout_K_SW128_Atom<Element>, Copy_Atom<SM75_U32x4_LDSM_N, Element>, identity,
       SM90_TMA_LOAD, UMMA::Layout_K_SW128_Atom<Element>, Copy_Atom<SM75_U32x4_LDSM_N, Element>,
