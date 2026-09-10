@@ -170,19 +170,24 @@ and validated:
   `routing_thresholds`, `page_router_stats`, `page_router_partials`
 - Exactness and graph-replay tests pass on sm90 and sm120.
 
-The packed arena producer now composes routing, reduction, and allocation in one
-page CTA. Its parallel row quantizers retain the same nine-candidate block-scale
-codec. A device-scope acquire/release completion counter lets the last row tile
-publish the address and release the A16 source, without a separate publication
-launch or waiting for other CTAs. The first kernel resets each active counter;
-stream order separates routing from quantization. The consumer still receives
-one committed format-tagged address per page.
+The packed arena producer distributes routing over token/head row CTAs. Each
+row contributes three sums and a nonnegative peak to four floats per event;
+the last row selects the format and allocates the destination. The input writer
+initializes these accumulators and the completion counter in its existing launch.
+The final router reuses its first two accumulator fields for cosine and peak/RMS,
+and resets the counter for quantization. No per-row partial array is materialized.
+Parallel row quantizers retain the same nine-candidate block-scale codec. Their
+last row publishes the address and releases the A16 source. Both phases use the
+same device-scope acquire/release completion primitive; neither waits for other
+CTAs. Stream order separates routing from quantization, and the consumer still
+receives one committed format-tagged address per page.
 
 `mixed_kv_route_moments` supplies the same neighbor-cosine and peak/RMS formulas
-to rectangular and arena producers. Page-wide reduction changes FP32 association;
+to rectangular and arena producers through `mixed_kv_route_row`. Row accumulation
+changes FP32 association;
 it does not change the routing thresholds or scale-search objective. The arena
-workspace holds one row-completion integer per event instead of per-row routing
-partials. Kernel/resource and serving-response measurements must accompany
+workspace holds four floats and one row-completion integer per event instead of
+per-row routing partials. Kernel/resource and serving-response measurements accompany
 performance claims for this lowering.
 
 The V30 full-model trace verifies 721 decode kernels and 1009 continuation
@@ -195,11 +200,13 @@ their coordinate mapping. The arithmetic and routing policy are shared.
 
 V31 removes that address division, but its captured decode route still averages
 59.06 microseconds across 48 layers, compared with V30's 73.83. The page CTA
-has only four warps: each warp serially evaluates 256 signature blocks in these
-64 KiB pages. The page reduction now uses 32 warps, reducing that loop to 32
-blocks per warp. The existing row quantizer retains its original block geometry.
-This changes reduction association, not the signature formula or payload codec;
-end-to-end latency and threshold-sensitive output differences remain measurements.
+had only four warps: each warp serially evaluated 256 signature blocks in these
+64 KiB pages. V32 used 32 warps, reducing that loop to 32 blocks per warp and
+the observed decode router mean to 25.01 microseconds, with 48 registers and
+zero local bytes. A few completed pages still occupied only a few SMs. V33
+reuses the original row calculation across SMs and removes the page-CTA layout
+specialization. End-to-end latency and threshold-sensitive output differences
+remain measurements.
 
 The completion counter uses the device scope described in NVIDIA's
 [CUDA memory model](https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html).

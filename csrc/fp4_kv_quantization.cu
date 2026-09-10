@@ -995,8 +995,18 @@ template <typename InType, int THREADS = 128>
 __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, const InType* k,
                                             const InType* v, const int64_t* slots, int tokens,
                                             int64_t k_token_stride, int64_t k_head_stride,
-                                            int64_t v_token_stride, int64_t v_head_stride) {
+                                            int64_t v_token_stride, int64_t v_head_stride,
+                                            const int32_t* completed_count, int capacity,
+                                            float* stats, int32_t* finished_rows,
+                                            uint64_t* pending) {
   const int input_token = blockIdx.x;
+  if (blockIdx.y == 0 && input_token < min(capacity, *completed_count)) {
+    if (threadIdx.x < 4) stats[input_token * 4 + threadIdx.x] = 0.0f;
+    if (threadIdx.x == 0) {
+      finished_rows[input_token] = 0;
+      pending[input_token] = flashinfer::kUnallocatedKVPage;
+    }
+  }
   if (input_token >= tokens) return;
   const int64_t slot = slots[input_token];
   if (slot < 0) return;
@@ -1026,57 +1036,61 @@ __device__ __forceinline__ void mixed_kv_completed_rows(int page_size,
   }
 }
 
-template <typename InType, bool PACKED_SIGNATURE, int THREADS>
+template <typename Finish>
+__device__ __forceinline__ void mixed_kv_finish_rows(int32_t* finished_rows, int event, int rows,
+                                                     Finish finish) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<int32_t, cuda::thread_scope_device> finished(finished_rows[event]);
+    // Acquire preceding row releases without waiting for another CTA to run.
+    if (finished.fetch_add(1, cuda::memory_order_acq_rel) == rows - 1) finish();
+  }
+}
+
+template <typename InType, int THREADS = 128>
 __global__ void mixed_kv_arena_route_kernel(flashinfer::KVPageStorage storage,
                                             flashinfer::KVPageArena arena, const int32_t* completed,
                                             const int32_t* completed_count, const int32_t* classes,
                                             float* stats, const float* thresholds,
                                             uint64_t* pending, int32_t* finished_rows,
                                             int capacity) {
-  const int event = blockIdx.x;
-  if (event >= capacity || event >= *completed_count) return;
-  const int page = completed[event];
-  const auto source = storage.address(page);
-  if (threadIdx.x == 0) {
-    finished_rows[event] = 0;
-    pending[event] = source.value;
-  }
-  if (!source.allocated() || source.format() != flashinfer::KVPageFormat::kA16) return;
-
-  const auto* input = reinterpret_cast<const InType*>(storage.data + source.offset());
-  const int64_t token_values = int64_t(storage.geometry.heads) * 2 * storage.geometry.head_dim;
-  const int blocks_per_row = storage.geometry.head_dim / MIXED_KV_SIGNATURE_BLOCK_SIZE;
-  const int64_t signature_blocks =
-      int64_t(storage.geometry.tokens) * storage.geometry.heads * 2 * blocks_per_row;
   __shared__ float moments[4];
-  mixed_kv_route_moments<THREADS>(
-      (storage.geometry.tokens - 1) * token_values, signature_blocks,
-      [&](int64_t linear) {
-        return make_float2(mixed_kv_to_float(input[linear]),
-                           mixed_kv_to_float(input[linear + token_values]));
-      },
-      [&](int64_t block, int lane) {
-        if constexpr (PACKED_SIGNATURE) {
-          return mixed_kv_to_float(input[block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane]);
-        } else {
-          const int64_t row = block / blocks_per_row;
-          const int dim = (block % blocks_per_row) * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane;
-          return mixed_kv_to_float(input[row * storage.geometry.head_dim + dim]);
+  mixed_kv_completed_rows(
+      storage.geometry.tokens, completed_count, capacity, [&](int event, int token) {
+        const int page = completed[event];
+        const auto source = storage.address(page);
+        if (!source.allocated() || source.format() != flashinfer::KVPageFormat::kA16) return;
+        mixed_kv_route_row<THREADS>(
+            token, storage.geometry.tokens, storage.geometry.head_dim,
+            [&](bool is_v, int row_token, int dim) {
+              const auto* input = reinterpret_cast<const InType*>(
+                  storage.payload(source, row_token, blockIdx.y, is_v));
+              return mixed_kv_to_float(input[dim]);
+            },
+            moments);
+        auto* sums = stats + event * 4;
+        if (threadIdx.x == 0) {
+          atomicAdd(sums + 0, moments[0]);
+          atomicAdd(sums + 1, moments[1]);
+          atomicAdd(sums + 2, moments[2]);
+          atomicMax(reinterpret_cast<uint32_t*>(sums + 3), __float_as_uint(moments[3]));
         }
-      },
-      moments);
-  if (threadIdx.x != 0) return;
-  const auto route = mixed_kv_route_stats(moments[0], moments[1], moments[2], moments[3]);
-  stats[event * 2] = route.x;
-  stats[event * 2 + 1] = route.y;
-  const uint8_t format = mixed_kv_select_format(route.x, route.y, thresholds);
-  if (format == 0) {
-    return;
-  }
-  const auto encoded_format = static_cast<flashinfer::KVPageFormat>(format);
-  pending[event] =
-      arena.allocate(storage.geometry.extent_bytes(encoded_format), classes[format], encoded_format)
-          .value;
+        mixed_kv_finish_rows(
+            finished_rows, event, storage.geometry.tokens * storage.geometry.heads, [&] {
+              const auto route = mixed_kv_route_stats(sums[0], sums[1], sums[2], sums[3]);
+              sums[0] = route.x;
+              sums[1] = route.y;
+              finished_rows[event] = 0;
+              const uint8_t format = mixed_kv_select_format(route.x, route.y, thresholds);
+              const auto encoded_format = static_cast<flashinfer::KVPageFormat>(format);
+              pending[event] = format == 0
+                                   ? source.value
+                                   : arena
+                                         .allocate(storage.geometry.extent_bytes(encoded_format),
+                                                   classes[format], encoded_format)
+                                         .value;
+            });
+      });
 }
 
 template <typename InType, int THREADS = 128>
@@ -1126,17 +1140,11 @@ __global__ void mixed_kv_arena_quant_kernel(flashinfer::KVPageStorage storage,
         if (!destination.allocated() || destination.value == source.value) return;
         mixed_kv_arena_quant_row<InType, THREADS>(storage, source, destination, global_scales,
                                                   token);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          cuda::atomic_ref<int32_t, cuda::thread_scope_device> finished(finished_rows[event]);
-          const int rows = storage.geometry.tokens * storage.geometry.heads;
-          // Acquire the preceding tiles' releases before publishing and
-          // freeing the source. No tile waits for another CTA to run.
-          if (finished.fetch_add(1, cuda::memory_order_acq_rel) == rows - 1) {
-            storage.entry(page) = destination.value;
-            arena.release(source);
-          }
-        }
+        mixed_kv_finish_rows(finished_rows, event, storage.geometry.tokens * storage.geometry.heads,
+                             [&] {
+                               storage.entry(page) = destination.value;
+                               arena.release(source);
+                             });
       });
 }
 
@@ -1303,8 +1311,8 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
   TVM_FFI_ICHECK(finished_rows.ndim() == 1 && finished_rows.dtype() == dl_int32 &&
                  finished_rows.numel() == completed.numel() && finished_rows.stride(0) == 1);
   TVM_FFI_ICHECK(stats.ndim() == 2 && stats.dtype() == dl_float32 &&
-                 stats.size(0) == completed.numel() && stats.size(1) == 2);
-  TVM_FFI_ICHECK(stats.stride(1) == 1 && stats.stride(0) == 2);
+                 stats.size(0) == completed.numel() && stats.size(1) == 4);
+  TVM_FFI_ICHECK(stats.stride(1) == 1 && stats.stride(0) == 4);
   TVM_FFI_ICHECK(pending.ndim() == 1 && pending.dtype() == dl_int64 &&
                  pending.numel() == completed.numel() && pending.stride(0) == 1);
   TVM_FFI_ICHECK(global_scales.numel() == 4 && global_scales.ndim() == 1 &&
@@ -1347,23 +1355,20 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
           storage, arena, reset, reset_count, size_classes,
           static_cast<const float*>(global_scales.data_ptr()), reused.numel());
     }
-    if (slots.numel()) {
-      mixed_kv_arena_write_kernel<c_type><<<dim3(slots.numel(), k.size(1)), 128, 0, stream>>>(
+    if (slots.numel() || capacity) {
+      const dim3 writes(std::max<int64_t>(slots.numel(), capacity), k.size(1));
+      mixed_kv_arena_write_kernel<c_type><<<writes, 128, 0, stream>>>(
           storage, static_cast<const c_type*>(k.data_ptr()),
           static_cast<const c_type*>(v.data_ptr()), static_cast<const int64_t*>(slots.data_ptr()),
-          slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
+          slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1), sealed_count, capacity,
+          route_stats, row_completions, destinations);
     }
     if (capacity) {
       const dim3 rows(capacity, k.size(1));
-      DISPATCH_BOOL(k.size(2) % MIXED_KV_SIGNATURE_BLOCK_SIZE == 0, PACKED_SIGNATURE, [&] {
-        constexpr int route_threads = 1024;
-        mixed_kv_arena_route_kernel<c_type, PACKED_SIGNATURE, route_threads>
-            <<<capacity, route_threads, 0, stream>>>(
-                storage, arena, sealed, sealed_count, size_classes, route_stats,
-                static_cast<const float*>(thresholds.data_ptr()), destinations, row_completions,
-                capacity);
-        return true;
-      });
+      mixed_kv_arena_route_kernel<c_type>
+          <<<rows, 128, 0, stream>>>(storage, arena, sealed, sealed_count, size_classes,
+                                     route_stats, static_cast<const float*>(thresholds.data_ptr()),
+                                     destinations, row_completions, capacity);
       mixed_kv_arena_quant_kernel<c_type><<<rows, 128, 0, stream>>>(
           storage, arena, sealed, sealed_count, destinations, row_completions,
           static_cast<const float*>(global_scales.data_ptr()), capacity);
