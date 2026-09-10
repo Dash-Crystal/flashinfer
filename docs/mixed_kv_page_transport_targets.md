@@ -196,9 +196,12 @@ scale-pair arrangements while sharing the pipeline schedule. The staged K-only
 V71 runtime has not executed; V72 validates the composed K/V change.
 
 V72's loaded D256/D512 decode binaries use 118/203 registers; query spans use
-168/212. All four report zero local bytes. The full graph server is serving the
-canonical workload. This establishes compilation and register placement, not
-the pending latency comparison.
+168/212. All four report zero local bytes. Its completed canonical workload's
+shared-cost fit predicts 9–18% lower 8K/1K latency than A16 across B48–96.
+The comparison and its limitations are recorded in vLLM's execution review;
+this is not a matched replay measurement or an established 20% latency gain.
+The emitted K loop fetches the next packed fragment before the current MMA,
+but some current conversion precedes that fetch despite the source ordering.
 
 The capacity snapshot's final scalar now counts reusable bytes across all size
 classes and empty slabs. Empty-slab count and free bytes share one block reduction.
@@ -207,3 +210,12 @@ compressed admission forecast, reserving outstanding writes and writable tails
 at A16. The paired snapshot ABI is six scalars plus two per geometry; the last
 scalar follows the existing per-geometry arrays. V72 predates this accounting
 change, which requires its own native scheduler build and serving validation.
+
+The next consumer change pairs adjacent E4M3 block-scale conversions. It shares
+the exact E4M3-to-FP16-to-FP32 embedding with the existing scale helper, multiplies
+each scale by its FP32 global scale, then packs the two rounded A16 values in one
+conversion. K broadcasts the two result halves; V consumes the pair directly.
+The ordinary paired scaling helper uses this implementation too. V72 SASS had
+two separate E4M3 conversions and two scalar BF16 conversions at this boundary.
+The paired source needs full-model compilation, emitted-instruction inspection
+and latency measurement; no performance gain is inferred from the source alone.

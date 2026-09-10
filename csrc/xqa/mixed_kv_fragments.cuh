@@ -88,11 +88,12 @@ __device__ inline InstInMat<2, 2> convertK(Fragment<format> const& fragment,
     return fragment;
   } else {
     InstInMat<2, 2> result;
+    uint16_t const scaleBits = uint8_t(scaleWords[0] >> (scaleColumn * 8)) |
+                               (uint16_t(uint8_t(scaleWords[1] >> (scaleColumn * 8))) << 8);
+    uint32_t const scalePair = convertE4M3x2ScalesToA16<InputElem>(scaleBits, globalScale);
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
-      uint8_t const scale = scaleWords[n] >> (scaleColumn * 8);
-      uint32_t const sf =
-          broadcastA16Scale<InputElem>(convertE4M3ScaleToA16Bits<InputElem>(scale, globalScale));
+      uint32_t const sf = broadcastA16Scale<InputElem>(uint16_t(scalePair >> (n * 16)));
       uint32_t const word = fragment[n];
       if constexpr (format == KVPageFormat::kBlockScaledFP8) {
         result.data[n][0] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(word), sf);
@@ -142,11 +143,9 @@ __device__ inline InstInMat<2, 2> convertV(Fragment<format> const& fragment,
     uint32_t sf[2];
 #pragma unroll
     for (uint32_t half = 0; half < 2; ++half) {
-      uint16_t const low = convertE4M3ScaleToA16Bits<InputElem>(
-          scaleWords[half * 2] >> (scaleColumn * 8), globalScale);
-      uint16_t const high = convertE4M3ScaleToA16Bits<InputElem>(
-          scaleWords[half * 2 + 1] >> (scaleColumn * 8), globalScale);
-      sf[half] = uint32_t(low) | (uint32_t(high) << 16);
+      uint16_t const bits = uint8_t(scaleWords[half * 2] >> (scaleColumn * 8)) |
+                            (uint16_t(uint8_t(scaleWords[half * 2 + 1] >> (scaleColumn * 8))) << 8);
+      sf[half] = convertE4M3x2ScalesToA16<InputElem>(bits, globalScale);
     }
     InstInMat<2, 2> result;
 #pragma unroll

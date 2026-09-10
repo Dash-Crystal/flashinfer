@@ -619,6 +619,28 @@ __device__ inline Vec<uint32_t, 4> convertE2M1x8ToA16(uint32_t fp4x8) {
   return converted;
 }
 
+__device__ inline void e4m3x2ScalesToFloat(uint32_t bits, float& low, float& high) {
+  uint32_t const f16x2 = convertE4M3x2ToA16<half>(static_cast<uint16_t>(bits));
+  float2 const values = __half22float2(reinterpret_cast<__half2 const&>(f16x2));
+  low = values.x;
+  high = values.y;
+}
+
+template <typename A16>
+__device__ inline uint32_t convertE4M3x2ScalesToA16(uint16_t bits, float globalScale) {
+  float low, high;
+  e4m3x2ScalesToFloat(bits, low, high);
+  low *= globalScale;
+  high *= globalScale;
+  if constexpr (mha::is_same_v<A16, half>) {
+    auto const result = __floats2half2_rn(low, high);
+    return reinterpret_cast<uint32_t const&>(result);
+  } else {
+    auto const result = __floats2bfloat162_rn(low, high);
+    return reinterpret_cast<uint32_t const&>(result);
+  }
+}
+
 template <typename A16>
 __device__ inline uint16_t convertE4M3ScaleToA16Bits(uint8_t scaleBits, float globalScale) {
   auto const scale = reinterpret_cast<__nv_fp8_e4m3 const&>(scaleBits);
@@ -635,13 +657,8 @@ __device__ inline uint32_t scaleA16x2(uint32_t a16x2Bits, uint8_t scaleBits, flo
 template <typename A16>
 __device__ inline uint32_t scaleA16x2Pair(uint32_t a16x2Bits, uint8_t scaleBits0,
                                           uint8_t scaleBits1, float globalScale) {
-  auto const scale0 = reinterpret_cast<__nv_fp8_e4m3 const&>(scaleBits0);
-  auto const scale1 = reinterpret_cast<__nv_fp8_e4m3 const&>(scaleBits1);
-  A16 const a16Scale0 = static_cast<A16>(float(scale0) * globalScale);
-  A16 const a16Scale1 = static_cast<A16>(float(scale1) * globalScale);
-  uint16_t const scaleBitsA16_0 = reinterpret_cast<uint16_t const&>(a16Scale0);
-  uint16_t const scaleBitsA16_1 = reinterpret_cast<uint16_t const&>(a16Scale1);
-  uint32_t const scalePair = uint32_t(scaleBitsA16_0) | (uint32_t(scaleBitsA16_1) << 16);
+  uint32_t const scalePair = convertE4M3x2ScalesToA16<A16>(
+      uint16_t(scaleBits0) | (uint16_t(scaleBits1) << 8), globalScale);
   uint32_t result;
   if constexpr (mha::is_same_v<A16, half>) {
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(result) : "r"(a16x2Bits), "r"(scalePair));
@@ -952,15 +969,6 @@ __device__ inline uint32_t ldsU16(uint32_t addr) {
 }
 __device__ inline void ldsB64(uint32_t addr, uint32_t& lo, uint32_t& hi) {
   asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(lo), "=r"(hi) : "r"(addr));
-}
-// Two E4M3 block scales (bytes 0 and 1 of s01) -> fp32, exact (E4M3 -> f16 -> f32 are both
-// exact embeddings; the same route as e4m3x4ScalesToFloat / convertE4M3ScaleToA16Bits).
-__device__ inline void e4m3x2ScalesToFloat(uint32_t s01, float& f0, float& f1) {
-  uint32_t f16x2;
-  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2) : "h"(static_cast<uint16_t>(s01)));
-  float2 const f = __half22float2(reinterpret_cast<__half2 const&>(f16x2));
-  f0 = f.x;
-  f1 = f.y;
 }
 // bf16 scale broadcast to both halves: one F2FP.BF16.PACK_AB with both inputs equal.
 __device__ inline uint32_t bf16x2Broadcast(float f) { return bf16x2BitsFromFloats(f, f); }
