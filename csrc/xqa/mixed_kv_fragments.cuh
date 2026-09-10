@@ -13,6 +13,7 @@ using flashinfer::KVPageFormat;
 template <typename Function>
 __device__ inline void visit(uint8_t format, Function const& function) {
 #if MIXED_PAGE_STATIC_FORMAT >= 0
+  unused(format);
   function(MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
   if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
@@ -40,15 +41,15 @@ __device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
       uint32_t const token = row + n * 8 + laneId() / 4;
-      auto const* packed = reinterpret_cast<uint8_t const*>(&tile.template at<true>(token, block));
-      uint8_t const scale = scales[token * scaleStride + scaleColumn];
+      uint32_t const packed = smemAddr(&tile.template at<true>(token, block));
+      uint8_t const scale = ldsU8(smemAddr(scales) + token * scaleStride + scaleColumn);
       uint32_t low, high;
       if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        low = *reinterpret_cast<uint16_t const*>(packed + pair);
-        high = *reinterpret_cast<uint16_t const*>(packed + pair + 8);
+        low = ldsU16(packed + pair);
+        high = ldsU16(packed + pair + 8);
       } else {
-        low = packed[pair / 2];
-        high = packed[pair / 2 + 4];
+        low = ldsU8(packed + pair / 2);
+        high = ldsU8(packed + pair / 2 + 4);
       }
       uint32_t const sf =
           broadcastA16Scale<InputElem>(convertE4M3ScaleToA16Bits<InputElem>(scale, globalScale));
@@ -94,9 +95,9 @@ __device__ inline InstInMat<2, 2> loadV(SharedMem::VSmemBuffer const& tile, uint
     for (uint32_t half = 0; half < 2; ++half) {
       uint32_t const token = row + half * 8 + (laneId() & 3U) * 2;
       uint16_t const low = convertE4M3ScaleToA16Bits<InputElem>(
-          scales[vScaleRow(token) * scaleStride + block], globalScale);
+          ldsU8(smemAddr(scales) + vScaleRow(token) * scaleStride + block), globalScale);
       uint16_t const high = convertE4M3ScaleToA16Bits<InputElem>(
-          scales[vScaleRow(token + 1) * scaleStride + block], globalScale);
+          ldsU8(smemAddr(scales) + vScaleRow(token + 1) * scaleStride + block), globalScale);
       sf[half] = uint32_t(low) | (uint32_t(high) << 16);
     }
     InstInMat<2, 2> result;
