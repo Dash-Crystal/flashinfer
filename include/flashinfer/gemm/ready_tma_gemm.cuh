@@ -15,6 +15,8 @@
 #ifndef FLASHINFER_GEMM_READY_TMA_GEMM_CUH_
 #define FLASHINFER_GEMM_READY_TMA_GEMM_CUH_
 
+#include <cutlass/device_kernel.h>
+
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
@@ -96,22 +98,30 @@ struct ReadyGemm {
 };
 
 template <typename Element>
-__global__ __launch_bounds__(ReadyGemm<Element>::Kernel::MaxThreadsPerBlock) void ReadyRowsGemm(
-    typename ReadyGemm<Element>::Kernel::Params params, int* readiness, int groups,
-    int done_index) {
-  extern __shared__ char storage[];
-  typename ReadyGemm<Element>::Kernel{}(params, storage);
-  __syncthreads();
-  masked_gemm::FinishReady(readiness, groups, done_index);
-}
+struct ReadyKernel : ReadyGemm<Element>::Kernel {
+  using Base = typename ReadyGemm<Element>::Kernel;
+  struct Params : Base::Params {
+    int* readiness;
+    int groups;
+    int done_index;
+  };
+
+  CUTLASS_DEVICE void operator()(Params const& params, char* storage) {
+    Base{}(params, storage);
+    __syncthreads();
+    masked_gemm::FinishReady(params.readiness, params.groups, params.done_index);
+  }
+};
 
 template <typename Element>
 cudaError_t PrepareReady(int* occupancy) {
-  using Kernel = typename ReadyGemm<Element>::Kernel;
-  auto status = masked_gemm::PrepareKernel(ReadyRowsGemm<Element>, Kernel::SharedStorageSize);
+  using Kernel = ReadyKernel<Element>;
+  auto status =
+      masked_gemm::PrepareKernel(cutlass::device_kernel<Kernel>, Kernel::SharedStorageSize);
   if (status != cudaSuccess) return status;
-  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      occupancy, ReadyRowsGemm<Element>, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize);
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(occupancy, cutlass::device_kernel<Kernel>,
+                                                       Kernel::MaxThreadsPerBlock,
+                                                       Kernel::SharedStorageSize);
 }
 
 template <typename Element>
@@ -123,7 +133,7 @@ template <typename Element>
 cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
                      int ldd, int* readiness, int group_rows, int done_index, void* workspace,
                      int sms, int occupancy, int available_sms, cudaStream_t stream) {
-  using Kernel = typename ReadyGemm<Element>::Kernel;
+  using Kernel = ReadyKernel<Element>;
   typename Kernel::Arguments args;
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.problem_shape = {m, n, k, 1};
@@ -132,10 +142,11 @@ cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, 
   args.epilogue.ptr_D = out;
   args.epilogue.dD = {ldd, _1{}, 0};
   args.hw_info.sm_count = available_sms;
-  auto params = Kernel::to_underlying_arguments(args, workspace);
+  typename Kernel::Params params{Kernel::to_underlying_arguments(args, workspace), readiness,
+                                 (m + group_rows - 1) / group_rows, done_index};
   auto grid = Kernel::get_grid_shape(params);
-  ReadyRowsGemm<Element><<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(
-      params, readiness, (m + group_rows - 1) / group_rows, done_index);
+  cutlass::device_kernel<Kernel>
+      <<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
   return cudaGetLastError();
 }
 
