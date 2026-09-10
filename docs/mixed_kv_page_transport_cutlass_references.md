@@ -171,11 +171,14 @@ and validated:
 - Exactness and graph-replay tests pass on sm90 and sm120.
 
 The packed arena producer distributes routing over token/head row CTAs. Each
-row contributes three sums and a nonnegative peak to four floats per event;
-the last row selects the format and allocates the destination. The input writer
-initializes these accumulators and the completion counter in its existing launch.
-The final router reuses its first two accumulator fields for cosine and peak/RMS,
-and resets the counter for quantization. No per-row partial array is materialized.
+row writes four partials, then publishes completion with one acquire/release
+increment. The last completing CTA reuses `mixed_kv_reduce_route`, the same
+parallel reduction as the rectangular producer, and allocates the destination.
+The input writer initializes completion state in its existing launch. The final
+router reuses the first two partial fields for cosine and peak/RMS and resets
+the counter for quantization. Gemma's reusable partial allocation is 0.75 MiB
+per rank; it removes V33's four contended atomic moment updates per row and
+restores the rectangular producer's reduction order.
 Parallel row quantizers retain the same nine-candidate block-scale codec. Their
 last row publishes the address and releases the A16 source. Both phases use the
 same device-scope acquire/release completion primitive; neither waits for other
@@ -183,12 +186,9 @@ CTAs. Stream order separates routing from quantization, and the consumer still
 receives one committed format-tagged address per page.
 
 `mixed_kv_route_moments` supplies the same neighbor-cosine and peak/RMS formulas
-to rectangular and arena producers through `mixed_kv_route_row`. Row accumulation
-changes FP32 association;
-it does not change the routing thresholds or scale-search objective. The arena
-workspace holds four floats and one row-completion integer per event instead of
-per-row routing partials. Kernel/resource and serving-response measurements accompany
-performance claims for this lowering.
+to rectangular and arena producers through `mixed_kv_route_row`. The reduction,
+routing thresholds, and scale-search objective are shared. Kernel/resource and
+serving-response measurements accompany performance claims for this lowering.
 
 The V30 full-model trace verifies 721 decode kernels and 1009 continuation
 kernels, 144 fewer than before, with no reported register spills. It also exposes
@@ -205,8 +205,10 @@ had only four warps: each warp serially evaluated 256 signature blocks in these
 the observed decode router mean to 25.01 microseconds, with 48 registers and
 zero local bytes. A few completed pages still occupied only a few SMs. V33
 reuses the original row calculation across SMs and removes the page-CTA layout
-specialization. End-to-end latency and threshold-sensitive output differences
-remain measurements.
+specialization. Its captured local-page router still takes 25.57--28.61
+microseconds, while global-page routing takes 11.14--17.35. V34 replaces the
+atomic moments with the original parallel partial reduction in the last CTA.
+End-to-end latency and output differences remain measurements.
 
 The completion counter uses the device scope described in NVIDIA's
 [CUDA memory model](https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html).
