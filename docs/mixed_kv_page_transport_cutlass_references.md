@@ -185,6 +185,19 @@ workspace holds one row-completion integer per event instead of per-row routing
 partials. Kernel/resource and serving-response measurements must accompany
 performance claims for this lowering.
 
+The V30 full-model trace verifies 721 decode kernels and 1009 continuation
+kernels, 144 fewer than before, with no reported register spills. It also exposes
+a costly address reconstruction in the page router: dynamic 64-bit division
+inside the signature loop, about 74 microseconds per call in the captured decode
+work. A geometry-compiled signature layout now reads complete 32-coefficient
+blocks linearly when the head dimension permits it. Ragged signature rows retain
+their coordinate mapping. The arithmetic and routing policy are shared.
+
+The completion counter uses the device scope described in NVIDIA's
+[CUDA memory model](https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html).
+Each tile's block barrier precedes its elected lane's acquire/release increment;
+the last increment acquires the earlier releases before publishing the page.
+
 ## 7. Measurement discipline
 
 Two conditions on the shared test hosts silently invalidate numbers:
