@@ -408,26 +408,40 @@ __global__ void mixed_kv_reset_reused_pages_kernel(const int32_t* __restrict__ r
   }
 }
 
-template <int THREADS, typename T>
-__device__ __forceinline__ T mixed_kv_block_sum(T value) {
+template <int THREADS, typename T, int CHANNELS>
+__device__ __forceinline__ void mixed_kv_block_sums(T (&values)[CHANNELS]) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {
-    value += __shfl_down_sync(uint32_t(-1), value, offset);
+#pragma unroll
+    for (int channel = 0; channel < CHANNELS; ++channel)
+      values[channel] += __shfl_down_sync(uint32_t(-1), values[channel], offset);
   }
-  __shared__ T warp_values[THREADS / 32];
+  __shared__ T warp_values[CHANNELS][THREADS / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  if (lane == 0) warp_values[warp] = value;
+#pragma unroll
+  for (int channel = 0; channel < CHANNELS; ++channel)
+    if (lane == 0) warp_values[channel][warp] = values[channel];
   __syncthreads();
   if (warp == 0) {
-    value = lane < THREADS / 32 ? warp_values[lane] : T{0};
+#pragma unroll
+    for (int channel = 0; channel < CHANNELS; ++channel)
+      values[channel] = lane < THREADS / 32 ? warp_values[channel][lane] : T{0};
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-      value += __shfl_down_sync(uint32_t(-1), value, offset);
+#pragma unroll
+      for (int channel = 0; channel < CHANNELS; ++channel)
+        values[channel] += __shfl_down_sync(uint32_t(-1), values[channel], offset);
     }
   }
   __syncthreads();
-  return value;
+}
+
+template <int THREADS, typename T>
+__device__ __forceinline__ T mixed_kv_block_sum(T value) {
+  T values[] = {value};
+  mixed_kv_block_sums<THREADS>(values);
+  return values[0];
 }
 
 __device__ __forceinline__ float4 mixed_kv_warp_moments(float4 value) {
@@ -1306,18 +1320,30 @@ __global__ void mixed_kv_arena_capacity_kernel(flashinfer::KVPageArena arena,
                                                int64_t* output) {
   const int kind = blockIdx.x;
   unsigned long long free = 0;
+  unsigned long long free_bytes = 0;
   for (uint32_t i = threadIdx.x; i < arena.slab_count; i += blockDim.x) {
     const auto slab = arena.slabs[i];
     if (kind == kinds) {
       free += slab.used == 0;
+      free_bytes += slab.used == 0 ? arena.slab_bytes
+                                   : (arena.slab_bytes / slab.slot_bytes - slab.used) *
+                                         static_cast<unsigned long long>(slab.slot_bytes);
     } else if (slab.used && arena.a16_classes[slab.size_class] == uint32_t(kind) &&
                slab.slot_bytes == a16_bytes[kind]) {
       free += arena.slab_bytes / slab.slot_bytes - slab.used;
     }
   }
-  free = mixed_kv_block_sum<256>(free);
+  if (kind == kinds) {
+    unsigned long long totals[] = {free, free_bytes};
+    mixed_kv_block_sums<256>(totals);
+    free = totals[0];
+    free_bytes = totals[1];
+  } else {
+    free = mixed_kv_block_sum<256>(free);
+  }
   if (threadIdx.x == 0) {
     output[kind == kinds ? 4 : 5 + kind] = free;
+    if (kind == kinds) output[5 + 2 * kinds] = free_bytes;
     if (kind != kinds) output[5 + kinds + kind] = arena.page_counts[kind];
     if (kind == 0) {
       output[0] = *arena.allocated_bytes;
@@ -1338,7 +1364,7 @@ void mixed_kv_arena_capacity(TensorView data, TensorView pages, TensorView slabs
   TVM_FFI_ICHECK(a16_bytes.ndim() == 1 && a16_bytes.dtype() == dl_int32 &&
                  a16_bytes.numel() == kinds && a16_bytes.stride(0) == 1);
   TVM_FFI_ICHECK(output.ndim() == 1 && output.dtype() == dl_int64 &&
-                 output.numel() == 5 + 2 * kinds && output.stride(0) == 1);
+                 output.numel() == 6 + 2 * kinds && output.stride(0) == 1);
   for (auto tensor : {a16_bytes, output}) {
     TVM_FFI_ICHECK(tensor.device().device_type == data.device().device_type &&
                    tensor.device().device_id == data.device().device_id);

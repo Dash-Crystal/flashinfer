@@ -194,3 +194,16 @@ across the output blocks; each byte is extracted from the existing row layout,
 including group-buffer dump rows. K and V retain their distinct matrix-load and
 scale-pair arrangements while sharing the pipeline schedule. The staged K-only
 V71 runtime has not executed; V72 validates the composed K/V change.
+
+V72's loaded D256/D512 decode binaries use 118/203 registers; query spans use
+168/212. All four report zero local bytes. The full graph server is serving the
+canonical workload. This establishes compilation and register placement, not
+the pending latency comparison.
+
+The capacity snapshot's final scalar now counts reusable bytes across all size
+classes and empty slabs. Empty-slab count and free bytes share one block reduction.
+vLLM uses A16-slot capacity for immediate writes and total reusable bytes for its
+compressed admission forecast, reserving outstanding writes and writable tails
+at A16. The paired snapshot ABI is six scalars plus two per geometry; the last
+scalar follows the existing per-geometry arrays. V72 predates this accounting
+change, which requires its own native scheduler build and serving validation.

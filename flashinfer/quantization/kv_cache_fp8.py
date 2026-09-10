@@ -140,7 +140,7 @@ class MixedKVPageArena:
         )
         self.reservations = torch.zeros(num_blocks, dtype=torch.int32, device=device)
         self.capacity_snapshot = torch.empty(
-            5 + 2 * len(self.page_values), dtype=torch.int64, device=device
+            6 + 2 * len(self.page_values), dtype=torch.int64, device=device
         )
         module = get_fp4_kv_quantization_module()
         self.update = module.mixed_kv_arena_update
