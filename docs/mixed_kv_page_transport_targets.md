@@ -174,3 +174,16 @@ available warp concurrency rather than only the CTA count. Page-relative K
 offsets also cover warp tiles smaller than a page; pages wider than the smaller
 CTA retain the wider CTA geometry. Compilation, spill placement and full-model
 performance still need measurement; V69 does not include this ownership change.
+V70's loaded D256 binary uses 121 registers and zero local bytes, fitting two
+eight-warp CTAs within the register budget. The full model has captured its graphs
+and is serving the canonical workload; its latency comparison is still running.
+
+The next register pipeline separates K fragment fetch from conversion and MMA.
+Two packed fragments alternate so the next matrix load precedes the current
+fragment's conversion and multiply. The existing four-byte scale row is loaded
+once per token into a register, replacing one byte load for every reduction
+block. Conversion still rounds the block scale times the global scale to A16
+before multiplying the payload. The final iteration consumes the last fragment
+without an out-of-range prefetch. No shared expansion or additional barrier is
+introduced. Full-model compilation, resource placement and performance are
+pending for this followup; the V70 binary does not contain it.

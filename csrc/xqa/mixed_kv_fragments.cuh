@@ -27,11 +27,28 @@ __device__ inline void visit(uint8_t format, Function const& function) {
 }
 
 template <KVPageFormat format>
-__device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint32_t row,
-                                        uint32_t block, uint32_t part, uint8_t const* scales,
-                                        float globalScale, flashinfer::KVPageFormatSpan const& page,
-                                        uint32_t head, uint32_t tokenBase, uint32_t skipTokens,
-                                        uint32_t cacheSeqLen) {
+using KFragment =
+    mha::conditional_t<format == KVPageFormat::kA16, InstInMat<2, 2>, Vec<uint32_t, 2>>;
+
+template <uint32_t count, typename Load, typename Consume>
+__device__ inline void pipelineFragments(Load const& load, Consume const& consume) {
+  static_assert(count > 0);
+  auto current = load(0);
+#pragma unroll 1
+  for (uint32_t block = 0; block + 1 < count; ++block) {
+    auto const next = load(block + 1);
+    consume(current, block);
+    current = next;
+  }
+  consume(current, count - 1);
+}
+
+template <KVPageFormat format>
+__device__ inline KFragment<format> fetchK(SharedMem::KSmemBuffer const& tile, uint32_t row,
+                                           uint32_t block, uint32_t part,
+                                           flashinfer::KVPageFormatSpan const& page, uint32_t head,
+                                           uint32_t tokenBase, uint32_t skipTokens,
+                                           uint32_t cacheSeqLen) {
   if constexpr (format == KVPageFormat::kA16) {
     InstInMat<2, 2> result;
     uint32_t const quad = laneId() & 3U;
@@ -53,25 +70,29 @@ __device__ inline InstInMat<2, 2> loadK(SharedMem::KSmemBuffer const& tile, uint
     }
     return result;
   } else {
-    constexpr uint32_t blocksPerPart = kHeadPartBytes / 32;
-    constexpr uint32_t scaleStride = mha::max(4U, blocksPerPart);
-    uint32_t const scaleColumn = (part * blocksPerPart + block) % scaleStride;
     auto const* address = &tile.template at<true>(row + laneId() % 16, block);
-    auto const packed = [&]() {
-      if constexpr (format == KVPageFormat::kBlockScaledFP8) {
-        return ldmatrix<false, 2>(address);
-      } else {
-        return ldmatrix_8x16_4x_unpack_4b<2>(address);
-      }
-    }();
+    if constexpr (format == KVPageFormat::kBlockScaledFP8) {
+      return ldmatrix<false, 2>(address);
+    } else {
+      return ldmatrix_8x16_4x_unpack_4b<2>(address);
+    }
+  }
+}
+
+template <KVPageFormat format>
+__device__ inline InstInMat<2, 2> convertK(KFragment<format> const& fragment,
+                                           Vec<uint32_t, 2> const& scaleWords, uint32_t scaleColumn,
+                                           float globalScale) {
+  if constexpr (format == KVPageFormat::kA16) {
+    return fragment;
+  } else {
     InstInMat<2, 2> result;
 #pragma unroll
     for (uint32_t n = 0; n < 2; ++n) {
-      uint32_t const token = row + n * 8 + laneId() / 4;
-      uint8_t const scale = ldsU8(smemAddr(scales) + token * scaleStride + scaleColumn);
+      uint8_t const scale = scaleWords[n] >> (scaleColumn * 8);
       uint32_t const sf =
           broadcastA16Scale<InputElem>(convertE4M3ScaleToA16Bits<InputElem>(scale, globalScale));
-      uint32_t const word = packed[n];
+      uint32_t const word = fragment[n];
       if constexpr (format == KVPageFormat::kBlockScaledFP8) {
         result.data[n][0] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(word), sf);
         result.data[n][1] = mulA16x2<InputElem>(convertE4M3x2ToA16<InputElem>(word >> 16), sf);
@@ -162,12 +183,24 @@ __device__ inline void smemQKPartGemmMixed(
       }
       float const scale =
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
-#pragma unroll 1
-      for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
-        auto const b =
-            mixed_kv_fragments::loadK<format>(k, tile * 16, block, part, scales, scale, page, head,
-                                              tokenBase, skipTokens, cacheSeqLen);
+      static_assert(kHeadPartBytes <= 128);
+      Vec<uint32_t, 2> scaleWords;
+      if constexpr (format != flashinfer::KVPageFormat::kA16) {
+#pragma unroll
+        for (uint32_t n = 0; n < 2; ++n) {
+          uint32_t const token = tile * 16 + n * 8 + laneId() / 4;
+          scaleWords[n] = reinterpret_cast<uint32_t const*>(scales)[token];
+        }
+      }
+      auto const fetch = [&](uint32_t block) {
+        return mixed_kv_fragments::fetchK<format>(k, tile * 16, block, part, page, head, tokenBase,
+                                                  skipTokens, cacheSeqLen);
+      };
+      auto const consume = [&](auto const& fragment, uint32_t block) {
         auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
+        uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
+        auto const b =
+            mixed_kv_fragments::convertK<format>(fragment, scaleWords, scaleColumn, scale);
 #pragma unroll
         for (uint32_t i = 0; i < rows; ++i) {
 #pragma unroll
@@ -176,7 +209,9 @@ __device__ inline void smemQKPartGemmMixed(
             mma<InputElem>(acc(i, tile * 2 + n).data, a(i, 0).data, operand);
           }
         }
-      }
+      };
+      // Fetch the next packed operand before converting and multiplying this one.
+      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32>(fetch, consume);
     });
   }
 }
