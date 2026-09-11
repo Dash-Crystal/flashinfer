@@ -3616,10 +3616,10 @@ def xqa_batch_decode_with_kv_cache(
         KV cache scaling factors. Must provide when NVFP4 KV cache is used.
 
     q_cu_seq_lens : Optional[torch.Tensor] = None
-        cumulative draft lengths [batch_size + 1] (int32, on device) enabling
-        ragged Q: requests may have different draft lengths. When given,
+        Cumulative query lengths [batch_size + 1] (int32, on device) enabling
+        ragged Q, including zero-query rows and single-query spans. When given,
         query/out stay packed as [total_q_tokens, num_heads, head_dim],
-        q_len_per_req must be the maximum draft length, and mask rows are
+        q_len_per_req bounds the query lengths, and mask rows are
         packed by the same cumulative offsets. On SM90 with fp8 KV cache,
         speculative decode runs on the generic kernel instead of the Hopper
         fp8 kernel (see :func:`flashinfer.xqa.xqa`).
@@ -3685,11 +3685,6 @@ def xqa_batch_decode_with_kv_cache(
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
     if q_cu_seq_lens is not None:
-        # Ragged Q: query stays packed as [total_q_tokens, num_heads, head_dim]
-        # and q_len_per_req is the max draft length across the batch.
-        assert q_len_per_req > 1, (
-            "q_cu_seq_lens requires q_len_per_req to be the max draft length (> 1)"
-        )
         query_new = query
         out_shape_ref = query
     else:
