@@ -111,6 +111,16 @@ struct ReadyGemm {
 template <typename Element>
 struct ReadyKernel : ReadyGemm<Element>::Kernel {
   using Base = typename ReadyGemm<Element>::Kernel;
+#if FLASHINFER_READY_MATH_REGISTERS
+  static constexpr int LoadThreads = Base::NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
+  static constexpr int MathThreads = Base::MaxThreadsPerBlock - LoadThreads;
+  // The CTA pool is fixed at entry; setmaxnreg only redistributes that pool.
+  static constexpr int EntryRegisterRequirement =
+      ((Base::LoadRegisterRequirement * LoadThreads + Base::MmaRegisterRequirement * MathThreads +
+        Base::MaxThreadsPerBlock * 8 - 1) /
+       (Base::MaxThreadsPerBlock * 8)) *
+      8;
+#endif
   struct Params : Base::Params {
     int* readiness;
     int groups;

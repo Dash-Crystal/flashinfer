@@ -217,5 +217,15 @@ each scale by its FP32 global scale, then packs the two rounded A16 values in on
 conversion. K broadcasts the two result halves; V consumes the pair directly.
 The ordinary paired scaling helper uses this implementation too. V72 SASS had
 two separate E4M3 conversions and two scalar BF16 conversions at this boundary.
-The paired source needs full-model compilation, emitted-instruction inspection
-and latency measurement; no performance gain is inferred from the source alone.
+V75's full-model binary emits one E4M3 pair conversion and one packed BF16
+rounding instruction at this boundary. D256 decode uses 117 registers with no
+local-memory spills. Its completed comparison remains pending.
+
+The ready projection's resource policy now also declares its entry register
+requirement to the native CUTLASS entry. The previous 184/192 math-register
+specializations still reserved 168 registers per thread at entry; the TP producer
+could not share that SM. The entry budget is the rounded weighted load/math
+allocation, preserving the grid-constant parameter contract and common kernel
+body. CUDA's occupancy model still determines actual co-residency. The CUTLASS
+entry source participates in the JIT identity. Full-model compilation and
+measurement must establish the resulting allocation, spills, and latency.
