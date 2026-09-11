@@ -102,8 +102,9 @@ constexpr bool kA16CopyFastPath =
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
-constexpr bool splitD256DecodeCTA = compactMixedPages && !SPEC_DEC && headElems == 256 &&
-                                    headGrpSize * beamWidth <= 8 && tokensPerPage <= 128;
+constexpr bool splitD256DecodeCTA = compactMixedPages && XQA_MAX_QUERY_LENGTH == 1 &&
+                                    headElems == 256 && headGrpSize * beamWidth <= 8 &&
+                                    tokensPerPage <= 128;
 CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {4, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
@@ -155,7 +156,7 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = smallSmemVTileSeqLen;
 // D256 uses the same copy schedule without storing unused padded Q rows.
 // Wider heads and query tiles retain 64 B K parts.
 // Native block-scaled builds need >= 32 V rows per warp pair for scale copies.
-#if CACHE_ELEM_ENUM == 5 && !SPEC_DEC && \
+#if CACHE_ELEM_ENUM == 5 && XQA_MAX_QUERY_LENGTH == 1 && \
     (HEAD_ELEMS <= 128 || (HEAD_ELEMS == 256 && HEAD_GRP_SIZE * BEAM_WIDTH <= 8))
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 16;
@@ -2070,15 +2071,15 @@ CUBIN_EXPORT __global__
     uint32_t const idxHeadTokenBeg = nbQHeads * reqSeqOffset + (idxHeadGrp * headGrpSize);
     TinyPtr<IOHead const> const src{srcBase, idxHeadTokenBeg};
 
-    bool const isFullTile = (nbValidHeadTokens == warpTile.y);
+    bool const isFullTile = (nbValidHeadTokens == SharedMem::qRows);
     static_assert(nbQBuffers == 1);
     if (isFullTile) {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     SharedMem::qkSwizzle, true, warpTile.y>(
+      copyHeadsAsync<PaddedInputHead, SharedMem::qRows, ctaShapeInWarps.x, grainBytes, grainBytes,
+                     SharedMem::qkSwizzle, true, SharedMem::qRows>(
           warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
     } else {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     SharedMem::qkSwizzle, false, warpTile.y>(
+      copyHeadsAsync<PaddedInputHead, SharedMem::qRows, ctaShapeInWarps.x, grainBytes, grainBytes,
+                     SharedMem::qkSwizzle, false, SharedMem::qRows>(
           warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
     }
 
