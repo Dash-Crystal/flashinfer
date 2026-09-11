@@ -10,6 +10,11 @@ namespace mixed_kv_fragments {
 
 using flashinfer::KVPageFormat;
 
+// Match the four adjacent K coefficients owned by each lane in the mixed consumer.
+struct A16KColumns {
+  __device__ uint32_t operator()(uint32_t lane, uint32_t pair) const { return lane * 4 + pair * 2; }
+};
+
 template <typename Function>
 __device__ inline void visit(uint8_t format, Function const& function) {
 #if MIXED_PAGE_STATIC_FORMAT >= 0
@@ -57,7 +62,8 @@ __device__ inline Fragment<format> fetchK(SharedMem::KSmemBuffer const& tile, ui
     for (uint32_t n = 0; n < 2; ++n) {
       uint32_t const token = row + n * 8 + laneId() / 4;
       uint32_t const absoluteToken = tokenBase + token;
-      uint32_t const column = part * kHeadPartBytes + block * 32 + quad * 8;
+      uint32_t const column =
+          part * kHeadPartBytes + block * 32 + A16KColumns{}(quad, 0) * sizeof(InputElem);
       uint64_t bits = 0;
       if (page.allocated && absoluteToken >= skipTokens && absoluteToken < cacheSeqLen &&
           column + 8 <= validElemsPerHead * sizeof(InputElem)) {
@@ -248,8 +254,8 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
         }
 #endif
 #if XQA_MIXED_NATIVE_MMA
-        auto const a =
-            q.template matrix<rows>(part * (kHeadPartBytes / inputElemSize) + block * 16);
+        auto const a = q.template matrix<rows>(part * (kHeadPartBytes / inputElemSize) + block * 16,
+                                               mixed_kv_fragments::A16KColumns{});
 #else
         auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
 #endif

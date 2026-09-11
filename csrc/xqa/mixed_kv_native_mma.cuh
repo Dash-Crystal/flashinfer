@@ -23,8 +23,8 @@ struct QueryRows {
     return source != nullptr && coefficient < validElemsPerHead ? float(source[coefficient]) : 0;
   }
 
-  template <uint32_t Rows>
-  __device__ auto matrix(uint32_t coefficient) const {
+  template <uint32_t Rows, typename Columns>
+  __device__ auto matrix(uint32_t coefficient, Columns columns) const {
     Array2D<InstInMat<2, 2>, Rows, 1> result;
 #pragma unroll
     for (uint32_t i = 0; i < Rows; ++i) {
@@ -33,7 +33,7 @@ struct QueryRows {
         auto const* source = row(i * 16 + laneId() / 4 + m * 8);
 #pragma unroll
         for (uint32_t k = 0; k < 2; ++k) {
-          uint32_t const column = coefficient + (laneId() % 4) * 2 + k * 8;
+          uint32_t const column = coefficient + columns(laneId() % 4, k);
           result(i, 0).data[k][m] = source != nullptr && column + 2 <= validElemsPerHead
                                         ? *reinterpret_cast<uint32_t const*>(source + column)
                                         : 0;
