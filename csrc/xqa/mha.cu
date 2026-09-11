@@ -83,8 +83,9 @@ constexpr uint32_t grainBytesSf = 4;
 constexpr bool enableMicroFastPath = false;
 
 // SM12x consumes packed KV directly in matrix operand registers.
-#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && defined(__CUDA_ARCH__) && \
-    (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && \
+    (XQA_MIXED_NATIVE_MMA ||                    \
+     (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)))
 #define ENABLE_MIXED_COMPACT_PAGES 1
 #else
 #define ENABLE_MIXED_COMPACT_PAGES 0
