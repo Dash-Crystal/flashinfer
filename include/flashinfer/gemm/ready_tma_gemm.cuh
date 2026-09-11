@@ -221,8 +221,6 @@ cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, 
   args.epilogue.ptr_D = out;
   args.epilogue.dD = {ldd, _1{}, 0};
   args.hw_info.sm_count = available_sms;
-  // Consume columns of the earliest row tile before waiting on later rows.
-  args.scheduler.raster_order = Kernel::TileScheduler::RasterOrderOptions::AlongN;
   typename Kernel::Params params{Kernel::to_underlying_arguments(args, workspace), readiness,
                                  (m + group_rows - 1) / group_rows, done_index};
   auto grid = Kernel::get_grid_shape(params);
