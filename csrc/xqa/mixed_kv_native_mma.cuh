@@ -6,23 +6,51 @@
 
 namespace mixed_kv_fragments {
 
-__device__ inline float queryCoefficient(SharedMem::QSmemBuffer const& q, uint32_t row,
-                                         uint32_t coefficient) {
-  // Invert XQA's existing A16 query permutation within each 16-coefficient group.
-  uint32_t const local = coefficient % 16;
-  uint32_t const permuted = (local % 4) / 2 * 8 + (local / 4) * 2 + local % 2;
-  uint32_t const column = coefficient / 16 * 2 + permuted / 8;
-  auto const& grain = q.template at<SharedMem::qkSwizzle>(row % SharedMem::qRows, column);
-  return float(reinterpret_cast<InputElem const*>(&grain)[permuted % 8]);
-}
+struct QueryRows {
+  InputElem const* values;
+  uint32_t rowBegin;
+  uint32_t rows;
+  uint32_t heads;
+
+  __device__ InputElem const* row(uint32_t local) const {
+    uint32_t const packed = rowBegin + local;
+    return local < rows ? values + (packed / headGrpSize * heads + packed % headGrpSize) * headElems
+                        : nullptr;
+  }
+
+  __device__ float operator()(uint32_t local, uint32_t coefficient) const {
+    auto const* source = row(local);
+    return source != nullptr && coefficient < validElemsPerHead ? float(source[coefficient]) : 0;
+  }
+
+  template <uint32_t Rows>
+  __device__ auto matrix(uint32_t coefficient) const {
+    Array2D<InstInMat<2, 2>, Rows, 1> result;
+#pragma unroll
+    for (uint32_t i = 0; i < Rows; ++i) {
+#pragma unroll
+      for (uint32_t m = 0; m < 2; ++m) {
+        auto const* source = row(i * 16 + laneId() / 4 + m * 8);
+#pragma unroll
+        for (uint32_t k = 0; k < 2; ++k) {
+          uint32_t const column = coefficient + (laneId() % 4) * 2 + k * 8;
+          result(i, 0).data[k][m] = source != nullptr && column + 2 <= validElemsPerHead
+                                        ? *reinterpret_cast<uint32_t const*>(source + column)
+                                        : 0;
+        }
+      }
+    }
+    return result;
+  }
+};
 
 struct NativeQueryFP4 {
   uint32_t values[4];
   uint32_t scales;
 };
 
-__device__ inline void prepareNativeQuery(SharedMem::NativeQuery& dst,
-                                          SharedMem::QSmemBuffer const& q, uint32_t warp) {
+__device__ inline void prepareNativeQuery(SharedMem::NativeQuery& dst, QueryRows const& q,
+                                          uint32_t warp) {
   // One conversion per query, shared by every KV tile and every QK warp.
   constexpr uint32_t groups = ctaShapeInWarps.x * warp_size / 4;
   for (uint32_t group = warp * 8 + laneId() / 4; group < SharedMem::qRows * headElems / 16;
@@ -34,7 +62,7 @@ __device__ inline void prepareNativeQuery(SharedMem::NativeQuery& dst,
     float maximum = 0;
 #pragma unroll
     for (uint32_t i = 0; i < 4; ++i) {
-      values[i] = queryCoefficient(q, row, block * 16 + lane * 4 + i);
+      values[i] = q(row, block * 16 + lane * 4 + i);
       maximum = fmaxf(maximum, fabsf(values[i]));
     }
     maximum = fmaxf(maximum, __shfl_xor_sync(~0U, maximum, 1));

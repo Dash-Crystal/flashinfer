@@ -169,7 +169,11 @@ __device__ inline InstInMat<2, 2> convertV(Fragment<format> const& fragment,
 }  // namespace mixed_kv_fragments
 
 __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
+#if XQA_MIXED_NATIVE_MMA
+                                           mixed_kv_fragments::QueryRows const& q,
+#else
                                            SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
+#endif
                                            SharedMem::KSmemBuffer const& k,
                                            MixedPageReferences<nbPagesPerWarpTile> const& pages,
                                            PageTransport const& transport, uint32_t head,
@@ -243,7 +247,12 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
           return;
         }
 #endif
+#if XQA_MIXED_NATIVE_MMA
+        auto const a =
+            q.template matrix<rows>(part * (kHeadPartBytes / inputElemSize) + block * 16);
+#else
         auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
+#endif
         auto const b =
             mixed_kv_fragments::convertK<format>(fragment, scaleWords, scaleColumn, scale);
 #pragma unroll

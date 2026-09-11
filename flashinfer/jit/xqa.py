@@ -145,6 +145,12 @@ def gen_xqa_module(
     use_spec_dec = uses_query_spans(
         q_seq_len, ragged=use_ragged_q, logical_mask=mask_mod_source is not None
     )
+    continuation = (
+        mixed_page
+        and q_seq_len > 32
+        and head_dim >= 256
+        and any(major == 12 for major, _ in CompilationContext().TARGET_CUDA_ARCHS)
+    )
     if use_spec_dec:
         # The SPEC_Q_SEQ_LEN (SWAP_AB) specialization requires a uniform q
         # length across the batch, so it must be skipped for ragged Q.
@@ -162,7 +168,9 @@ def gen_xqa_module(
         # MMA rows; on sm90 it is the condition for the 2-CTA/SM SharedMem layout and
         # __launch_bounds__(256, 2) of the mixed-page build).  Only the mixed-page modules
         # take it: they are the ones measured on both hosts.
-        if mixed_page and (q_seq_len * head_group_ratio <= 16 or head_dim >= 256):
+        if continuation:
+            flag_spec_dec.append(f"-DM_TILESIZE={64 if head_dim == 256 else 32}")
+        elif mixed_page and (q_seq_len * head_group_ratio <= 16 or head_dim >= 256):
             flag_spec_dec.append("-DM_TILESIZE=16")
     else:
         flag_spec_dec = ["-DSPEC_DEC=0"]
@@ -220,7 +228,7 @@ def gen_xqa_module(
             f"-I{header.parent}",
             f"-I{Path(torch.__file__).parent / 'include'}",
         ]
-    transport_version = "live_query_work_v15" if mixed_page else "work_operand_v6"
+    transport_version = "live_query_work_v16" if mixed_page else "work_operand_v6"
     module_name = f"xqa_{transport_version}_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{mask_suffix}"
     module_name += f"_page_table_{page_ratio}_{page_stride}"
     if native_mma:
