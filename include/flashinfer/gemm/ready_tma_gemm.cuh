@@ -27,7 +27,7 @@
 namespace flashinfer::ready_tma_gemm {
 
 using namespace cute;
-using ReadyTile = cutlass::gemm::GemmShape<128, 64, 64>;
+using ReadyTile = cutlass::gemm::GemmShape<FLASHINFER_READY_ROW_TILE, 64, 64>;
 using TileShape = Shape<Int<ReadyTile::kM>, Int<ReadyTile::kN>, Int<ReadyTile::kK>>;
 using ClusterShape = Shape<_1, _1, _1>;
 using InputStride = Stride<int64_t, _1, int64_t>;
@@ -88,11 +88,11 @@ template <typename Element>
 struct ReadyGemm {
   using MmaAtom = std::conditional_t<std::is_same_v<Element, cutlass::bfloat16_t>,
                                      SM80_16x8x16_F32BF16BF16F32_TN, SM80_16x8x16_F32F16F16F32_TN>;
-  using TiledMma =
-      decltype(make_tiled_mma(MmaAtom{}, Layout<Shape<_2, _2, _1>>{}, Tile<_128, _32, _16>{}));
+  using TiledMma = decltype(make_tiled_mma(MmaAtom{}, Layout<Shape<_2, _2, _1>>{},
+                                           Tile<Int<ReadyTile::kM>, _32, _16>{}));
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto, float, float, void,
+      Shape<Int<(ReadyTile::kM < 64 ? ReadyTile::kM : 64)>, _32>, float, float, void,
       cutlass::layout::RowMajor, 8, Element, cutlass::layout::RowMajor, 8,
       cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
   // Compose the existing typed mainloop directly: the convenience builder's

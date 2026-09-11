@@ -13,9 +13,11 @@ from ..utils import get_compute_capability
 
 
 @cache
-def get_masked_gemm_module(*, ready_tma: bool = False, math_registers: int = 0):
+def get_masked_gemm_module(
+    *, ready_tma: bool = False, math_registers: int = 0, row_tile: int = 128
+):
     return gen_masked_gemm_module(
-        ready_tma=ready_tma, math_registers=math_registers
+        ready_tma=ready_tma, math_registers=math_registers, row_tile=row_tile
     ).build_and_load()
 
 
@@ -111,21 +113,36 @@ def ready_gemm_info(
     device: int,
     dtype: torch.dtype,
     producer: tuple[int, int, int] | None = None,
+    *,
+    rows_per_partition: int = 128,
 ) -> ReadyGemmInfo:
+    if rows_per_partition <= 0:
+        raise ValueError("A projection partition must contain rows")
     ready_tma = get_compute_capability(torch.device("cuda", device))[0] == 12
-    module = get_masked_gemm_module(ready_tma=ready_tma)
+    # SM80 MMA's 2x2 warp layout covers at least 32 rows. Bind the largest
+    # supported tile within one publication partition before graph replay.
+    row_tile = (
+        max(32, min(128, 1 << (rows_per_partition.bit_length() - 1)))
+        if ready_tma
+        else 128
+    )
+    module = get_masked_gemm_module(ready_tma=ready_tma, row_tile=row_tile)
     args = (device, dtype == torch.bfloat16, *(producer or (0, 0, 0)))
     sms, occupancy, row_tile, workspace_bytes, budget, concurrent = (
         module.prepare_ready(*args)
     )
     if ready_tma and budget:
-        module = get_masked_gemm_module(ready_tma=True, math_registers=budget)
+        module = get_masked_gemm_module(
+            ready_tma=True, math_registers=budget, row_tile=row_tile
+        )
         sms, occupancy, row_tile, workspace_bytes, _, concurrent = module.prepare_ready(
             *args
         )
         logging.getLogger(__name__).info(
-            "Ready TMA resource plan: producer=%s, math_registers=%d, shared_sm=%s",
+            "Ready TMA resource plan: producer=%s, row_tile=%d, "
+            "math_registers=%d, shared_sm=%s",
             producer,
+            row_tile,
             budget,
             bool(concurrent),
         )
@@ -141,7 +158,16 @@ def create_ready_workspace(device: torch.device, dtype: torch.dtype) -> torch.Te
 
 
 def mm_ready_rows(
-    x, weight, out, readiness, *, group_rows, reserved_blocks, workspace, producer=None
+    x,
+    weight,
+    out,
+    readiness,
+    *,
+    group_rows,
+    reserved_blocks,
+    workspace,
+    producer=None,
+    rows_per_partition=128,
 ):
     """Multiply once, consuming row groups published by a concurrent producer.
 
@@ -160,6 +186,8 @@ def mm_ready_rows(
     the native TMA pipeline with
     separate loading and compute warps. Other architectures use CUTLASS Stream-K.
     The resource plan is cached per compiled producer before graph replay.
+    ``rows_per_partition`` binds the consumer tile to the caller's static row
+    partition: a tile waits only for its own rows, with a minimum of 32 on SM120.
     ``workspace`` is allocated and zeroed once with ``create_ready_workspace``;
     Stream-K partials and barriers occupy fixed, disjoint regions across shapes.
     The TMA path needs zero scratch bytes. Execution adds no allocation or
@@ -177,7 +205,9 @@ def mm_ready_rows(
         or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
-    info = ready_gemm_info(x.device.index, x.dtype, producer)
+    info = ready_gemm_info(
+        x.device.index, x.dtype, producer, rows_per_partition=rows_per_partition
+    )
     if (
         workspace.device != x.device
         or workspace.dtype != torch.uint8
