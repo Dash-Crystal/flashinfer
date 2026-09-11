@@ -2153,7 +2153,32 @@ CUBIN_EXPORT __global__
 
   uint32_t const seqStrideIters = nbSubSeqPerSeq;
   constexpr bool isKVCacheQuantized = (cacheElemSize < 2);
-  uint32_t const seqIterInit = nbSkipLeadingTiles + idxSubSeqInSeq;
+#if defined(XQA_MASK_SUPPORT) && BEAM_WIDTH == 1
+  auto supportProgram = [&](uint32_t head, uint32_t query) {
+    return xqa_mask_support(idxReq, idxHeadGrp * headGrpSize + head, query, query, 0,
+                            cacheSeqLen - 1, reinterpret_cast<uint64_t const*>(mask));
+  };
+  xqa_work::VisibleTiles<rowsPerBlock, decltype(supportProgram(0, 0))> const visibleTiles(
+      supportProgram, idxHeadTokenInGrp, actualQSeqLen, headGrpSize, cacheSeqLen, ctaTile.x,
+      nbSubSeqPerSeq);
+#endif
+  auto nextSeqIter = [&](uint32_t first) {
+#if defined(XQA_MASK_SUPPORT) && BEAM_WIDTH == 1
+    return visibleTiles.next(first);
+#else
+    return first;
+#endif
+  };
+  auto advanceSeqIter = [&](uint32_t current, uint32_t count) {
+    return count == 0 ? current : nextSeqIter(current + seqStrideIters * count);
+  };
+  auto nextPage = [&](uint32_t page, uint32_t step) {
+    uint32_t next = xqa_work::nextSplitPage(page, step, nbPagesPerCtaTile, nbSubSeqPerSeq);
+    if (next / nbPagesPerCtaTile != page / nbPagesPerCtaTile)
+      next = nextSeqIter(next / nbPagesPerCtaTile) * nbPagesPerCtaTile + next % nbPagesPerCtaTile;
+    return next;
+  };
+  uint32_t const seqIterInit = nextSeqIter(nbSkipLeadingTiles + idxSubSeqInSeq);
 #if BEAM_WIDTH > 1
   uint32_t const nbCtxCtaTiles = beamSearchParams.ctxLenList[idxReq * beamWidth] / ctaTile.x;
 #endif
@@ -2246,7 +2271,7 @@ CUBIN_EXPORT __global__
 #if BEAM_WIDTH == 1 && ENABLE_MIXED_KV_CACHE
     // Second call primes the two-deep prefetch: tile 0 becomes current (its tags
     // are requested now), tile 1's indices are in flight.
-    idxPageBeg += nbPagesPerCtaTile * nbSubSeqPerSeq;
+    idxPageBeg = nextPage(idxPageBeg, nbPagesPerCtaTile);
     loadPages(idxPageBeg);
 #endif
     auto loadKTilePart = [&](uint32_t seqIter, uint32_t idxBeam, uint32_t idxPart) mutable {
@@ -2428,7 +2453,7 @@ CUBIN_EXPORT __global__
       if (idxPart + 1 == nbPartsPerCacheKHead) {
         bool const isForNextSeqIter = isConvergedTile(seqIter) || idxBeam == beamWidth - 1;
         if (isForNextSeqIter) {
-          idxPageBeg += nbPagesPerCtaTile * nbSubSeqPerSeq;
+          idxPageBeg = nextPage(idxPageBeg, nbPagesPerCtaTile);
           loadPages(idxPageBeg);
         }
 #if BEAM_WIDTH > 1
@@ -2437,7 +2462,7 @@ CUBIN_EXPORT __global__
             isConvergedTile(seqIter)
                 ? mha::tuple<uint32_t, uint32_t>(0U, 1U)
                 : carryLE<beamWidth>(idxBeam + 1, 0);  // optimize for context cache
-        loadCacheIndir(seqIter + seqStrideIters * seqIterDelta, idxBeamNext);
+        loadCacheIndir(advanceSeqIter(seqIter, seqIterDelta), idxBeamNext);
 #endif
       }
     };
@@ -2481,7 +2506,8 @@ CUBIN_EXPORT __global__
     ThrdRegRowMax initRowMax;
     initRowMax.fill(safeInitRowMax);
 #endif
-    for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters) {
+    for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters;
+         seqIter = advanceSeqIter(seqIter, 1)) {
 #if SHORT_SEQ_OPT
       if (ctaTile.x * seqIter + warpTile.x * warpIdx.x >= cacheSeqLen) {
         break;
@@ -2513,7 +2539,7 @@ CUBIN_EXPORT __global__
               isConvergedTile(seqIter) ? carryLE<nbPartsPerKHead, 1U>(p + 1, idxBeam, 0U)
                                        : carryLE<nbPartsPerKHead, beamWidth>(p + 1, idxBeam, 0U);
 
-          loadKTilePart(seqIter + seqStrideIters * nNextBias, idxBeamNext, idxPartNext);
+          loadKTilePart(advanceSeqIter(seqIter, nNextBias), idxBeamNext, idxPartNext);
           ldgsts::commitGroup();
           // @fixme: do L2 cache prefetch for next iter tile if last part
 
@@ -2825,7 +2851,7 @@ CUBIN_EXPORT __global__
               ? carryLE<1, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0)
               : carryLE<beamWidth, nbXItersPerCtaTile>(idxBeam + isNextBeam, xIter, 0);
 
-      uint32_t const seqIterNext = seqIter + seqStrideIters * nNextBias;
+      uint32_t const seqIterNext = advanceSeqIter(seqIter, nNextBias);
       return mha::tuple<uint32_t, uint32_t, uint32_t, uint32_t>(seqIterNext, xIterNext, vIterNext,
                                                                 idxBeamNext);
     };
@@ -2842,7 +2868,7 @@ CUBIN_EXPORT __global__
         if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1 &&
             (idxBeam == beamWidth - 1 || isConvergedTile(seqIter))) {
           auto const step = 1;  // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
-          idxPageBeg = xqa_work::nextSplitPage(idxPageBeg, step, nbPagesPerCtaTile, nbSubSeqPerSeq);
+          idxPageBeg = nextPage(idxPageBeg, step);
           assert(beamWidth == 1 ||
                  cacheVTileSeqStride <= tokensPerPage &&
                      "todo: need to substrate from idxPageBeg for beam switching");
@@ -2866,7 +2892,7 @@ CUBIN_EXPORT __global__
         }
         // idxPageBeg already names the prefetched window. Advance that window,
         // including the interleaved split-KV jump, only when this tile crosses a page.
-        idxPageBeg = xqa_work::nextSplitPage(idxPageBeg, 1, nbPagesPerCtaTile, nbSubSeqPerSeq);
+        idxPageBeg = nextPage(idxPageBeg, 1);
 #else
         idxPageBeg = seqOffsetNext / tokensPerPage;
 #endif
@@ -2877,8 +2903,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1
         // The page window is prefetched one step ahead of vIter. Its own position
         // determines the split boundary; the current tile's phase is unrelated.
-        idxPageBeg =
-            xqa_work::nextSplitPage(idxPageBeg, step_per_viter, nbPagesPerCtaTile, nbSubSeqPerSeq);
+        idxPageBeg = nextPage(idxPageBeg, step_per_viter);
         loadPages(idxPageBeg);
 #else
         bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
@@ -3171,7 +3196,8 @@ CUBIN_EXPORT __global__
       unused(pWarpGrpBar->arrive());
     }
     bool xBarProducedParityNext = false;
-    for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters) {
+    for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters;
+         seqIter = advanceSeqIter(seqIter, 1)) {
 #if MIXED_COMPACT_TILE_LOOPS
       // [43] kCompactTileLoops rolls the X-tile loop: one V copy/expand/MMA body per module
       // (the unrolled form carried nbXItersPerCtaTile = 4 of them in the hot loop).  Kept as
