@@ -17,6 +17,10 @@
 
 #include "cuda_hint.cuh"
 #include "defines.h"
+#if XQA_MIXED_NATIVE_MMA
+#include <cute/arch/mma_sm120.hpp>
+#include <flashinfer/math.cuh>
+#endif
 #if !(IS_MLA)
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -503,6 +507,9 @@ struct alignas(128) SharedMem {
   MixedPageFormats<nbPagesPerWarpTile> kFormats[ctaShapeInWarps.x][nbKBuffers];
 #endif
   MixedPageFormats<nbPagesPerVTile> vFormats[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
+#if XQA_MIXED_NATIVE_MMA
+  MixedPageReferences<nbPagesPerVTile> vPages[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
+#endif
   uint8_t kNeedsExpansion[ctaShapeInWarps.x][nbKBuffers];
   uint8_t vNeedsExpansion[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbVBuffers];
   // Row maxNbCopiedHeads of a warp's range is the dump row for its lanes past the tile's
@@ -1216,6 +1223,9 @@ __device__ inline auto loadQueryMatrix(Warp const& warp, SharedMem::QSmemBuffer 
 }
 
 #if ENABLE_MIXED_COMPACT_PAGES
+#if XQA_MIXED_NATIVE_MMA
+#include "mixed_kv_native_mma.cuh"
+#endif
 #include "mixed_kv_fragments.cuh"
 #endif
 
@@ -2918,6 +2928,9 @@ CUBIN_EXPORT __global__
       if (laneId() == 0) {
         smem.vNeedsExpansion[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] = needsExpansion;
         smem.vFormats[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] = pageFormats;
+#if XQA_MIXED_NATIVE_MMA
+        smem.vPages[warpGrpIdx][warpIdxInGrp][idxNextSMemVBuf] = pageReferences;
+#endif
       }
       __syncwarp();
 #endif
@@ -3334,7 +3347,16 @@ CUBIN_EXPORT __global__
                     warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile,
                     idxVTile, smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
                     &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
-                    idxNSplit, fp8VGlobalScale, fp4VGlobalScale);
+                    idxNSplit, fp8VGlobalScale, fp4VGlobalScale
+#if XQA_MIXED_NATIVE_MMA
+                    ,
+                    smem.vPages[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], cacheList.transport,
+                    idxHeadGrp,
+                    ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
+                        cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx,
+                    grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems
+#endif
+                );
               } else
 #endif
               {

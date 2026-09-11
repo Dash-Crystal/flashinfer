@@ -71,6 +71,11 @@ struct KVPageTransport {
     result.payload_stride = {0, storage.geometry.heads * 2 * row_bytes, 2 * row_bytes};
     result.scale_stride = {0, storage.geometry.heads * storage.geometry.head_dim / 8,
                            storage.geometry.head_dim / 8};
+    if (storage.geometry.native_mma && format != static_cast<uint8_t>(KVPageFormat::kA16)) {
+      result.payload_stride = {0, row_bytes, 2 * storage.geometry.tokens * row_bytes};
+      result.scale_stride = {0, storage.geometry.head_dim / 16,
+                             storage.geometry.tokens * storage.geometry.head_dim / 8};
+    }
     return result;
   }
 };

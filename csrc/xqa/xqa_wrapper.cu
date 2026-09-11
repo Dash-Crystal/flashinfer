@@ -119,7 +119,8 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                              static_cast<uint64_t*>(pages.data_ptr()),
                              static_cast<uint32_t>(pages.stride(0)),
                              static_cast<uint32_t>(pages.size(1)),
-                             {tokensPerPage, static_cast<uint32_t>(nbKHeads), validElemsPerHead}};
+                             {tokensPerPage, static_cast<uint32_t>(nbKHeads), validElemsPerHead,
+                              bool(XQA_MIXED_NATIVE_MMA)}};
   } else {
     TVM_FFI_ICHECK(fp8KPayload.has_value() && fp8VPayload.has_value() && fp8KScales.has_value() &&
                    fp8VScales.has_value() && fp4KPayload.has_value() && fp4VPayload.has_value() &&

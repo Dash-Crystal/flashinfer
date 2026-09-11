@@ -37,12 +37,13 @@ struct KVPageAddress {
   }
 };
 
-// Every page uses [token, head, K/V, coefficient] ordering. Scales follow the
-// payload in [token, head, K/V, coefficient / 16] order. No A16 row gaps remain.
+// A16 uses [token, head, K/V, coefficient]. Native MMA pages keep K rows and
+// transposed V rows in separate head planes; each scale spans 16 reduction values.
 struct KVPageGeometry {
   uint32_t tokens;
   uint32_t heads;
   uint32_t head_dim;
+  bool native_mma = false;
 
   __host__ __device__ uint64_t values() const { return uint64_t(tokens) * heads * 2 * head_dim; }
   __host__ __device__ uint32_t row_bytes(KVPageFormat format) const {
@@ -61,6 +62,25 @@ struct KVPageGeometry {
   }
   __host__ __device__ uint64_t row(uint32_t token, uint32_t head, bool is_v) const {
     return (uint64_t(token) * heads + head) * 2 + uint32_t(is_v);
+  }
+  __host__ __device__ uint64_t value_index(KVPageFormat format, uint32_t token, uint32_t head,
+                                           bool is_v, uint32_t dim) const {
+    if (!native_mma || format == KVPageFormat::kA16) return row(token, head, is_v) * head_dim + dim;
+    return (uint64_t(head) * 2 + uint32_t(is_v)) * tokens * head_dim +
+           (is_v ? uint64_t(dim) * tokens + token : uint64_t(token) * head_dim + dim);
+  }
+  __host__ __device__ uint64_t scale_index(uint32_t token, uint32_t head, bool is_v,
+                                           uint32_t dim) const {
+    return value_index(KVPageFormat::kBlockScaledFP8, token, head, is_v, dim) / 16;
+  }
+  __host__ __device__ uint64_t a16_index(uint64_t encoded_index) const {
+    if (!native_mma) return encoded_index;
+    uint32_t const plane = encoded_index / (uint64_t(tokens) * head_dim);
+    uint32_t const local = encoded_index % (uint64_t(tokens) * head_dim);
+    bool const is_v = plane % 2;
+    uint32_t const token = is_v ? local % tokens : local / head_dim;
+    uint32_t const dim = is_v ? local / tokens : local % head_dim;
+    return row(token, plane / 2, is_v) * head_dim + dim;
   }
 };
 
@@ -82,13 +102,17 @@ struct KVPageStorage {
   }
   __device__ uint8_t* payload(KVPageAddress address, uint32_t token, uint32_t head,
                               bool is_v) const {
+    auto const format = address.format();
+    uint64_t const index = geometry.value_index(format, token, head, is_v, 0);
     return data + address.offset() +
-           geometry.row(token, head, is_v) * geometry.row_bytes(address.format());
+           (format == KVPageFormat::kA16              ? index * 2
+            : format == KVPageFormat::kBlockScaledFP8 ? index
+                                                      : index / 2);
   }
   __device__ uint8_t* scales(KVPageAddress address, uint32_t token, uint32_t head,
                              bool is_v) const {
     return data + address.offset() + geometry.payload_bytes(address.format()) +
-           geometry.row(token, head, is_v) * (geometry.head_dim / 16);
+           geometry.scale_index(token, head, is_v, 0);
   }
 };
 

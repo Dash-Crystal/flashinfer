@@ -362,6 +362,12 @@ __device__ inline void copyMixedPartialHeadsAsync(
     constexpr bool isFP4 = format == fp4Format;
     static_assert(isA16 || isFP8 || isFP4);
     if constexpr (isA16 && narrowStaging) return;
+    if constexpr (XQA_MIXED_NATIVE_MMA && !isA16) {
+      if (!isK) return;
+    }
+    if constexpr (XQA_MIXED_NATIVE_MMA && isFP4 && narrowStaging) {
+      if (isK) return;
+    }
     auto const fmt = transport.span(address, format);
     auto const* payload = static_cast<uint8_t const*>(isK ? fmt.k_payload : fmt.v_payload);
     bool const pageValid = fmt.allocated;
@@ -482,6 +488,9 @@ __device__ inline void copyMixedPartialHeadsAsync(
 #endif
   }
 
+  if constexpr (XQA_MIXED_NATIVE_MMA) {
+    if (!isK) return;
+  }
   static_assert(validElemsPerHead % 64 == 0);
   constexpr uint32_t scaleLoadBytes = mha::max(4U, blocksPerPart);
   constexpr uint32_t scaleCopyBytes = mha::min(16U, scaleLoadBytes);

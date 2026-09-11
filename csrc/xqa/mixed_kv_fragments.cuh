@@ -175,6 +175,20 @@ __device__ inline void smemQKPartGemmMixed(
     uint32_t cacheSeqLen, uint8_t const* scales, uint32_t part, float fp8GlobalScale,
     float fp4GlobalScale) {
   constexpr uint32_t rows = warpTile.y / 16;
+#if XQA_MIXED_NATIVE_MMA
+  Vec<mixed_kv_fragments::NativeQueryFP4, rows> qFP4;
+  Array2D<mixed_kv_fragments::NativeOperandFP8, rows, kHeadPartBytes / 32> qFP8;
+#pragma unroll
+  for (uint32_t i = 0; i < rows; ++i) {
+    qFP4[i] = mixed_kv_fragments::quantizeQueryFP4(q, i * 16, qColBeg);
+#pragma unroll
+    for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
+      qFP8(i, block) = mixed_kv_fragments::quantizeOperandFP8([&](uint32_t row, uint32_t k) {
+        return mixed_kv_fragments::queryCoefficient(q, i * 16 + row, qColBeg * 8 + block * 16 + k);
+      });
+    }
+  }
+#endif
   // Static accumulator indices, with a single format dispatch outside the rolled
   // reduction loop. The old block/page unrolling replicated every converter.
 #pragma unroll
@@ -183,6 +197,14 @@ __device__ inline void smemQKPartGemmMixed(
     uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
     mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
       constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
+#if XQA_MIXED_NATIVE_MMA
+      if constexpr (format == flashinfer::KVPageFormat::kBlockScaledFP4) {
+        mixed_kv_fragments::nativeFP4QK(
+            acc, qFP4, transport.span(address, static_cast<uint8_t>(format)), head, tokenBase,
+            skipTokens, cacheSeqLen, part, tile, fp4GlobalScale);
+        return;
+      }
+#endif
       flashinfer::KVPageFormatSpan page;
       if constexpr (format == flashinfer::KVPageFormat::kA16) {
         page = transport.span(address, static_cast<uint8_t>(format));
@@ -203,8 +225,21 @@ __device__ inline void smemQKPartGemmMixed(
                                                   skipTokens, cacheSeqLen);
       };
       auto const consume = [&](auto const& fragment, uint32_t block) {
-        auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
         uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
+#if XQA_MIXED_NATIVE_MMA
+        if constexpr (format == flashinfer::KVPageFormat::kBlockScaledFP8) {
+#pragma unroll
+          for (uint32_t i = 0; i < rows; ++i) {
+            auto const& a = qFP8(i, block);
+#pragma unroll
+            for (uint32_t n = 0; n < 2; ++n)
+              mixed_kv_fragments::nativeFP8Mma(acc(i, tile * 2 + n), a, fragment[n],
+                                               uint8_t(scaleWords[n] >> (scaleColumn * 8)), scale);
+          }
+          return;
+        }
+#endif
+        auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
         auto const b =
             mixed_kv_fragments::convertK<format>(fragment, scaleWords, scaleColumn, scale);
 #pragma unroll
@@ -217,19 +252,31 @@ __device__ inline void smemQKPartGemmMixed(
         }
       };
       // Fetch the next packed operand before converting and multiplying this one.
-      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32>(fetch, consume);
+      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32, bool(XQA_MIXED_NATIVE_MMA)>(
+          fetch, consume);
     });
   }
 }
 
-__device__ inline void smemXVPartGemmMixed(Warp const& warp, WarpAcc& acc, bool skipRescale,
-                                           UniformRescaleMask, ThrdRegRowMax rowScales,
-                                           SharedMem::XSmemBuffer const& x, uint32_t vTile,
-                                           SharedMem::VSmemBuffer const& v,
-                                           MixedPageFormats<nbPagesPerVTile> const& formats,
-                                           uint8_t const* scales, uint32_t headSlice,
-                                           float fp8GlobalScale, float fp4GlobalScale) {
+__device__ inline void smemXVPartGemmMixed(
+    Warp const& warp, WarpAcc& acc, bool skipRescale, UniformRescaleMask, ThrdRegRowMax rowScales,
+    SharedMem::XSmemBuffer const& x, uint32_t vTile, SharedMem::VSmemBuffer const& v,
+    MixedPageFormats<nbPagesPerVTile> const& formats, uint8_t const* scales, uint32_t headSlice,
+    float fp8GlobalScale, float fp4GlobalScale
+#if XQA_MIXED_NATIVE_MMA
+    ,
+    MixedPageReferences<nbPagesPerVTile> const& pages, PageTransport const& transport,
+    uint32_t head, uint32_t tokenBase, uint32_t headColumn
+#endif
+) {
   constexpr uint32_t rows = warpTile.y / 16;
+#if XQA_MIXED_NATIVE_MMA
+  QuadRegRowMax nativeScales;
+  if (skipRescale)
+    nativeScales.fill(1.0f);
+  else
+    nativeScales = replicateForQuad(warp, rowScales);
+#endif
   Vec<InputElem2, QuadRegRowMax::size> scalesQuad;
 #if INPUT_FP16
   auto const converted = __float2half2_rn(rowScales);
@@ -241,22 +288,31 @@ __device__ inline void smemXVPartGemmMixed(Warp const& warp, WarpAcc& acc, bool 
 #pragma unroll
   for (uint32_t tile = 0; tile < cacheVTileSeqLen / 16; ++tile) {
     uint32_t const column = SharedMem::XSmemBuffer::cols / nbCacheVTilesPerXTile * vTile + tile * 2;
-    auto a = loadMatrix<2, 2, rows, 1, false, false, false, false>(warp, x, 0, column);
-#pragma unroll
-    for (uint32_t i = 0; i < rows; ++i) {
-#pragma unroll
-      for (uint32_t n = 0; n < 2; ++n) {
-#pragma unroll
-        for (uint32_t j = 0; j < 2; ++j) {
-          auto& value = reinterpret_cast<InputElem2&>(a(i, 0).data[j][n]);
-          value = skipRescale ? value : value * scalesQuad[i * 2 + n];
-        }
-      }
-    }
     mixed_kv_fragments::visit(formats.values[tile * 16 / tokensPerPage], [&](auto tag) {
       constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
       float const scale =
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
+#if XQA_MIXED_NATIVE_MMA
+      if constexpr (format != flashinfer::KVPageFormat::kA16) {
+        mixed_kv_fragments::nativePV<format>(
+            acc, x, column, nativeScales, transport.storage,
+            flashinfer::KVPageAddress{pages.values[tile * 16 / tokensPerPage]}, head,
+            headColumn + headSlice * warpTile.x, (tokenBase + tile * 16) % tokensPerPage, scale);
+        return;
+      }
+#endif
+      auto a = loadMatrix<2, 2, rows, 1, false, false, false, false>(warp, x, 0, column);
+#pragma unroll
+      for (uint32_t i = 0; i < rows; ++i) {
+#pragma unroll
+        for (uint32_t n = 0; n < 2; ++n) {
+#pragma unroll
+          for (uint32_t j = 0; j < 2; ++j) {
+            auto& value = reinterpret_cast<InputElem2&>(a(i, 0).data[j][n]);
+            value = skipRescale ? value : value * scalesQuad[i * 2 + n];
+          }
+        }
+      }
       static_assert(warpTile.x <= 64);
       constexpr uint32_t blocks = warpTile.x / 16;
       uint32_t const firstBlock = headSlice * blocks;

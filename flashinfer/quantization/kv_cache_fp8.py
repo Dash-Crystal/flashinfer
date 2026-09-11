@@ -61,6 +61,7 @@ class MixedKVPagedCache(NamedTuple):
     page_storage: torch.Tensor | None = None
     page_addresses: torch.Tensor | None = None
     page_geometry: tuple[int, int, int] | None = None
+    native_mma: bool = False
 
 
 class MixedKVPageUpdatePhase(IntEnum):

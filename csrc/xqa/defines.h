@@ -18,6 +18,10 @@
 #pragma once
 #include "mha_stdheaders.cuh"
 
+#ifndef XQA_MIXED_NATIVE_MMA
+#define XQA_MIXED_NATIVE_MMA 0
+#endif
+
 #define STATIC_NB_K_HEADS 0
 #if STATIC_NB_K_HEADS
 #define NB_K_HEADS 2

@@ -996,10 +996,11 @@ __global__ void mixed_kv_arena_prepare_kernel(flashinfer::KVPageStorage storage,
       } else {
         value = decode_e2m1_nibble((payload[i / 2] >> ((i % 2) * 4)) & 15);
       }
-      const int kv = (i / storage.geometry.head_dim) % 2;
+      uint64_t const output_index = storage.geometry.a16_index(i);
+      const int kv = (output_index / storage.geometry.head_dim) % 2;
       const int scale_index = (static_cast<int>(format) - 1) * 2 + kv;
       const InType block_scale = InType(float(scale) * global_scales[scale_index]);
-      output[i] = InType(value * mixed_kv_to_float(block_scale));
+      output[output_index] = InType(value * mixed_kv_to_float(block_scale));
     }
   }
   __syncthreads();
@@ -1079,8 +1080,9 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
   auto* scales = payload + storage.geometry.payload_bytes(destination.format());
   const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
   for (int64_t i = threadIdx.x; i < values; i += THREADS) {
-    const int kv = (i / storage.geometry.head_dim) % 2;
-    const auto encoded = mixed_kv_quantize_block(mixed_kv_to_float(input[i]),
+    uint64_t const input_index = storage.geometry.a16_index(i);
+    const int kv = (input_index / storage.geometry.head_dim) % 2;
+    const auto encoded = mixed_kv_quantize_block(mixed_kv_to_float(input[input_index]),
                                                  global_scales[(format - 1) * 2 + kv], format);
     if (lane == 0) scales[i / BSFP8_BLOCK_SIZE] = encoded.scale;
     if (format == 1) {
@@ -1238,7 +1240,7 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
                            TensorView hints, TensorView counters, TensorView reservations,
                            TensorView a16_classes, TensorView classes, TensorView stats,
                            TensorView global_scales, TensorView thresholds, int64_t page_size,
-                           int64_t slab_bytes, int64_t phase) {
+                           int64_t slab_bytes, bool native_mma, int64_t phase) {
   CHECK_CUDA(k);
   CHECK_CUDA(v);
   CHECK_DIM(3, k);
@@ -1276,7 +1278,7 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
       static_cast<uint32_t>(pages.stride(0)),
       static_cast<uint32_t>(pages.size(1)),
       {static_cast<uint32_t>(page_size), static_cast<uint32_t>(k.size(1)),
-       static_cast<uint32_t>(k.size(2))}};
+       static_cast<uint32_t>(k.size(2)), native_mma}};
   TVM_FFI_ICHECK(storage.geometry.extent_bytes(flashinfer::KVPageFormat::kA16) <=
                  uint64_t(slab_bytes));
   TVM_FFI_ICHECK(slab_bytes <= UINT32_MAX && slabs.size(0) <= UINT32_MAX &&

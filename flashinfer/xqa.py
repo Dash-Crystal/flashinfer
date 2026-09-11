@@ -66,6 +66,7 @@ def get_xqa_module(
     mixed_page_static_format: int = -1,
     mask_mod_source: str | None = None,
     page_table_geometry: tuple[int, int] = (0, 0),
+    native_mma: bool = False,
 ):
     # Ragged Q must reuse the uniform module unless it changes the compile
     # flags; a second cache entry would re-register the same torch op.
@@ -85,6 +86,7 @@ def get_xqa_module(
         mixed_page_static_format,
         mask_mod_source,
         page_table_geometry,
+        native_mma,
     )
 
 
@@ -104,6 +106,7 @@ def _get_xqa_module_cached(
     mixed_page_static_format: int,
     mask_mod_source: str | None,
     page_table_geometry: tuple[int, int],
+    native_mma: bool,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -120,6 +123,7 @@ def _get_xqa_module_cached(
         mixed_page_static_format,
         mask_mod_source,
         page_table_geometry,
+        native_mma,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -323,6 +327,7 @@ class XQAWork:
             -1,
             None if mask_mod is None else mask_mod.source,
             (addresses.shape[1], addresses.stride(0)),
+            page_transport.native_mma,
         )
         self.sequence_tile = module.sequence_tile()
         self.query_rows = module.split_kv_geometry()[1]
@@ -809,6 +814,7 @@ def xqa(
             if packed_page
             else (0, 0)
         ),
+        packed_page and page_transport.native_mma,
     )
 
     if q_seq_len > 1:
