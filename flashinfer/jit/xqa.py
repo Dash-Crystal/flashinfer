@@ -228,7 +228,7 @@ def gen_xqa_module(
             f"-I{header.parent}",
             f"-I{Path(torch.__file__).parent / 'include'}",
         ]
-    transport_version = "live_query_work_v16" if mixed_page else "work_operand_v6"
+    transport_version = "live_query_work_v17" if mixed_page else "work_operand_v6"
     module_name = f"xqa_{transport_version}_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_block_scaled_fp8_{block_scaled_fp8}_mixed_page_{mixed_page}_static_format_{mixed_page_static_format}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{mask_suffix}"
     module_name += f"_page_table_{page_ratio}_{page_stride}"
     if native_mma:
@@ -255,6 +255,7 @@ def gen_xqa_module(
         + mask_flags
         + [
             f"-DXQA_MIXED_NATIVE_MMA={int(native_mma)}",
+            f"-DXQA_CONTINUATION_TILE={int(continuation)}",
             f"-DXQA_MAX_QUERY_LENGTH={q_seq_len}",
         ],
         extra_include_paths=jit_env.CUTLASS_INCLUDE_DIRS if native_mma else None,

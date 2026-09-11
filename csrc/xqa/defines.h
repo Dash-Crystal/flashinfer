@@ -22,6 +22,10 @@
 #define XQA_MIXED_NATIVE_MMA 0
 #endif
 
+#ifndef XQA_CONTINUATION_TILE
+#define XQA_CONTINUATION_TILE 0
+#endif
+
 #define STATIC_NB_K_HEADS 0
 #if STATIC_NB_K_HEADS
 #define NB_K_HEADS 2

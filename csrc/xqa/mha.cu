@@ -105,8 +105,7 @@ constexpr bool kA16CopyFastPath =
 constexpr bool splitD256DecodeCTA = compactMixedPages && XQA_MAX_QUERY_LENGTH == 1 &&
                                     headElems == 256 && headGrpSize * beamWidth <= 8 &&
                                     tokensPerPage <= 128;
-constexpr bool continuationTile =
-    compactMixedPages && XQA_MAX_QUERY_LENGTH > 32 && headElems >= 256 && M_TILESIZE > 16;
+constexpr bool continuationTile = XQA_CONTINUATION_TILE;
 CUBIN_EXPORT __device__ constexpr uint3 ctaShapeInWarps = {4, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
@@ -3906,20 +3905,20 @@ struct KernelLaunchGeometry {
   uint32_t sharedBytes;
   uint32_t scratchBytes;
   uint3 warps;
+  uint2 tile;
   SplitKVGeometry splitKV;
 
   dim3 block() const { return {warp_size * warps.x, warps.y, warps.z}; }
   uint32_t threads() const { return warp_size * warps.x * warps.y * warps.z; }
-  uint32_t sequenceTile() const { return warpTile.x * warps.x; }
+  uint32_t sequenceTile() const { return tile.x; }
 };
+
+CUBIN_EXPORT __device__ constexpr KernelLaunchGeometry deviceGeometry = {
+    smemSize, scratchBytesPerCta, ctaShapeInWarps, ctaTile, splitKVGeometry};
 
 static KernelLaunchGeometry const hostGeometry = []() {
   KernelLaunchGeometry geometry;
-  checkCuda(cudaMemcpyFromSymbol(&geometry.sharedBytes, smemSize, sizeof(smemSize)));
-  checkCuda(
-      cudaMemcpyFromSymbol(&geometry.scratchBytes, scratchBytesPerCta, sizeof(scratchBytesPerCta)));
-  checkCuda(cudaMemcpyFromSymbol(&geometry.warps, ctaShapeInWarps, sizeof(ctaShapeInWarps)));
-  checkCuda(cudaMemcpyFromSymbol(&geometry.splitKV, splitKVGeometry, sizeof(splitKVGeometry)));
+  checkCuda(cudaMemcpyFromSymbol(&geometry, deviceGeometry, sizeof(geometry)));
   checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  geometry.sharedBytes));
   return geometry;
