@@ -67,20 +67,21 @@ struct ReadyMainloop : Base {
                            typename Base::PipelineState state, LoadInputs const& inputs,
                            BlockCoord const& block, KTileIterator k_tile, int k_tiles, int lane,
                            uint32_t cluster_rank, typename Base::TensorStorage& tensors) {
-    const int first = int(get<0>(block)) * ReadyTile::kM;
-    const int end = min(first + ReadyTile::kM, params.rows);
-    for (int group = first / params.group_rows + lane; group <= (end - 1) / params.group_rows;
-         group += 32) {
-      const int expected = min(params.group_rows, params.rows - group * params.group_rows);
-      cuda::atomic_ref<int, cuda::thread_scope_device> ready(params.readiness[group]);
-      while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
-    }
-    __syncwarp();
-    // Publication orders the producer's generic stores; the elected TMA
-    // issuer must also acquire those bytes into the async proxy.
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    Base::load(params, pipeline, state, inputs, block, k_tile, k_tiles, lane, cluster_rank,
-               tensors);
+    auto ready_a = [&] {
+      const int first = int(get<0>(block)) * ReadyTile::kM;
+      const int end = min(first + ReadyTile::kM, params.rows);
+      for (int group = first / params.group_rows + lane; group <= (end - 1) / params.group_rows;
+           group += 32) {
+        const int expected = min(params.group_rows, params.rows - group * params.group_rows);
+        cuda::atomic_ref<int, cuda::thread_scope_device> ready(params.readiness[group]);
+        while (ready.load(cuda::memory_order_acquire) < expected) __nanosleep(64);
+      }
+      __syncwarp();
+      // Acquire published generic stores before issuing A's async loads.
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+    };
+    Base::load(params, pipeline, state, inputs, block, k_tile, k_tiles, lane, cluster_rank, tensors,
+               ready_a, Int<Base::DispatchPolicy::Stages>{});
   }
 };
 
