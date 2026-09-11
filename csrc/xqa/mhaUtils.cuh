@@ -365,9 +365,6 @@ __device__ inline void copyMixedPartialHeadsAsync(
     if constexpr (XQA_MIXED_NATIVE_MMA && !isA16) {
       if (!isK) return;
     }
-    if constexpr (XQA_MIXED_NATIVE_MMA && isFP4 && narrowStaging) {
-      if (isK) return;
-    }
     auto const fmt = transport.span(address, format);
     auto const* payload = static_cast<uint8_t const*>(isK ? fmt.k_payload : fmt.v_payload);
     bool const pageValid = fmt.allocated;

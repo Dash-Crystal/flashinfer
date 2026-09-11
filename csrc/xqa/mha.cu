@@ -465,6 +465,19 @@ struct alignas(128) SharedMem {
   using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
   using VSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
                               exactDiv(grpLoadV ? headElems : warpVHeadElems, cacheElemsPerGrain)>;
+#if XQA_MIXED_NATIVE_MMA
+  using StoredVSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
+                                    exactDiv(grpLoadV ? headElems : warpVHeadElems, grainBytes)>;
+  struct NativeQuery {
+    uint32_t fp8[headElems / 16][qRows][4];
+    uint32_t fp4[headElems / 16][qRows][2];
+    float fp8Scales[headElems / 16][qRows];
+    uint8_t fp4Scales[headElems / 16][qRows];
+  };
+  NativeQuery nativeQuery;
+#else
+  using StoredVSmemBuffer = VSmemBuffer;
+#endif
 
 #if ENABLE_4BIT_KV_CACHE
   using KSfSmemBuffer =
@@ -485,7 +498,7 @@ struct alignas(128) SharedMem {
   KSmemBuffer k[ctaShapeInWarps.x][nbKBuffers];
   XSmemBuffer x[ctaShapeInWarps.y][ctaShapeInWarps.x];
   static_assert(nbXBuffers == 1);
-  VSmemBuffer v[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers];
+  StoredVSmemBuffer v[gemm1NbWarpGrps][grpLoadV ? 1 : gemm1WarpsPerGrp][nbVBuffers];
 
 #if ENABLE_MIXED_KV_CACHE
   static constexpr uint32_t mixedKScaleBytes =
@@ -2456,6 +2469,12 @@ CUBIN_EXPORT __global__
       qBarParityNext = !qBarParityNext;
       assertWarpConverged();
     }
+#if XQA_MIXED_NATIVE_MMA
+    mixed_kv_fragments::prepareNativeQuery(smem.nativeQuery, smem.q[warpIdx.y][0], warpIdx.x);
+    unused(qBar.arrive());
+    qBar.wait_parity(qBarParityNext);
+    qBarParityNext = !qBarParityNext;
+#endif
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
     ThrdRegRowMax initRowMax;
     initRowMax.fill(safeInitRowMax);
@@ -2566,11 +2585,15 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_COMPACT_PAGES
           if constexpr (compactMixedPages) {
             uint32_t const tokenBase = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
-            smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
-                                smem.kPages[warpIdx.x][idxCurrSMemKBuf], cacheList.transport,
-                                idxHeadGrp, tokenBase, nbTotalSkipTokens, cacheSeqLen,
-                                &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p, fp8KGlobalScale,
-                                fp4KGlobalScale);
+            smemQKPartGemmMixed(
+                warp, acc, smemQ, smemQOffset, smemKPart, smem.kPages[warpIdx.x][idxCurrSMemKBuf],
+                cacheList.transport, idxHeadGrp, tokenBase, nbTotalSkipTokens, cacheSeqLen,
+                &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p, fp8KGlobalScale, fp4KGlobalScale
+#if XQA_MIXED_NATIVE_MMA
+                ,
+                smem.nativeQuery
+#endif
+            );
           } else
 #endif
           {
@@ -2727,7 +2750,7 @@ CUBIN_EXPORT __global__
     unused(smem.xBarriers[warpIdx.y][warpIdx.x].consumed.arrive(gemm1WarpsPerGrp *
                                                                 nbWarpGrpsPerXTile));
     CircIdx<nbVBuffers> idxCurrSMemVBuf{nbVBuffers - 1};
-    auto const getSmemVTile = [&](uint32_t idx) -> SharedMem::VSmemBuffer& {
+    auto const getSmemVTile = [&](uint32_t idx) -> SharedMem::StoredVSmemBuffer& {
       return smem.v[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idx];
     };
 #if ENABLE_4BIT_KV_CACHE
@@ -2743,7 +2766,9 @@ CUBIN_EXPORT __global__
     // This warp's scale rows of V buffer idx (its own token range + dump row under grpLoadV).
     auto const getSmemVScales = [&](uint32_t idx) -> uint8_t* {
       return &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idx]
-                          [grpLoadV ? SharedMem::vScaleRowsPerWarp * warpIdxInGrp : 0][0];
+                          [grpLoadV && !XQA_MIXED_NATIVE_MMA
+                               ? SharedMem::vScaleRowsPerWarp * warpIdxInGrp
+                               : 0][0];
     };
 #endif
 #if BEAM_WIDTH == 1
@@ -2973,7 +2998,12 @@ CUBIN_EXPORT __global__
       //     printf("}\n");
       // }
 
-#if GRP_LOAD_V
+#if XQA_MIXED_NATIVE_MMA
+      mixed_kv_fragments::copyNativeVAsync(
+          dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport.storage, pageReferences,
+          idxHeadGrp, tokenOffset, grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems,
+          grpLoadV ? warpIdxInGrp : 0U);
+#elif GRP_LOAD_V
       uint32_t const nbHeadsAvail =
           (seqIter + 1 < nbSeqIters)
               ? cacheVTileSeqLen
@@ -3279,7 +3309,7 @@ CUBIN_EXPORT __global__
               }
             }
             auto& smemVTile = getSmemVTile(idxCurrSMemVBuf);
-#if ENABLE_MIXED_KV_CACHE
+#if ENABLE_MIXED_KV_CACHE && !XQA_MIXED_NATIVE_MMA
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
             constexpr bool needsExpansion = kMixedStaticNeedsExpansion;  // [45c] build constant
 #elif MIXED_HOISTED_COPY
@@ -3357,11 +3387,15 @@ CUBIN_EXPORT __global__
                     idxHeadGrp,
                     ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
                         cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx,
-                    grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems
+                    grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems, nbTotalSkipTokens, cacheSeqLen
 #endif
                 );
-              } else
+              }
+#if !XQA_MIXED_NATIVE_MMA
+              else
 #endif
+#endif
+#if !XQA_MIXED_NATIVE_MMA
               {
                 smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask,
                                           xRowScales, smemXTile, idxVTile, smemVTile,
@@ -3370,6 +3404,7 @@ CUBIN_EXPORT __global__
 #endif
                                           idxNSplit);
               }
+#endif
 #else
               WarpAcc tmpAcc{};
               smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
