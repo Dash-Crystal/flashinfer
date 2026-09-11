@@ -26,6 +26,7 @@ from .jit.xqa import (
     gen_xqa_module_mla,
     ragged_q_changes_build,
     swap_ab_eligible,
+    uses_query_spans,
 )
 from .jit.utils import filename_safe_dtype_map
 from .quantization.kv_cache_fp8 import MixedKVPagedCache
@@ -309,7 +310,9 @@ class XQAWork:
             window_left + 1 if window_left is not None and window_left >= 0 else 0
         )
         self.query_heads = num_q_heads // heads
-        self.query_span = query_length > 1
+        self.query_span = uses_query_spans(
+            query_length, logical_mask=mask_mod is not None
+        )
         module = get_xqa_module(
             input_dtype,
             input_dtype,
@@ -550,7 +553,7 @@ def xqa(
 
     use_ragged_q = q_cu_seq_lens is not None
     if use_ragged_q:
-        assert q_seq_len > 1, "q_cu_seq_lens requires q_seq_len > 1 (the max draft len)"
+        assert q_seq_len >= 1, "q_seq_len must bound a nonempty query span"
         assert q.dim() == 3, (
             "With q_cu_seq_lens, q must be packed as "
             f"[total_q_tokens, num_q_heads, head_dim], got {q.dim()}D"
@@ -817,7 +820,10 @@ def xqa(
         packed_page and page_transport.native_mma,
     )
 
-    if q_seq_len > 1:
+    query_span = uses_query_spans(
+        q_seq_len, ragged=use_ragged_q, logical_mask=mask_mod is not None
+    )
+    if query_span:
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
@@ -840,7 +846,7 @@ def xqa(
     _last_dispatch = {
         "kernel_family": "mha_sm90.cu" if run_sm90_fp8_mha else "mha.cu",
         "module_uri": xqa_module.uri,
-        "spec_dec": q_seq_len > 1,
+        "spec_dec": query_span,
         "module_q_seq_len": module_q_seq_len,
     }
 

@@ -47,9 +47,14 @@ def _has_sm90_target() -> bool:
 
 
 def ragged_q_changes_build(q_seq_len: int, head_group_ratio: int) -> bool:
-    """True when ragged Q changes the build: it suppresses SPEC_Q_SEQ_LEN
-    (SWAP_AB), which only the SM90 kernel uses."""
-    return swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
+    """Ragged decode needs query offsets; SM90 also needs dynamic query width."""
+    return q_seq_len == 1 or (
+        swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
+    )
+
+
+def uses_query_spans(query_length, *, ragged=False, logical_mask=False):
+    return query_length > 1 or ragged or logical_mask
 
 
 def gen_xqa_module(
@@ -137,8 +142,10 @@ def gen_xqa_module(
     else:
         flag_low_prec_output = ["-DLOW_PREC_OUTPUT=0"]
 
-    if q_seq_len > 1:
-        use_spec_dec = True
+    use_spec_dec = uses_query_spans(
+        q_seq_len, ragged=use_ragged_q, logical_mask=mask_mod_source is not None
+    )
+    if use_spec_dec:
         # The SPEC_Q_SEQ_LEN (SWAP_AB) specialization requires a uniform q
         # length across the batch, so it must be skipped for ragged Q.
         ragged_changes_flags = use_ragged_q and ragged_q_changes_build(
@@ -158,10 +165,7 @@ def gen_xqa_module(
         if mixed_page and (q_seq_len * head_group_ratio <= 16 or head_dim >= 256):
             flag_spec_dec.append("-DM_TILESIZE=16")
     else:
-        if use_ragged_q:
-            raise ValueError("use_ragged_q requires q_seq_len > 1 (speculative decode)")
         flag_spec_dec = ["-DSPEC_DEC=0"]
-        use_spec_dec = False
         ragged_changes_flags = False
 
     compilation_context = CompilationContext()
