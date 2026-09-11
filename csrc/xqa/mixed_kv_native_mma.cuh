@@ -12,7 +12,7 @@ __device__ inline float queryCoefficient(SharedMem::QSmemBuffer const& q, uint32
   uint32_t const local = coefficient % 16;
   uint32_t const permuted = (local % 4) / 2 * 8 + (local / 4) * 2 + local % 2;
   uint32_t const column = coefficient / 16 * 2 + permuted / 8;
-  auto const& grain = q.template at<qkSwizzle>(row % SharedMem::qRows, column);
+  auto const& grain = q.template at<SharedMem::qkSwizzle>(row % SharedMem::qRows, column);
   return float(reinterpret_cast<InputElem const*>(&grain)[permuted % 8]);
 }
 

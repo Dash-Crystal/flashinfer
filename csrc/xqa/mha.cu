@@ -459,6 +459,7 @@ static_assert(ctaShapeInWarps.y == 1);
 
 struct alignas(128) SharedMem {
   static constexpr uint32_t qRows = MIXED_COMPACT_Q_ROWS ? 8 : warpTile.y;
+  static constexpr bool qkSwizzle = true;
   using QSmemBuffer = Array2D<LdGrain, qRows, exactDiv(qHeadPartBytes, grainBytes)>;
   using KSmemBuffer = Array2D<LdGrain, warpTile.x, exactDiv(kSharedPartBytes, grainBytes)>;
   using XSmemBuffer = Array2D<LdGrain, warpTile.y, exactDiv(inputElemSize* warpTile.x, grainBytes)>;
@@ -2035,7 +2036,6 @@ CUBIN_EXPORT __global__
 #endif
 #endif
 
-  constexpr bool qkSwizzle = true;
   // load whole Q heads into shared memory
 #if SPEC_DEC
   if (warpIdx.z == 0) {
@@ -2060,12 +2060,12 @@ CUBIN_EXPORT __global__
     static_assert(nbQBuffers == 1);
     if (isFullTile) {
       copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     qkSwizzle, true, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                  nbValidHeadTokens, localQHeadTokenIdxMap);
+                     SharedMem::qkSwizzle, true, warpTile.y>(
+          warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
     } else {
       copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     qkSwizzle, false, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                   nbValidHeadTokens, localQHeadTokenIdxMap);
+                     SharedMem::qkSwizzle, false, warpTile.y>(
+          warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
     }
 
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
@@ -2097,8 +2097,8 @@ CUBIN_EXPORT __global__
     constexpr bool isFullTile = (nbValidRows == SharedMem::qRows);
     static_assert(nbQBuffers == 1);
     copyHeadsAsync<PaddedInputHead, SharedMem::qRows, ctaShapeInWarps.x, grainBytes, grainBytes,
-                   qkSwizzle, isFullTile, SharedMem::qRows>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                            nbValidRows, localQHeadIdxMap);
+                   SharedMem::qkSwizzle, isFullTile, SharedMem::qRows>(
+        warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
   }
 #endif
@@ -2314,16 +2314,17 @@ CUBIN_EXPORT __global__
       uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
 #if MIXED_ALL_HOISTED_COPY
       unused(dstHeadOffset);
-      copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true>(
-          dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], cacheList.transport, pageReferences,
-          tagWord, idxHeadGrp, idxPart, nbHeadsSkip, nbHeadsAvail);
+      copyMixedPartialHeadsAsyncHoisted<warpTile.x, nbPartsPerCacheKHead, SharedMem::qkSwizzle,
+                                        true>(dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0],
+                                              cacheList.transport, pageReferences, tagWord,
+                                              idxHeadGrp, idxPart, nbHeadsSkip, nbHeadsAvail);
 #else
       static_assert(!kMixedStaticNeedsExpansion && kA16CopyFastPath,
                     "a16 static module: every page is A16, the stock A16 copy is the only body");
       unused(tagWord);
       copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
-                            grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
-                                                                   idxPart, nbHeadsAvail);
+                            grainBytesGmemCache, SharedMem::qkSwizzle, false>(
+          warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
 #endif
 #else
 #if ENABLE_MIXED_COMPACT_PAGES
@@ -2332,7 +2333,8 @@ CUBIN_EXPORT __global__
       }
       uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
       uint32_t const nbHeadsAvail = nbHeadsAvailRaw > warpTile.x ? warpTile.x : nbHeadsAvailRaw;
-      copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false, true>(
+      copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, SharedMem::qkSwizzle, false,
+                                 true>(
           dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset, cacheList.transport,
           pageReferences, tokenOffset, idxHeadGrp, true, idxPart, nbHeadsSkip, nbHeadsAvail);
 #else
@@ -2348,17 +2350,17 @@ CUBIN_EXPORT __global__
       __syncwarp();
       if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0 && isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
-                              grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
-                                                                    idxPart);
+                              grainBytesGmemCache, SharedMem::qkSwizzle, true>(
+            warp, dst, dstHeadOffset, src, idxPart);
       } else if (kA16CopyFastPath && !needsExpansion && nbHeadsSkip == 0) {
         uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
             (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
-                              grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
-                                                                     idxPart, nbHeadsAvail);
+                              grainBytesGmemCache, SharedMem::qkSwizzle, false>(
+            warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
       } else if (isFullTile) {
-        copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, true,
+        copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, SharedMem::qkSwizzle, true,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
             cacheList.transport, pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip
@@ -2371,7 +2373,7 @@ CUBIN_EXPORT __global__
         uint32_t const nbHeadsAvailRaw = seqOffset < cacheSeqLen ? cacheSeqLen - seqOffset : 0U;
         uint32_t const nbHeadsAvail =
             (kCompactTileLoops && nbHeadsAvailRaw > warpTile.x) ? warpTile.x : nbHeadsAvailRaw;
-        copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, qkSwizzle, false,
+        copyMixedPartialHeadsAsync<warpTile.x, nbPartsPerCacheKHead, SharedMem::qkSwizzle, false,
                                    compactMixedPages>(
             dst, &smem.kScales[warpIdx.x][idxNextSMemKBuf][0][0], dstHeadOffset,
             cacheList.transport, pageReferences, 0, idxHeadGrp, true, idxPart, nbHeadsSkip,
@@ -2387,16 +2389,16 @@ CUBIN_EXPORT __global__
 #else
       if (isFullTile) {
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
-                              grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
-                                                                    idxPart);
+                              grainBytesGmemCache, SharedMem::qkSwizzle, true>(
+            warp, dst, dstHeadOffset, src, idxPart);
       } else {
         uint32_t const nbHeadsAvail =
             (seqOffset < cacheSeqLen
                  ? cacheSeqLen - seqOffset
                  : 0U);  // may also be full but it can be handled correctly anyway
         copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
-                              grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
-                                                                     idxPart, nbHeadsAvail);
+                              grainBytesGmemCache, SharedMem::qkSwizzle, false>(
+            warp, dst, dstHeadOffset, src, idxPart, nbHeadsAvail);
       }
 #if ENABLE_4BIT_KV_CACHE
       copyPartialHeadsAsync<PaddedCacheHeadSf, warpTile.x, nbPartsPerCacheKHead, grainBytesSf,
@@ -2447,8 +2449,8 @@ CUBIN_EXPORT __global__
     constexpr bool reorderForKCache =
         useKVCache && inputElemSize == 2 && (cacheElemSize == 1 || compactMixedPages);
     if constexpr (reorderForKCache) {
-      reorder16bQHeadsToMatch8bKCache<ctaShapeInWarps.x, qkSwizzle, true>(warpIdx.x,
-                                                                          smem.q[warpIdx.y][0]);
+      reorder16bQHeadsToMatch8bKCache<ctaShapeInWarps.x, SharedMem::qkSwizzle, true>(
+          warpIdx.x, smem.q[warpIdx.y][0]);
       unused(qBar.arrive());
       qBar.wait_parity(qBarParityNext);
       qBarParityNext = !qBarParityNext;
@@ -2526,7 +2528,7 @@ CUBIN_EXPORT __global__
               // [44]: the helper begins with __syncwarp() - the waitGroup<1> above completed
               // this lane's copies only, and the scale word of a row was copied by another lane.
               expandMixedPartialHeadsInPlaceBF16Placement<warpTile.x, nbPartsPerCacheKHead,
-                                                          qkSwizzle>(
+                                                          SharedMem::qkSwizzle>(
                   smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0],
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT >= 0
                   0u,
@@ -2537,7 +2539,8 @@ CUBIN_EXPORT __global__
 #endif
                   0, fp8KGlobalScale, fp4KGlobalScale);
 #else
-              expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead, qkSwizzle>(
+              expandMixedPartialHeadsInPlace<warpTile.x, nbPartsPerCacheKHead,
+                                             SharedMem::qkSwizzle>(
                   smemKPart, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], 0,
                   smem.kFormats[warpIdx.x][idxCurrSMemKBuf], 0, p, fp8KGlobalScale,
                   fp4KGlobalScale);
