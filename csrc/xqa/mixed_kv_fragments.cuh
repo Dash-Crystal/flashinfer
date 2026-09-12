@@ -16,17 +16,17 @@ struct A16KColumns {
 };
 
 template <typename Function>
-__device__ inline decltype(auto) visit(uint8_t format, Function const& function) {
+__device__ inline void visit(uint8_t format, Function const& function) {
 #if MIXED_PAGE_STATIC_FORMAT >= 0
   unused(format);
-  return function(MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
+  function(MixedFormatTag<MIXED_PAGE_STATIC_FORMAT>{});
 #else
   if (format == static_cast<uint8_t>(KVPageFormat::kA16)) {
-    return function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kA16)>{});
+    function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kA16)>{});
   } else if (format == static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)) {
-    return function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)>{});
+    function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kBlockScaledFP8)>{});
   } else {
-    return function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4)>{});
+    function(MixedFormatTag<static_cast<uint8_t>(KVPageFormat::kBlockScaledFP4)>{});
   }
 #endif
 }
@@ -195,67 +195,43 @@ __device__ inline void smemQKPartGemmMixed(
       scaleWords[tile][n] = compressed ? reinterpret_cast<uint32_t const*>(scales)[token] : 0;
     }
   }
-  auto const withTile = [&](uint32_t tile, auto const& function) {
-    flashinfer::KVPageAddress const address{pages.values[tile * 16 / tokensPerPage]};
-    uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
-    return mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
-      constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
-      flashinfer::KVPageFormatSpan page;
-      if constexpr (format == flashinfer::KVPageFormat::kA16) {
-        page = transport.span(address, static_cast<uint8_t>(format));
-      }
-      float const scale =
-          format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
-      auto const fetch = [&](uint32_t block) {
-        return mixed_kv_fragments::fetchK<format>(k, tile * 16, block, part, page, head, tokenBase,
-                                                  skipTokens, cacheSeqLen);
-      };
-      auto const convert = [&](auto const& fragment, uint32_t block) {
-        uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
-        return mixed_kv_fragments::convertK<format>(fragment, scaleWords[tile], scaleColumn, scale);
-      };
-      return function(fetch, convert);
-    });
-  };
-  auto const loadQ = [&](uint32_t block) {
-    return loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
-  };
-  auto const multiply = [&](auto const& a, auto const& b, uint32_t tile) {
-#pragma unroll
-    for (uint32_t i = 0; i < rows; ++i) {
-#pragma unroll
-      for (uint32_t n = 0; n < 2; ++n) {
-        uint32_t const operand[2][1] = {b.data[n][0], b.data[n][1]};
-        mma<InputElem>(acc(i, tile * 2 + n).data, a(i, 0).data, operand);
-      }
-    }
-  };
-  if constexpr (XQA_MAX_QUERY_LENGTH > 1) {
-    // Wide query tiles amortize a Q load over several MMAs. Keep format
-    // dispatch outside the reduction and prefetch packed K before conversion.
-#pragma unroll
-    for (uint32_t tile = 0; tile < tiles; ++tile) {
-      withTile(tile, [&](auto const& fetch, auto const& convert) {
-        mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32>(
-            fetch, [&](auto const& fragment, uint32_t block) {
-              multiply(loadQ(block), convert(fragment, block), tile);
-            });
-      });
-    }
-  } else {
-    // Decode reuses one Q fragment across key tiles. Only two converted K
-    // fragments are live; all accumulator indices remain static.
+  // Reuse one Q fragment across every key tile, keeping only two converted K
+  // fragments live. The reduction loop stays rolled; tile/accumulator indices
+  // are static. Compressed storage never expands into a shared A16 tile.
 #pragma unroll 1
-    for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
-      auto const a = loadQ(block);
-      auto const fetch = [&](uint32_t tile) {
-        return withTile(tile, [&](auto const& load, auto const& convert) {
-          return convert(load(block), block);
-        });
-      };
-      mixed_kv_fragments::pipelineFragments<tiles, true>(
-          fetch, [&](auto const& b, uint32_t tile) { multiply(a, b, tile); });
-    }
+  for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
+    auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
+    auto const fetch = [&](uint32_t tile) {
+      flashinfer::KVPageAddress const address{pages.values[tile * 16 / tokensPerPage]};
+      uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
+      InstInMat<2, 2> result;
+      mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
+        constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
+        flashinfer::KVPageFormatSpan page;
+        if constexpr (format == flashinfer::KVPageFormat::kA16) {
+          page = transport.span(address, static_cast<uint8_t>(format));
+        }
+        float const scale =
+            format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
+        auto const fragment = mixed_kv_fragments::fetchK<format>(
+            k, tile * 16, block, part, page, head, tokenBase, skipTokens, cacheSeqLen);
+        uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
+        result =
+            mixed_kv_fragments::convertK<format>(fragment, scaleWords[tile], scaleColumn, scale);
+      });
+      return result;
+    };
+    auto const consume = [&](auto const& b, uint32_t tile) {
+#pragma unroll
+      for (uint32_t i = 0; i < rows; ++i) {
+#pragma unroll
+        for (uint32_t n = 0; n < 2; ++n) {
+          uint32_t const operand[2][1] = {b.data[n][0], b.data[n][1]};
+          mma<InputElem>(acc(i, tile * 2 + n).data, a(i, 0).data, operand);
+        }
+      }
+    };
+    mixed_kv_fragments::pipelineFragments<tiles, true>(fetch, consume);
   }
 }
 

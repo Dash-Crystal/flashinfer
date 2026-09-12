@@ -34,7 +34,7 @@ per thread and from 32 to zero stack bytes, with 544 shared bytes and zero
 spills in both. Receipts are under
 `ws-1:/data/h3-runtime/tp2-direct-seal-v117-20260912/` in
 `compile-sm120-{parent,retry}.log`. This is compiled-resource evidence;
-the corrected producer has not run a full-model serving campaign.
+the later V119 campaign below measures the corrected producer in serving.
 
 The Python reference's candidate axis, residual tensors, argmin/gather and
 search options are deleted with the test that required keeping the search.
@@ -87,8 +87,46 @@ sealer used 54 registers. Rectangular SM120 producers remain at 39 registers,
 `ws-1:/data/h3-runtime/tp2-page-codec-v118-20260912/compile-sm{120,90}.log`.
 The 1,024-thread CTA and routing/encoding input rereads remain; fewer reported
 registers alone do not establish better occupancy or latency. Changed-file
-pre-commit hooks pass. Full-model numerical and Pareto measurements remain
-pending; the deployed service still uses V116.
+pre-commit hooks pass. V119/V120 below supply full-model task and serving
+measurements; a paired numerical error comparison remains unmeasured.
+
+### Corrected-producer full-model comparison
+
+V119 uses `4ee770ec` with the Q-reuse consumer. V120's `dfc12ee7` combines
+the same producer with the exact previously measured V115 packed-prefetch
+continuation consumer and v20 module identity. Both canonical adaptive
+SVG-REPL/video campaigns completed on Gemma4 12B BF16 TP2, two SM120 GPUs,
+with full CUDA graphs. There were no standalone kernel runs.
+
+Against the former V114 composition, V119's conditional continuation latency
+changes -1.56%/-1.49%/-4.45% at pooled 2,048/4,096/8,192-row work, with working
+standard errors 0.65/0.50/1.13 percentage points. Decode curves have gains and
+losses; the correction does not establish Pareto dominance. Live ownership
+censuses average 8.941/8.886 bits per value on V119 and 9.270/9.215 on V120,
+including scales and tails, with no allocation/accounting failures. These
+censuses are not read-weighted traffic measurements.
+
+V120 does not establish a better continuation composition. At pooled
+2,048/4,096-row work across the four old/new versions it changes +0.21%/+2.07%
+against V119, with working errors 0.76/0.46 percentage points. Its pooled
+8,192-row prediction lies outside the recorded feature span. At V120's own
+observed large-continuation work, both responses are identified: V119 predicts
+608.08 ms and V120 623.41 ms, with working errors 16.24/4.21 ms. Those estimates
+do not establish an improvement either. Observed work points for every version
+are retained, rather than choosing one convenient extrapolation.
+
+The branch therefore retains the measured V119 Q-reuse consumer and v19 JIT
+identity, while keeping the direct shared codec v7. The packed-prefetch
+alternative remains in `dfc12ee7`. Both candidates share their decode traversal;
+fitted decode differences cannot all be caused by the continuation edit.
+The larger remaining consumer change is probability/row ownership, rather
+than another local traversal choice.
+
+Remote artifacts are under `ws-1:/data/h3-runtime/` in
+`tp2-direct-producer-v119-20260912` and `tp2-direct-prefetch-v120-20260912`.
+The existing vLLM reporter's independent-plan and shared-family frontier
+reports, all observed-work comparisons, task summaries and receipts are under
+`/Users/mdot/.local/share/vllm-reviews/2026-09-12-direct-producer/`.
 
 ### Packed storage integration, September 9 snapshot
 
