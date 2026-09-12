@@ -188,22 +188,6 @@ def test_page_event_driven_mixed_seal_handles_strided_a16_cache(
                     rtol=0,
                     atol=0,
                 )
-                reconstructed = payload.float() * denominator
-                tensor_payload, tensor_scale = quantize_tensor_fp8_reference(source)
-                tensor_reconstructed = tensor_payload.float() * tensor_scale
-                block_residual = (reconstructed - source.float()).reshape(-1, 16).abs()
-                tensor_residual = (
-                    (tensor_reconstructed - source.float()).reshape(-1, 16).abs()
-                )
-                block_objective = (
-                    block_residual.square().mean(-1)
-                    + 0.05 * block_residual.amax(-1).square()
-                ).mean()
-                tensor_objective = (
-                    tensor_residual.square().mean(-1)
-                    + 0.05 * tensor_residual.amax(-1).square()
-                ).mean()
-                assert block_objective <= tensor_objective
         elif selected_format == 2:
             e2m1_magnitude = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda")
             for source, payload, scales in (

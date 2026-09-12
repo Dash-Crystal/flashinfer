@@ -24,48 +24,19 @@
 #include <cstdint>
 #include <cuda/atomic>
 
-#include "flashinfer/attention/page_storage.cuh"
+#include "flashinfer/attention/page_codec.cuh"
 #include "tvm_ffi_utils.h"
 
-// Number of elements per block scale group
+using flashinfer::KVPageFormat;
+using flashinfer::page_codec::block_amax;
+using flashinfer::page_codec::BlockCodec;
+using flashinfer::page_codec::decode_e2m1_nibble;
+using flashinfer::page_codec::encoding_inverse;
+using flashinfer::page_codec::reciprocal_approximate_ftz;
+
 constexpr int NVFP4_BLOCK_SIZE = 16;
-constexpr int BSFP8_BLOCK_SIZE = 16;
+constexpr int BSFP8_BLOCK_SIZE = flashinfer::page_codec::kBlockSize;
 constexpr int MIXED_KV_SIGNATURE_BLOCK_SIZE = 32;
-// Keep payload * block_scale finite when the attention tile algebra expands
-// E4M3 directly into FP16 registers before applying the global scale.
-constexpr float BSFP8_A16_SCALE_MAX = 128.0f;
-
-// Software E2M1 is the SM90 producer fallback and the semantic reference for
-// SM100/SM120 specializations.  Nibble order matches page_transport.cuh:
-// low nibble is the even coefficient, high nibble is the odd coefficient.
-__device__ __forceinline__ uint8_t encode_e2m1_nibble(float value) {
-  constexpr float magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-  const float absolute = fabsf(value);
-  int nearest = 0;
-  float best = absolute;
-#pragma unroll
-  for (int code = 1; code < 8; ++code) {
-    const float distance = fabsf(absolute - magnitude[code]);
-    if (distance < best) {
-      best = distance;
-      nearest = code;
-    }
-  }
-  return uint8_t(nearest | (signbit(value) ? 8 : 0));
-}
-
-__device__ __forceinline__ float decode_e2m1_nibble(uint8_t code) {
-  constexpr float magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-  const float value = magnitude[code & 7];
-  return code & 8 ? -value : value;
-}
-
-// Helper functions
-__device__ __forceinline__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
 
 __device__ __forceinline__ __nv_bfloat162 cuda_abs(__nv_bfloat162 a) {
   __nv_bfloat162 result;
@@ -346,7 +317,7 @@ __global__ void bsfp8_quant_kernel(const InType* __restrict__ input,
                          ? 0.0f
                          : fminf(block_max * reciprocal_approximate_ftz(global_scale) *
                                      reciprocal_approximate_ftz(448.0f),
-                                 BSFP8_A16_SCALE_MAX);
+                                 flashinfer::page_codec::kFP8A16ScaleMax);
     __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
     sf_value = static_cast<float>(sf_fp8);
     if (lane == 0) {
@@ -625,52 +596,27 @@ struct MixedKVQuantizedBlock {
   uint8_t payload;
 };
 
-template <int VALUES>
-__device__ __forceinline__ __nv_fp8_e4m3 mixed_kv_block_scale(float const (&values)[VALUES],
-                                                              float global_scale,
-                                                              uint8_t selected_format) {
-  constexpr int lanes = BSFP8_BLOCK_SIZE / VALUES;
-  const uint32_t subgroup_mask = ((1U << lanes) - 1) << (threadIdx.x % 32 / lanes * lanes);
-  float block_max = 0;
-#pragma unroll
-  for (int i = 0; i < VALUES; ++i) block_max = fmaxf(block_max, fabsf(values[i]));
-#pragma unroll
-  for (int offset = lanes / 2; offset > 0; offset /= 2) {
-    block_max = fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, lanes));
-  }
-
-  const float format_max = selected_format == 2 ? 6.0f : 448.0f;
-  const float scale_max = selected_format == 2 ? 448.0f : BSFP8_A16_SCALE_MAX;
-  float sf_value = 0.0f;
-  if (block_max != 0.0f) {
-    const float required_sf = block_max * reciprocal_approximate_ftz(global_scale) *
-                              reciprocal_approximate_ftz(format_max);
-    sf_value = fminf(fmaxf(required_sf, 0x1p-9f), scale_max);
-  }
-  return __nv_fp8_e4m3(sf_value);
-}
-
 __device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float value,
                                                                          float global_scale,
-                                                                         uint8_t selected_format) {
-  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
-  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
+                                                                         uint8_t selected_format,
+                                                                         int warp_lane) {
   const float values[1] = {value};
-  const auto sf_fp8 = mixed_kv_block_scale(values, global_scale, selected_format);
-  const float sf_value = static_cast<float>(sf_fp8);
-  const float encode_scale =
-      sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
-  uint8_t payload;
-  if (selected_format == 1) {
-    payload = __nv_fp8_e4m3(value * encode_scale).__x;
-  } else {
-    const int pair_lane = lane & (BSFP8_BLOCK_SIZE / 2 - 1);
-    const float low = __shfl_sync(subgroup_mask, value, pair_lane * 2, BSFP8_BLOCK_SIZE);
-    const float high = __shfl_sync(subgroup_mask, value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE);
-    payload =
-        encode_e2m1_nibble(low * encode_scale) | (encode_e2m1_nibble(high * encode_scale) << 4);
-  }
-  return {sf_fp8.__x, payload};
+  const float amax = block_amax(values, warp_lane);
+  const auto quantize = [&](auto codec) -> MixedKVQuantizedBlock {
+    const auto scale = codec.scale(amax, global_scale);
+    const float inverse = encoding_inverse(scale, global_scale);
+    if constexpr (decltype(codec)::kBits == 8) {
+      return {scale.__x, uint8_t(codec.encode(values, inverse))};
+    } else {
+      const int pair_lane = warp_lane & (BSFP8_BLOCK_SIZE / 2 - 1);
+      const uint32_t mask = 0xffffU << (warp_lane & 16);
+      const float pair[] = {__shfl_sync(mask, value, pair_lane * 2, BSFP8_BLOCK_SIZE),
+                            __shfl_sync(mask, value, pair_lane * 2 + 1, BSFP8_BLOCK_SIZE)};
+      return {scale.__x, uint8_t(codec.encode(pair, inverse))};
+    }
+  };
+  return selected_format == 1 ? quantize(BlockCodec<KVPageFormat::kBlockScaledFP8>{})
+                              : quantize(BlockCodec<KVPageFormat::kBlockScaledFP4>{});
 }
 
 // Match the existing bsfp8_quant_kernel / NVIDIA NVFP4 producer geometry:
@@ -737,7 +683,8 @@ __global__ void mixed_kv_quant_rows_kernel(
       const int64_t input_offset = page * in_stride_page + token * in_stride_token +
                                    head * in_stride_head + dim * in_stride_dim;
       const float value = valid ? mixed_kv_to_float(input[input_offset]) : 0.0f;
-      const auto encoded = mixed_kv_quantize_block(value, global_scale, selected_format);
+      const auto encoded =
+          mixed_kv_quantize_block(value, global_scale, selected_format, threadIdx.x % 32);
       // All source lanes have read before an in-place compressed store.
       __syncthreads();
       const int64_t sf_offset = page * sf_stride_page + token * sf_stride_token +
@@ -1012,7 +959,39 @@ __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, c
 
 constexpr int kMixedKVSealThreads = 1024;
 
-template <typename InType, int THREADS = kMixedKVSealThreads>
+template <KVPageFormat Format, bool NativeMMA, int THREADS, typename InType>
+__device__ __forceinline__ void mixed_kv_encode_page(const InType* input, uint8_t* payload,
+                                                     flashinfer::KVPageGeometry geometry,
+                                                     const float* global_scales, int thread) {
+  using Codec = BlockCodec<Format>;
+  auto* scales = payload + geometry.payload_bytes(Format);
+  for (int64_t i = int64_t(thread) * 4; i < geometry.values(); i += THREADS * 4) {
+    const uint64_t input_index = geometry.a16_index<NativeMMA>(i);
+    const int kv = (input_index / geometry.head_dim) % 2;
+    float vector[4];
+    if (!NativeMMA || kv == 0) {
+      const uint64_t packed = *reinterpret_cast<uint64_t const*>(input + input_index);
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        vector[j] = mixed_kv_to_float(reinterpret_cast<InType const*>(&packed)[j]);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        vector[j] = mixed_kv_to_float(input[geometry.a16_index<NativeMMA>(i + j)]);
+    }
+    const float global_scale = global_scales[(static_cast<int>(Format) - 1) * 2 + kv];
+    const auto scale = Codec::scale(block_amax(vector, thread % 32), global_scale);
+    if (thread % 4 == 0) scales[i / BSFP8_BLOCK_SIZE] = scale.__x;
+    const uint32_t encoded = Codec::encode(vector, encoding_inverse(scale, global_scale));
+    if constexpr (Codec::kBits == 8) {
+      *reinterpret_cast<uint32_t*>(payload + i) = encoded;
+    } else {
+      *reinterpret_cast<uint16_t*>(payload + i / 2) = uint16_t(encoded);
+    }
+  }
+}
+
+template <typename InType, bool NativeMMA, int THREADS = kMixedKVSealThreads>
 __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
     flashinfer::KVPageStorage storage, flashinfer::KVPageArena arena, const int32_t* completed,
     const int32_t* completed_count, const int32_t* classes, float* stats, int64_t stats_stride,
@@ -1052,40 +1031,13 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
   __syncthreads();
   const flashinfer::KVPageAddress destination{pending};
   if (!destination.allocated() || destination.value == source.value) return;
-  const auto format = static_cast<uint8_t>(destination.format());
   auto* payload = storage.data + destination.offset();
-  auto* scales = payload + storage.geometry.payload_bytes(destination.format());
-  for (int64_t i = int64_t(threadIdx.x) * 4; i < values; i += THREADS * 4) {
-    uint64_t const input_index = storage.geometry.a16_index(i);
-    const int kv = (input_index / storage.geometry.head_dim) % 2;
-    float vector[4];
-    if (!storage.geometry.native_mma || kv == 0) {
-      const uint64_t packed = *reinterpret_cast<uint64_t const*>(input + input_index);
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        vector[j] = mixed_kv_to_float(reinterpret_cast<InType const*>(&packed)[j]);
-    } else {
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        vector[j] = mixed_kv_to_float(input[storage.geometry.a16_index(i + j)]);
-    }
-    const float global_scale = global_scales[(format - 1) * 2 + kv];
-    const auto encoded_scale = mixed_kv_block_scale(vector, global_scale, format);
-    const float scale = static_cast<float>(encoded_scale);
-    if (threadIdx.x % 4 == 0) scales[i / BSFP8_BLOCK_SIZE] = encoded_scale.__x;
-    const float inverse = scale == 0 ? 0 : reciprocal_approximate_ftz(global_scale * scale);
-    uint32_t encoded = 0;
-    if (format == 1) {
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        encoded |= uint32_t(__nv_fp8_e4m3(vector[j] * inverse).__x) << (j * 8);
-      *reinterpret_cast<uint32_t*>(payload + i) = encoded;
-    } else {
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        encoded |= uint32_t(encode_e2m1_nibble(vector[j] * inverse)) << (j * 4);
-      *reinterpret_cast<uint16_t*>(payload + i / 2) = uint16_t(encoded);
-    }
+  if (destination.format() == KVPageFormat::kBlockScaledFP8) {
+    mixed_kv_encode_page<KVPageFormat::kBlockScaledFP8, NativeMMA, THREADS>(
+        input, payload, storage.geometry, global_scales, threadIdx.x);
+  } else {
+    mixed_kv_encode_page<KVPageFormat::kBlockScaledFP4, NativeMMA, THREADS>(
+        input, payload, storage.geometry, global_scales, threadIdx.x);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -1304,10 +1256,14 @@ void mixed_kv_arena_update(TensorView k, TensorView v, TensorView slots, TensorV
           slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
     }
     if ((phase & 2) && capacity) {
-      mixed_kv_arena_seal_kernel<c_type><<<capacity, kMixedKVSealThreads, 0, stream>>>(
-          storage, arena, sealed, sealed_count, size_classes, route_stats, stats.stride(0),
-          static_cast<const float*>(thresholds.data_ptr()),
-          static_cast<const float*>(global_scales.data_ptr()), capacity);
+      DISPATCH_BOOL(native_mma, NATIVE_MMA, [&] {
+        mixed_kv_arena_seal_kernel<c_type, NATIVE_MMA>
+            <<<capacity, kMixedKVSealThreads, 0, stream>>>(
+                storage, arena, sealed, sealed_count, size_classes, route_stats, stats.stride(0),
+                static_cast<const float*>(thresholds.data_ptr()),
+                static_cast<const float*>(global_scales.data_ptr()), capacity);
+        return true;
+      });
     }
     return true;
   });

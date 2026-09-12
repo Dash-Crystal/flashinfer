@@ -221,8 +221,9 @@ def quantize_block_scaled_fp8(
     for row_begin in range(0, flat.shape[0], rows_per_chunk):
         chunk = flat[row_begin : row_begin + rows_per_chunk]
         tensor_amax = torch.maximum(tensor_amax, chunk.abs().amax().float())
-    tensor_amax = tensor_amax.clamp_min(torch.finfo(torch.float32).tiny)
-    global_scale = tensor_amax / (FP8_E4M3_MAX * FP8_E4M3_A16_SCALE_MAX)
+    global_scale = (tensor_amax / (FP8_E4M3_MAX * FP8_E4M3_A16_SCALE_MAX)).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
     payload = torch.empty(flat.shape, dtype=torch.float8_e4m3fn, device=x.device)
     scales = torch.empty(
         (flat.shape[0], blocks_per_row), dtype=torch.uint8, device=x.device
@@ -233,21 +234,23 @@ def quantize_block_scaled_fp8(
         block_amax = blocks.abs().amax(dim=-1)
         required_sf = block_amax / (global_scale * FP8_E4M3_MAX)
 
-        scales_f32 = (
-            required_sf.clamp(FP8_E4M3_MIN_SUBNORMAL, FP8_E4M3_A16_SCALE_MAX)
-            .to(torch.float8_e4m3fn)
-            .float()
+        zero_blocks = block_amax == 0
+        encoded_scales = torch.where(
+            zero_blocks,
+            0.0,
+            required_sf.clamp(FP8_E4M3_MIN_SUBNORMAL, FP8_E4M3_A16_SCALE_MAX),
+        ).to(torch.float8_e4m3fn)
+        denominator = torch.where(
+            zero_blocks, 1.0, global_scale * encoded_scales.float()
         )
         payload_chunk = (
-            (blocks / (global_scale * scales_f32).unsqueeze(-1))
+            (blocks / denominator.unsqueeze(-1))
             .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
             .to(torch.float8_e4m3fn)
         )
 
         payload[row_begin:row_end].copy_(payload_chunk.reshape(-1, head_dim))
-        scales[row_begin:row_end].copy_(
-            scales_f32.to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
-        )
+        scales[row_begin:row_end].copy_(encoded_scales.contiguous().view(torch.uint8))
 
     return BlockScaledFP8(
         payload.reshape_as(x),
@@ -268,8 +271,8 @@ def quantize_block_scaled_fp8_cuda(
 
     ``x`` may have arbitrary leading dimensions and a head dimension divisible
     by 16. ``global_scale`` is the dequantization scale and must be a CUDA
-    float32 scalar tensor. Accuracy-optimized candidate search remains in
-    :func:`quantize_block_scaled_fp8`.
+    float32 scalar tensor. :func:`quantize_block_scaled_fp8` supplies the
+    chunked PyTorch reference implementation.
     """
 
     if not x.is_cuda:

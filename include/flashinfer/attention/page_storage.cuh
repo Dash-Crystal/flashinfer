@@ -73,14 +73,18 @@ struct KVPageGeometry {
                                            uint32_t dim) const {
     return value_index(KVPageFormat::kBlockScaledFP8, token, head, is_v, dim) / 16;
   }
+  template <bool NativeMMA>
   __host__ __device__ uint64_t a16_index(uint64_t encoded_index) const {
-    if (!native_mma) return encoded_index;
+    if constexpr (!NativeMMA) return encoded_index;
     uint32_t const plane = encoded_index / (uint64_t(tokens) * head_dim);
     uint32_t const local = encoded_index % (uint64_t(tokens) * head_dim);
     bool const is_v = plane % 2;
     uint32_t const token = is_v ? local % tokens : local / head_dim;
     uint32_t const dim = is_v ? local / tokens : local % head_dim;
     return row(token, plane / 2, is_v) * head_dim + dim;
+  }
+  __host__ __device__ uint64_t a16_index(uint64_t encoded_index) const {
+    return native_mma ? a16_index<true>(encoded_index) : a16_index<false>(encoded_index);
   }
 };
 
