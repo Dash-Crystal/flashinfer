@@ -123,7 +123,7 @@ __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCou
           publication[2 * groups + tile.m()]);
       if (fragments.fetch_add(1, cuda::memory_order_acq_rel) == params.grid_tiled_shape.n() - 1) {
         fragments.store(0, cuda::memory_order_relaxed);
-        cuda::atomic_ref<int, cuda::thread_scope_system> local(publication[tile.m()]);
+        cuda::atomic_ref<int, cuda::thread_scope_device> local(publication[tile.m()]);
         cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + tile.m()]);
         peer.store(1, cuda::memory_order_release);
         local.store(1, cuda::memory_order_release);
