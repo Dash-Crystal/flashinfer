@@ -28,8 +28,18 @@ FP8/NVIDIA NVFP4 quantizers and the mixed format's scale bounds. The selected
 compressed format is encoded once. Rectangular and arena producers share this
 helper; v6 identifies the corrected producer module.
 
+CUDA 13.3.73 compiles `4e7a0fbb` and parent `247a81e7` for SM120f with
+the same flags. Both FP16 and BF16 arena sealers go from 61 to 54 registers
+per thread and from 32 to zero stack bytes, with 544 shared bytes and zero
+spills in both. Receipts are under
+`ws-1:/data/h3-runtime/tp2-direct-seal-v117-20260912/` in
+`compile-sm120-{parent,retry}.log`. This is compiled-resource evidence;
+the corrected producer has not run a full-model serving campaign.
+
 The Python reference's candidate axis, residual tensors, argmin/gather and
 search options are deleted with the test that required keeping the search.
+The default reference encode chunk remains 4,096 rows after removing the
+candidate axis; callers can still supply the explicit chunk extent.
 Historical results below used the search and do not measure this correction.
 Payload values can change; format decoding, routing thresholds and exclusive
 page publication retain their contracts. New serving claims require full-model

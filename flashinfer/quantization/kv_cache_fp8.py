@@ -204,7 +204,7 @@ def quantize_block_scaled_fp8(
     x: torch.Tensor,
     *,
     block_size: int = 16,
-    rows_per_chunk: int = 65536,
+    rows_per_chunk: int = 4096,
 ) -> BlockScaledFP8:
     """Quantize KV data once using amax-derived E4M3 block scales."""
 
