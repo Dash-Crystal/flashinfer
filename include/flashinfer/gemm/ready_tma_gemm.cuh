@@ -146,9 +146,9 @@ cudaError_t PrepareReady(int* occupancy) {
                                                        Kernel::SharedStorageSize);
 }
 
-template <typename Element>
-cudaError_t PlanReady(cudaDeviceProp const& device, int producer_registers, size_t producer_shared,
-                      int producer_threads, int* math_registers, bool* concurrent) {
+template <typename Element, typename Producers>
+cudaError_t PlanReady(cudaDeviceProp const& device, Producers const& producers, int* math_registers,
+                      bool* concurrent) {
   using Kernel = ReadyKernel<Element>;
   cudaFuncAttributes consumer;
   auto status = cudaFuncGetAttributes(&consumer, cutlass::device_kernel<Kernel>);
@@ -157,29 +157,39 @@ cudaError_t PlanReady(cudaDeviceProp const& device, int producer_registers, size
   cudaOccDeviceState state;
   state.carveoutConfig = SHAREDMEM_CARVEOUT_MAX_SHARED;
   cudaOccFuncAttributes consumer_attributes(consumer);
-  cudaOccFuncAttributes producer_attributes;
-  producer_attributes.maxThreadsPerBlock = device.maxThreadsPerBlock;
-  producer_attributes.numRegs = producer_registers;
-  producer_attributes.shmemLimitConfig = FUNC_SHMEM_LIMIT_OPTIN;
-  producer_attributes.maxDynamicSharedSizeBytes = producer_shared;
-  producer_attributes.numBlockBarriers = 1;
-  cudaOccResult consumer_occupancy, producer_occupancy;
+  cudaOccResult consumer_occupancy;
   int granularity, partitions;
   if (cudaOccRegAllocationGranularity(&granularity, &hardware) != CUDA_OCC_SUCCESS ||
       cudaOccSubPartitionsPerMultiprocessor(&partitions, &hardware) != CUDA_OCC_SUCCESS ||
       cudaOccMaxActiveBlocksPerMultiprocessor(&consumer_occupancy, &hardware, &consumer_attributes,
                                               &state, Kernel::MaxThreadsPerBlock,
-                                              Kernel::SharedStorageSize) != CUDA_OCC_SUCCESS ||
-      cudaOccMaxActiveBlocksPerMultiprocessor(&producer_occupancy, &hardware, &producer_attributes,
-                                              &state, producer_threads,
-                                              producer_shared) != CUDA_OCC_SUCCESS) {
+                                              Kernel::SharedStorageSize) != CUDA_OCC_SUCCESS) {
     return cudaErrorInvalidValue;
   }
-  const int producer_warps = __occDivideRoundUp(producer_threads, device.warpSize);
+  int producer_regs = 0, producer_warps = 0, producer_shared = 0;
+  *concurrent = consumer_occupancy.activeBlocksPerMultiprocessor > 0;
+  for (auto const& producer : producers) {
+    cudaOccFuncAttributes attributes;
+    attributes.maxThreadsPerBlock = device.maxThreadsPerBlock;
+    attributes.numRegs = producer[0];
+    attributes.shmemLimitConfig = FUNC_SHMEM_LIMIT_OPTIN;
+    attributes.maxDynamicSharedSizeBytes = producer[1];
+    attributes.numBlockBarriers = 1;
+    cudaOccResult occupancy;
+    int const threads = producer[2];
+    if (threads <= 0 ||
+        cudaOccMaxActiveBlocksPerMultiprocessor(&occupancy, &hardware, &attributes, &state, threads,
+                                                producer[1]) != CUDA_OCC_SUCCESS) {
+      return cudaErrorInvalidValue;
+    }
+    int const warps = __occDivideRoundUp(threads, device.warpSize);
+    int const allocated_warps = __occRoundUp(warps, partitions);
+    producer_regs += occupancy.allocatedRegistersPerBlock / warps * allocated_warps;
+    producer_warps += allocated_warps;
+    producer_shared += occupancy.allocatedSharedMemPerBlock;
+    *concurrent &= occupancy.activeBlocksPerMultiprocessor > 0;
+  }
   const int consumer_warps = Kernel::MaxThreadsPerBlock / device.warpSize;
-  const int producer_regs = producer_occupancy.allocatedRegistersPerBlock / producer_warps *
-                            __occRoundUp(producer_warps, partitions);
-  const int consumer_regs = consumer_occupancy.allocatedRegistersPerBlock;
   const int uniform_registers = (device.regsPerMultiprocessor - producer_regs) / consumer_warps /
                                 granularity * granularity / device.warpSize;
   constexpr int consumer_threads = Kernel::MaxThreadsPerBlock;
@@ -188,19 +198,16 @@ cudaError_t PlanReady(cudaDeviceProp const& device, int producer_registers, size
   const int budget =
       (uniform_registers * consumer_threads - int(Kernel::LoadRegisterRequirement) * load_threads) /
       math_threads;
-  // setmaxnreg encodes registers in multiples of eight. This is a resource
-  // bound from the paired producer, independent of GEMM timing or tile search.
+  // Allocate registers for every producer that must progress during readiness waits.
   *math_registers =
       budget >= 24 ? std::min(DefaultRegisterAllocation::MathRegisters, budget / 8 * 8) : 0;
-  *concurrent = consumer_occupancy.activeBlocksPerMultiprocessor > 0 &&
-                producer_occupancy.activeBlocksPerMultiprocessor > 0 &&
-                consumer_regs + producer_regs <= device.regsPerMultiprocessor &&
-                consumer_occupancy.allocatedSharedMemPerBlock +
-                        producer_occupancy.allocatedSharedMemPerBlock <=
-                    device.sharedMemPerMultiprocessor &&
-                (consumer_warps + __occRoundUp(producer_warps, partitions)) * device.warpSize <=
-                    device.maxThreadsPerMultiProcessor &&
-                consumer_occupancy.blockLimitBlocks >= 2;
+  *concurrent &=
+      consumer_occupancy.allocatedRegistersPerBlock + producer_regs <=
+          device.regsPerMultiprocessor &&
+      consumer_occupancy.allocatedSharedMemPerBlock + producer_shared <=
+          device.sharedMemPerMultiprocessor &&
+      (consumer_warps + producer_warps) * device.warpSize <= device.maxThreadsPerMultiProcessor &&
+      consumer_occupancy.blockLimitBlocks >= int(producers.size()) + 1;
   return cudaSuccess;
 }
 

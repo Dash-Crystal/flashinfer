@@ -142,9 +142,19 @@ cudaError_t PrepareKernel(Kernel kernel, size_t shared_bytes) {
 }
 
 template <typename Element, bool Publish, bool TilePublication = false>
-cudaError_t Prepare() {
-  return PrepareKernel(MaskedGemm<Element, Publish, TilePublication>,
-                       sizeof(typename Gemm<Element, Publish, TilePublication>::SharedStorage));
+cudaError_t Prepare(int* resources) {
+  using Kernel = Gemm<Element, Publish, TilePublication>;
+  constexpr size_t shared = sizeof(typename Kernel::SharedStorage);
+  auto kernel = MaskedGemm<Element, Publish, TilePublication>;
+  auto status = PrepareKernel(kernel, shared);
+  if (status != cudaSuccess) return status;
+  cudaFuncAttributes attributes;
+  status = cudaFuncGetAttributes(&attributes, kernel);
+  if (status != cudaSuccess) return status;
+  resources[0] = attributes.numRegs;
+  resources[1] = attributes.sharedSizeBytes + shared;
+  resources[2] = Kernel::kThreadCount;
+  return cudaSuccess;
 }
 
 template <typename Element, bool Publish, bool TilePublication = false>

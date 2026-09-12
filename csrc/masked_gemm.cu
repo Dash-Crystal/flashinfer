@@ -26,20 +26,23 @@ namespace ready_gemm = flashinfer::masked_gemm;
 
 using tvm::ffi::Optional;
 
-void PrepareMaskedGemm(int64_t device, bool bf16, bool publish, bool tile_publication) {
+tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publish,
+                                           bool tile_publication) {
+  int resources[3];
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
   if (tile_publication) {
-    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true, true>()
-                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true, true>();
+    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true, true>(resources)
+                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true, true>(resources);
   } else if (publish) {
-    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>()
-                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>();
+    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>(resources)
+                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>(resources);
   } else {
-    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, false>()
-                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, false>();
+    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, false>(resources)
+                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, false>(resources);
   }
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
+  return {resources[0], resources[1], resources[2]};
 }
 
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,
@@ -68,8 +71,8 @@ void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView i
   });
 }
 
-tvm::ffi::Array<int64_t> PrepareReadyGemm(int64_t device, bool bf16, int64_t producer_registers,
-                                          int64_t producer_shared, int64_t producer_threads) {
+tvm::ffi::Array<int64_t> PrepareReadyGemm(
+    int64_t device, bool bf16, tvm::ffi::Array<tvm::ffi::Array<int64_t>> const& producers) {
   ffi::CUDADeviceGuard guard(device);
   int occupancy;
   auto status = bf16 ? ready_gemm::PrepareReady<cutlass::bfloat16_t>(&occupancy)
@@ -85,13 +88,12 @@ tvm::ffi::Array<int64_t> PrepareReadyGemm(int64_t device, bool bf16, int64_t pro
   int math_registers = 0;
   bool concurrent = false;
 #if FLASHINFER_READY_TMA_SM120
-  if (producer_threads > 0) {
-    status = bf16 ? ready_gemm::PlanReady<cutlass::bfloat16_t>(properties, producer_registers,
-                                                               producer_shared, producer_threads,
+  if (!producers.empty()) {
+    for (auto const& producer : producers) TVM_FFI_ICHECK(producer.size() == 3);
+    status = bf16 ? ready_gemm::PlanReady<cutlass::bfloat16_t>(properties, producers,
                                                                &math_registers, &concurrent)
-                  : ready_gemm::PlanReady<cutlass::half_t>(properties, producer_registers,
-                                                           producer_shared, producer_threads,
-                                                           &math_registers, &concurrent);
+                  : ready_gemm::PlanReady<cutlass::half_t>(properties, producers, &math_registers,
+                                                           &concurrent);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
   }
 #endif

@@ -24,8 +24,15 @@ def get_masked_gemm_module(
 @cache
 def _prepared_module(device: int, dtype: torch.dtype, publish: bool, tiles: bool):
     module = get_masked_gemm_module()
-    module.prepare(device, dtype == torch.bfloat16, publish, tiles)
-    return module
+    resources = tuple(module.prepare(device, dtype == torch.bfloat16, publish, tiles))
+    return module, resources
+
+
+def masked_gemm_resources(
+    device: int, dtype: torch.dtype, *, publish: bool, tiles: bool
+):
+    """Return the prepared producer's registers/thread, shared bytes and threads."""
+    return _prepared_module(device, dtype, publish, tiles)[1]
 
 
 def _validate_mm_operands(x, weight, out):
@@ -125,7 +132,7 @@ def mm_masked_tiles(
     if x.shape[0] and weight.shape[1]:
         _prepared_module(
             x.device.index, x.dtype, peer_output is not None, publication is not None
-        ).run(
+        )[0].run(
             x,
             weight,
             out,
@@ -151,7 +158,7 @@ class ReadyGemmInfo(NamedTuple):
 def ready_gemm_info(
     device: int,
     dtype: torch.dtype,
-    producer: tuple[int, int, int] | None = None,
+    producers: tuple[tuple[int, int, int], ...] = (),
     *,
     rows_per_partition: int = 128,
 ) -> ReadyGemmInfo:
@@ -166,7 +173,7 @@ def ready_gemm_info(
         else 128
     )
     module = get_masked_gemm_module(ready_tma=ready_tma, row_tile=row_tile)
-    args = (device, dtype == torch.bfloat16, *(producer or (0, 0, 0)))
+    args = (device, dtype == torch.bfloat16, producers)
     sms, occupancy, row_tile, workspace_bytes, budget, concurrent = (
         module.prepare_ready(*args)
     )
@@ -178,9 +185,9 @@ def ready_gemm_info(
             *args
         )
         logging.getLogger(__name__).info(
-            "Ready TMA resource plan: producer=%s, row_tile=%d, "
+            "Ready TMA resource plan: producers=%s, row_tile=%d, "
             "math_registers=%d, shared_sm=%s",
-            producer,
+            producers,
             row_tile,
             budget,
             bool(concurrent),
@@ -205,7 +212,7 @@ def mm_ready_rows(
     group_rows,
     reserved_blocks,
     workspace,
-    producer=None,
+    producers=(),
     rows_per_partition=128,
 ):
     """Multiply once, consuming row groups published by a concurrent producer.
@@ -217,10 +224,10 @@ def mm_ready_rows(
     reserved for consumer completion; the last GEMM CTA resets the workspace.
     The caller joins both kernels before reusing any operand or workspace.
 
-    ``producer`` gives its compiled registers/thread, shared bytes and threads.
-    SM120 budgets its native register allocation for that producer, then checks
-    both compiled allocations with CUDA's occupancy calculator. A fitting pair
-    shares SMs; otherwise ``reserved_blocks`` leaves producer SMs available.
+    ``producers`` lists compiled registers/thread, shared bytes and threads.
+    SM120 budgets registers for all producers, then checks their joint allocation
+    with CUDA's occupancy calculator. Fitting kernels share SMs; otherwise
+    ``reserved_blocks`` leaves producer SMs available.
     Readiness waits cannot occupy the producer's execution capacity. SM120 uses
     the native TMA pipeline with
     separate loading and compute warps. Other architectures use CUTLASS Stream-K.
@@ -245,7 +252,7 @@ def mm_ready_rows(
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
     info = ready_gemm_info(
-        x.device.index, x.dtype, producer, rows_per_partition=rows_per_partition
+        x.device.index, x.dtype, producers, rows_per_partition=rows_per_partition
     )
     if (
         workspace.device != x.device
