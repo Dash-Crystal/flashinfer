@@ -626,9 +626,9 @@ struct MixedKVQuantizedBlock {
 };
 
 template <int VALUES>
-__device__ __forceinline__ float mixed_kv_choose_scale(float const (&values)[VALUES],
-                                                       float global_scale,
-                                                       uint8_t selected_format) {
+__device__ __forceinline__ __nv_fp8_e4m3 mixed_kv_block_scale(float const (&values)[VALUES],
+                                                              float global_scale,
+                                                              uint8_t selected_format) {
   constexpr int lanes = BSFP8_BLOCK_SIZE / VALUES;
   const uint32_t subgroup_mask = ((1U << lanes) - 1) << (threadIdx.x % 32 / lanes * lanes);
   float block_max = 0;
@@ -645,48 +645,9 @@ __device__ __forceinline__ float mixed_kv_choose_scale(float const (&values)[VAL
   if (block_max != 0.0f) {
     const float required_sf = block_max * reciprocal_approximate_ftz(global_scale) *
                               reciprocal_approximate_ftz(format_max);
-    constexpr float factors[9] = {
-        0.75f, 0.8125f, 0.875f, 0.9375f, 1.0f, 1.0625f, 1.125f, 1.25f, 1.5f,
-    };
-    float best_objective = __int_as_float(0x7f800000);
-#pragma unroll
-    for (int candidate = 0; candidate < 9; ++candidate) {
-      float candidate_sf = fminf(fmaxf(required_sf * factors[candidate], 0x1p-9f), scale_max);
-      __nv_fp8_e4m3 candidate_sf_fp8 = __nv_fp8_e4m3(candidate_sf);
-      candidate_sf = static_cast<float>(candidate_sf_fp8);
-      const float encode_scale = reciprocal_approximate_ftz(global_scale * candidate_sf);
-      float sum_squared = 0;
-      float max_residual = 0;
-#pragma unroll
-      for (int i = 0; i < VALUES; ++i) {
-        const float value = values[i];
-        float reconstructed;
-        if (selected_format == 2) {
-          reconstructed = decode_e2m1_nibble(encode_e2m1_nibble(value * encode_scale)) *
-                          candidate_sf * global_scale;
-        } else {
-          __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
-          reconstructed = static_cast<float>(encoded) * candidate_sf * global_scale;
-        }
-        const float residual = fabsf(reconstructed - value);
-        sum_squared += residual * residual;
-        max_residual = fmaxf(max_residual, residual);
-      }
-#pragma unroll
-      for (int offset = lanes / 2; offset > 0; offset /= 2) {
-        sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, lanes);
-        max_residual =
-            fmaxf(max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset, lanes));
-      }
-      const float objective =
-          sum_squared / float(BSFP8_BLOCK_SIZE) + 0.05f * max_residual * max_residual;
-      if (objective < best_objective) {
-        best_objective = objective;
-        sf_value = candidate_sf;
-      }
-    }
+    sf_value = fminf(fmaxf(required_sf, 0x1p-9f), scale_max);
   }
-  return sf_value;
+  return __nv_fp8_e4m3(sf_value);
 }
 
 __device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float value,
@@ -695,8 +656,8 @@ __device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float v
   const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
   const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
   const float values[1] = {value};
-  const float sf_value = mixed_kv_choose_scale(values, global_scale, selected_format);
-  __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
+  const auto sf_fp8 = mixed_kv_block_scale(values, global_scale, selected_format);
+  const float sf_value = static_cast<float>(sf_fp8);
   const float encode_scale =
       sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
   uint8_t payload;
@@ -1109,8 +1070,9 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
         vector[j] = mixed_kv_to_float(input[storage.geometry.a16_index(i + j)]);
     }
     const float global_scale = global_scales[(format - 1) * 2 + kv];
-    const float scale = mixed_kv_choose_scale(vector, global_scale, format);
-    if (threadIdx.x % 4 == 0) scales[i / BSFP8_BLOCK_SIZE] = __nv_fp8_e4m3(scale).__x;
+    const auto encoded_scale = mixed_kv_block_scale(vector, global_scale, format);
+    const float scale = static_cast<float>(encoded_scale);
+    if (threadIdx.x % 4 == 0) scales[i / BSFP8_BLOCK_SIZE] = encoded_scale.__x;
     const float inverse = scale == 0 ? 0 : reciprocal_approximate_ftz(global_scale * scale);
     uint32_t encoded = 0;
     if (format == 1) {

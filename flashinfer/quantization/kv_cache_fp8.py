@@ -1,9 +1,4 @@
-"""Reference codecs for block-scaled FP8 KV-cache transport.
-
-The encode path is intentionally accuracy first.  It is used while sealing a
-paged-attention page; the latency-critical decode path lives in XQA and only
-loads an E4M3 payload byte and one amortized E4M3 scale byte per 16 values.
-"""
+"""Direct block-scaled FP8 codecs and page-local mixed-KV routing."""
 
 from __future__ import annotations
 
@@ -37,9 +32,8 @@ class MixedKVPagedCache(NamedTuple):
     address; row strides are retained and scales must not overlap source rows.
     The two compressed formats may share payload and scale storage.
 
-    ``page_router_stats`` stores neighbor cosine and block peak/RMS. The scale
-    search evaluates reconstruction error in registers without materializing
-    alternate page encodings.
+    ``page_router_stats`` stores neighbor cosine and block peak/RMS. The chosen
+    format uses an amax-derived scale per block and one encoding pass.
     """
 
     fp8_k_payload: torch.Tensor | None
@@ -210,21 +204,12 @@ def quantize_block_scaled_fp8(
     x: torch.Tensor,
     *,
     block_size: int = 16,
-    optimize_scales: bool = True,
-    tail_weight: float = 0.05,
     rows_per_chunk: int = 65536,
 ) -> BlockScaledFP8:
-    """Quantize KV data to the XQA accuracy-first block-scaled FP8 format.
-
-    ``tail_weight`` adds the squared maximum element error in each block to
-    the ordinary mean-squared objective.  Scale search changes only page-seal
-    cost; payload rate and the attention read kernel are unchanged.
-    """
+    """Quantize KV data once using amax-derived E4M3 block scales."""
 
     if block_size != 16:
         raise ValueError("the current XQA transport kernel requires block_size=16")
-    if tail_weight < 0:
-        raise ValueError("tail_weight must be non-negative")
     if rows_per_chunk <= 0:
         raise ValueError("rows_per_chunk must be positive")
     _check_input(x, block_size)
@@ -242,65 +227,22 @@ def quantize_block_scaled_fp8(
     scales = torch.empty(
         (flat.shape[0], blocks_per_row), dtype=torch.uint8, device=x.device
     )
-    factors = torch.tensor(
-        (0.75, 0.8125, 0.875, 0.9375, 1.0, 1.0625, 1.125, 1.25, 1.5),
-        dtype=torch.float32,
-        device=x.device,
-    )
-    # Candidate search has an extra candidate axis; cap its chunk to keep page
-    # sealing bounded even when this reference helper is run on a full pool.
-    encode_chunk_rows = min(rows_per_chunk, 4096) if optimize_scales else rows_per_chunk
-    for row_begin in range(0, flat.shape[0], encode_chunk_rows):
-        row_end = min(row_begin + encode_chunk_rows, flat.shape[0])
+    for row_begin in range(0, flat.shape[0], rows_per_chunk):
+        row_end = min(row_begin + rows_per_chunk, flat.shape[0])
         blocks = flat[row_begin:row_end].float().reshape(-1, blocks_per_row, block_size)
         block_amax = blocks.abs().amax(dim=-1)
         required_sf = block_amax / (global_scale * FP8_E4M3_MAX)
 
-        if optimize_scales:
-            # Search both sides of max-normalization. Slightly smaller scales
-            # may clip one outlier but improve the other 15 values; larger
-            # scales avoid clipping after E4M3 scale rounding.
-            sf_candidates = (required_sf.unsqueeze(-1) * factors).clamp(
-                FP8_E4M3_MIN_SUBNORMAL, FP8_E4M3_A16_SCALE_MAX
-            )
-            sf_candidates = sf_candidates.to(torch.float8_e4m3fn).float()
-            denominators = global_scale * sf_candidates
-            payload_candidates = (
-                blocks.unsqueeze(-2) / denominators.unsqueeze(-1)
-            ).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-            payload_candidates = payload_candidates.to(torch.float8_e4m3fn)
-            residual = (
-                payload_candidates.float() * denominators.unsqueeze(-1)
-                - blocks.unsqueeze(-2)
-            ).abs()
-            objective = residual.square().mean(dim=-1)
-            if tail_weight:
-                objective = objective + tail_weight * residual.amax(dim=-1).square()
-            selected = objective.argmin(dim=-1, keepdim=True)
-            scales_f32 = sf_candidates.gather(-1, selected).squeeze(-1)
-            # CPU PyTorch does not implement gather for float8, but raw-byte
-            # selection is exactly equivalent and is also cheaper.
-            payload_chunk = (
-                payload_candidates.contiguous()
-                .view(torch.uint8)
-                .gather(
-                    -2,
-                    selected.unsqueeze(-1).expand(*selected.shape, block_size),
-                )
-                .squeeze(-2)
-                .view(torch.float8_e4m3fn)
-            )
-        else:
-            scales_f32 = (
-                required_sf.clamp(FP8_E4M3_MIN_SUBNORMAL, FP8_E4M3_A16_SCALE_MAX)
-                .to(torch.float8_e4m3fn)
-                .float()
-            )
-            payload_chunk = (
-                (blocks / (global_scale * scales_f32).unsqueeze(-1))
-                .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-                .to(torch.float8_e4m3fn)
-            )
+        scales_f32 = (
+            required_sf.clamp(FP8_E4M3_MIN_SUBNORMAL, FP8_E4M3_A16_SCALE_MAX)
+            .to(torch.float8_e4m3fn)
+            .float()
+        )
+        payload_chunk = (
+            (blocks / (global_scale * scales_f32).unsqueeze(-1))
+            .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+            .to(torch.float8_e4m3fn)
+        )
 
         payload[row_begin:row_end].copy_(payload_chunk.reshape(-1, head_dim))
         scales[row_begin:row_end].copy_(

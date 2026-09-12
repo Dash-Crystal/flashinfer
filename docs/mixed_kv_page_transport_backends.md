@@ -16,6 +16,30 @@ mixed-KV-page branch. It exists because of the following review finding, quoted 
 
 ## Design specification
 
+### September 12 correction: direct quantization
+
+The online producer no longer searches reconstructed block-scale candidates.
+`b5e35a87` introduced that search on September 1; both the Claude snapshot
+`d0d7d602` and pre-merge head `bd0e5aaa` inherited it. Its historical presence
+did not authorize preserving it. The page-local cosine/peak-RMS filter chooses
+FP4, FP8 or A16 before any encoding. `mixed_kv_block_scale` now derives one
+scale from block amax, using the direct normalization already present in the
+FP8/NVIDIA NVFP4 quantizers and the mixed format's scale bounds. The selected
+compressed format is encoded once. Rectangular and arena producers share this
+helper; v6 identifies the corrected producer module.
+
+The Python reference's candidate axis, residual tensors, argmin/gather and
+search options are deleted with the test that required keeping the search.
+Historical results below used the search and do not measure this correction.
+Payload values can change; format decoding, routing thresholds and exclusive
+page publication retain their contracts. New serving claims require full-model
+task and sequence metrics through the canonical client.
+
+The current arena owns one committed encoding per page. The selected SM120
+consumer still reserves A16-sized V shared workspace around packed payload;
+this is distinct from a duplicate persistent cache and remains an operand
+lifetime/layout correction. vLLM's TP2 execution tickets record that review.
+
 ### Packed storage integration, September 9 snapshot
 
 `page_storage.cuh` adds one byte arena with format-sized extents and one

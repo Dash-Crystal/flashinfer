@@ -31,28 +31,6 @@ def test_block_scaled_fp8_shapes_and_rate(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_scale_search_never_worsens_its_objective(device: str) -> None:
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
-    torch.manual_seed(11)
-    x = torch.randn(97, 256, device=device, dtype=torch.bfloat16)
-    x[::3, 0] *= 16
-    searched = quantize_block_scaled_fp8(x, tail_weight=0.05)
-    direct = quantize_block_scaled_fp8(x, optimize_scales=False, tail_weight=0.05)
-    searched_error = (dequantize_block_scaled_fp8(*searched) - x.float()).abs()
-    direct_error = (dequantize_block_scaled_fp8(*direct) - x.float()).abs()
-    searched_blocks = searched_error.reshape(-1, 16)
-    direct_blocks = direct_error.reshape(-1, 16)
-    searched_objective = (
-        searched_blocks.square().mean(-1) + 0.05 * searched_blocks.amax(-1).square()
-    )
-    direct_objective = (
-        direct_blocks.square().mean(-1) + 0.05 * direct_blocks.amax(-1).square()
-    )
-    assert torch.all(searched_objective <= direct_objective + 1e-12)
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_reference_codecs_round_trip(device: str) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -76,7 +54,7 @@ def test_cuda_page_seal_matches_direct_reference() -> None:
     actual = quantize_block_scaled_fp8_cuda(
         x, global_scale, payload_out=payload, scales_out=scales
     )
-    expected = quantize_block_scaled_fp8(x, optimize_scales=False)
+    expected = quantize_block_scaled_fp8(x)
     assert actual.payload.data_ptr() == payload.data_ptr()
     assert actual.scales.data_ptr() == scales.data_ptr()
     torch.testing.assert_close(

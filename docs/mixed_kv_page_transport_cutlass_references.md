@@ -159,6 +159,10 @@ produce the multi-hour `ptxas` runs observed on sm90 and are prohibited.
 
 ## 6. Quantization / page sealing (producer side)
 
+The [September 12 producer correction](mixed_kv_page_transport_backends.md#september-12-correction-direct-quantization)
+removes online scale search. The resource and runtime observations below record
+the earlier searched codec, not an obligation to retain its candidate loop.
+
 The routing filters — single-pass, linear-time, non-recurrent page statistics that
 separate high-outlier-loss pages (image and poorly-normalized multimodal embeddings)
 from low-outlier-loss pages (normalized text-vocabulary embeddings) — are implemented
