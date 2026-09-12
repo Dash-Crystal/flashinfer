@@ -221,8 +221,8 @@ def mm_ready_rows(
     SM120 budgets registers for all producers, then checks their joint allocation
     with CUDA's occupancy calculator. Fitting kernels share SMs; otherwise
     ``reserved_blocks`` leaves producer SMs available.
-    Readiness waits cannot occupy the producer's execution capacity. SM120 uses
-    the native TMA pipeline with
+    The resource plan reserves execution capacity; the caller also owns stream
+    dependencies and producer progress. SM120 uses the native TMA pipeline with
     separate loading and compute warps. Other architectures use CUTLASS Stream-K.
     The resource plan is cached per compiled producer before graph replay.
     Communication groups do not select the GEMM's compute tile. SM120 traverses
