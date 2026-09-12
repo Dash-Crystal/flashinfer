@@ -3310,3 +3310,12 @@ next packed K fragment, then converts and consumes the current fragment.
 Decode retains Q reuse. The mixed JIT identity is v20; all four BF16 resource
 counts remain unchanged. V115 measures this composition through the same
 full-model campaign; its serving result is recorded in vLLM's TP2 ticket ledger.
+
+The completed V115 comparison does not establish a better composition. Its
+independent-plan decode frontier loses 22--33% against V114 near the upper
+8K-input rate interval, while improving parts of the 4K frontier. Sharing
+marginal costs within the actual TP execution regimes favors V114 more broadly.
+The selected source therefore restores the exact V114 consumer and v19 JIT
+identity from `247a81e7`; the alternative remains in commit history. This is a
+selection between composed serving observations, not a causal attribution of
+all curve differences to QK traversal. Uniform dominance over A16 remains open.
