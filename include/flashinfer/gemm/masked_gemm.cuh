@@ -115,9 +115,8 @@ __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCou
   if (__syncthreads_or(live))
     Kernel()(params, *reinterpret_cast<typename Kernel::SharedStorage*>(storage));
   if constexpr (TilePublication) {
-    // Every epilogue writer publishes its PCIe stores before the final N tile
-    // releases the row group. No remote atomic operation is required.
-    __threadfence_system();
+    // CTA synchronization and the device release sequence carry all writers
+    // into the final tile's cumulative system release. No remote atomic needed.
     __syncthreads();
     if (threadIdx.x == 0) {
       cuda::atomic_ref<int, cuda::thread_scope_device> fragments(
