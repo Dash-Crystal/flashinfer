@@ -13,9 +13,11 @@ from ..utils import get_compute_capability
 
 
 @cache
-def get_masked_gemm_module(*, ready_tma: bool = False, math_registers: int = 0):
+def get_masked_gemm_module(
+    *, ready_tma: bool = False, math_registers: int = 0, row_tile: int = 128
+):
     return gen_masked_gemm_module(
-        ready_tma=ready_tma, math_registers=math_registers
+        ready_tma=ready_tma, math_registers=math_registers, row_tile=row_tile
     ).build_and_load()
 
 
@@ -30,12 +32,17 @@ class MaskedGemmInfo(NamedTuple):
 
 @cache
 def masked_gemm_info(
-    device: int, dtype: torch.dtype, *, publish: bool, tiles: bool
+    device: int,
+    dtype: torch.dtype,
+    *,
+    publish: bool,
+    tiles: bool,
+    stream_k: bool = False,
 ) -> MaskedGemmInfo:
     """Return compiled resources and geometry, independent of publication groups."""
     module = get_masked_gemm_module()
     registers, shared, threads, rows, sms, occupancy, workspace_bytes = module.prepare(
-        device, dtype == torch.bfloat16, publish, tiles
+        device, dtype == torch.bfloat16, publish, tiles, stream_k
     )
     return MaskedGemmInfo(
         module, (registers, shared, threads), rows, sms, occupancy, workspace_bytes
@@ -85,6 +92,7 @@ def mm_masked_tiles(
     publication=None,
     peer_publication=None,
     workspace=None,
+    stream_k=False,
 ):
     """Compute visible GEMM tiles and publish complete reduced output rows.
 
@@ -100,7 +108,8 @@ def mm_masked_tiles(
     counts N-fragment completion, then all its row groups are published.
     The consumer acquires both flags and the last reader resets its local flags
     and consumed-row counter. Both ranks join consumption before slot reuse.
-    Published tiles use Stream-K with caller-owned FP32 partial workspace;
+    The prepared schedule selects direct output tiles or Stream-K. Stream-K
+    uses caller-owned FP32 partial workspace. Both share MMA and publication;
     wholly padded tiles skip MMA but still retire contributors and publish zeros.
     Workspace is initialized once and reused only after this launch completes.
     """
@@ -147,8 +156,9 @@ def mm_masked_tiles(
             x.dtype,
             publish=peer_output is not None,
             tiles=publication is not None,
+            stream_k=stream_k,
         )
-        if publication is not None and (
+        if info.workspace_bytes and (
             workspace is None
             or workspace.device != x.device
             or workspace.dtype != torch.uint8
@@ -170,6 +180,7 @@ def mm_masked_tiles(
             workspace,
             info.sms,
             info.occupancy,
+            stream_k,
         )
     return out
 
@@ -188,15 +199,19 @@ def ready_gemm_info(
     device: int,
     dtype: torch.dtype,
     producers: tuple[tuple[int, int, int], ...] = (),
+    *,
+    row_tile: int = 128,
 ) -> ReadyGemmInfo:
     ready_tma = get_compute_capability(torch.device("cuda", device))[0] == 12
-    module = get_masked_gemm_module(ready_tma=ready_tma)
+    module = get_masked_gemm_module(ready_tma=ready_tma, row_tile=row_tile)
     args = (device, dtype == torch.bfloat16, producers)
     sms, occupancy, row_tile, workspace_bytes, budget, concurrent = (
         module.prepare_ready(*args)
     )
     if ready_tma and budget:
-        module = get_masked_gemm_module(ready_tma=True, math_registers=budget)
+        module = get_masked_gemm_module(
+            ready_tma=True, math_registers=budget, row_tile=row_tile
+        )
         sms, occupancy, row_tile, workspace_bytes, _, concurrent = module.prepare_ready(
             *args
         )
@@ -229,6 +244,7 @@ def mm_ready_rows(
     reserved_blocks,
     workspace,
     producers=(),
+    row_tile=128,
 ):
     """Multiply once, consuming row groups published by a concurrent producer.
 
@@ -266,7 +282,7 @@ def mm_ready_rows(
         or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
-    info = ready_gemm_info(x.device.index, x.dtype, producers)
+    info = ready_gemm_info(x.device.index, x.dtype, producers, row_tile=row_tile)
     if (
         workspace.device != x.device
         or workspace.dtype != torch.uint8

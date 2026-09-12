@@ -28,7 +28,7 @@ namespace ready_gemm = flashinfer::masked_gemm;
 using tvm::ffi::Optional;
 
 tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publish,
-                                           bool tile_publication) {
+                                           bool tile_publication, bool stream_k) {
   int resources[4];
   int occupancy = 0;
   int sms = 0;
@@ -36,16 +36,19 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
   if (tile_publication) {
-    status = bf16 ? flashinfer::published_gemm::Prepare<cutlass::bfloat16_t>(resources, &occupancy)
-                  : flashinfer::published_gemm::Prepare<cutlass::half_t>(resources, &occupancy);
+    using namespace flashinfer::published_gemm;
+    auto prepare =
+        bf16 ? (stream_k ? Prepare<cutlass::bfloat16_t, true> : Prepare<cutlass::bfloat16_t, false>)
+             : (stream_k ? Prepare<cutlass::half_t, true> : Prepare<cutlass::half_t, false>);
+    status = prepare(resources, &occupancy);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     cudaDeviceProp properties;
     status = cudaGetDeviceProperties(&properties, device);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     sms = properties.multiProcessorCount;
-    workspace_bytes =
-        bf16 ? flashinfer::published_gemm::WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
-             : flashinfer::published_gemm::WorkspaceBytes<cutlass::half_t>(sms * occupancy);
+    if (stream_k)
+      workspace_bytes = bf16 ? WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
+                             : WorkspaceBytes<cutlass::half_t>(sms * occupancy);
   } else if (publish) {
     status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>(resources)
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>(resources);
@@ -66,7 +69,7 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,
                    int64_t row_offset, Optional<TensorView> peer_output,
                    Optional<TensorView> publication, Optional<TensorView> peer_publication,
-                   Optional<TensorView> workspace, int64_t sms, int64_t occupancy) {
+                   Optional<TensorView> workspace, int64_t sms, int64_t occupancy, bool stream_k) {
   ffi::CUDADeviceGuard guard(x.device().device_id);
   const auto stream = get_stream(x.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
@@ -74,19 +77,23 @@ void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView i
                                        cutlass::half_t>;
     cudaError_t status;
     if (publication.has_value()) {
-      TVM_FFI_ICHECK(workspace.has_value() && peer_output.has_value() &&
-                     peer_publication.has_value());
+      TVM_FFI_ICHECK(peer_output.has_value() && peer_publication.has_value());
       TVM_FFI_ICHECK(sms > 0 && occupancy > 0);
-      TVM_FFI_ICHECK(workspace.value().size(0) >=
-                     flashinfer::published_gemm::WorkspaceBytes<Element>(sms * occupancy));
-      status = flashinfer::published_gemm::Run(
+      if (stream_k) {
+        TVM_FFI_ICHECK(workspace.has_value());
+        TVM_FFI_ICHECK(workspace.value().size(0) >=
+                       flashinfer::published_gemm::WorkspaceBytes<Element>(sms * occupancy));
+      }
+      auto run = stream_k ? flashinfer::published_gemm::Run<Element, true>
+                          : flashinfer::published_gemm::Run<Element, false>;
+      status = run(
           static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
           static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
           weight.stride(1), out.stride(0), static_cast<uint8_t const*>(is_padding.data_ptr()),
           row_offset, static_cast<Element*>(peer_output.value().data_ptr()),
           static_cast<int*>(publication.value().data_ptr()),
           static_cast<int*>(peer_publication.value().data_ptr()), publication.value().size(1),
-          workspace.value().data_ptr(), sms, occupancy, stream);
+          workspace.has_value() ? workspace.value().data_ptr() : nullptr, sms, occupancy, stream);
     } else {
       auto run = peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
                                          : flashinfer::masked_gemm::Run<Element, false>;

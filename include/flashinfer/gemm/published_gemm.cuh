@@ -10,6 +10,12 @@ namespace flashinfer::published_gemm {
 
 using namespace masked_gemm;
 
+struct OutputTileMapping : cutlass::gemm::threadblock::GemmHorizontalThreadblockSwizzle {
+  CUTLASS_DEVICE static cutlass::gemm::GemmCoord get_tile_offset(int) {
+    return GemmHorizontalThreadblockSwizzle::get_tile_offset({});
+  }
+};
+
 struct WorkMapping : ReadySwizzle {
   using Base = ReadySwizzle;
   static constexpr auto kReductionStrategy = Base::kAtomic;
@@ -111,14 +117,17 @@ struct PublishedEpilogue : StoreEpilogue<Element> {
   }
 };
 
-template <typename Element>
-using Kernel =
+template <typename Element, bool StreamK = true>
+using Kernel = std::conditional_t<
+    StreamK,
     cutlass::gemm::kernel::GemmUniversalStreamk<MaskedMma<typename LocalGemm<Element>::Mma>,
-                                                PublishedEpilogue<Element>, WorkMapping>;
+                                                PublishedEpilogue<Element>, WorkMapping>,
+    cutlass::gemm::kernel::Gemm<MaskedMma<typename LocalGemm<Element>::Mma>,
+                                PublishedEpilogue<Element>, OutputTileMapping, false>>;
 
-template <typename Element>
+template <typename Element, bool StreamK = true>
 constexpr size_t SharedBytes() {
-  return PersistentSharedBytes<Kernel<Element>>();
+  return sizeof(typename Kernel<Element, StreamK>::SharedStorage) + (StreamK ? 128 : 0);
 }
 
 template <typename Element>
@@ -131,50 +140,74 @@ constexpr size_t WorkspaceBytes(int slots) {
   return PartialBytes<Element>(slots) + (slots * sizeof(int) + 127) / 128 * 128;
 }
 
-template <typename Element>
-__global__ __launch_bounds__(Kernel<Element>::kThreadCount) void PublishedGemm(
-    typename Kernel<Element>::Params params, int logical_blocks) {
+template <typename Element, bool StreamK>
+__global__ __launch_bounds__(Kernel<Element, StreamK>::kThreadCount) void PublishedGemm(
+    typename Kernel<Element, StreamK>::Params params, int logical_blocks) {
   extern __shared__ char storage[];
-  RunResidentWork<Kernel<Element>>(params, storage, logical_blocks);
+  if constexpr (StreamK) {
+    RunResidentWork<Kernel<Element, StreamK>>(params, storage, logical_blocks);
+  } else {
+    Kernel<Element, StreamK>{}(
+        params, *reinterpret_cast<typename Kernel<Element, StreamK>::SharedStorage*>(storage));
+  }
 }
 
-template <typename Element>
+template <typename Element, bool StreamK>
 cudaError_t Prepare(int* resources, int* occupancy) {
-  auto status = PrepareKernel(PublishedGemm<Element>, SharedBytes<Element>());
+  auto kernel = PublishedGemm<Element, StreamK>;
+  constexpr size_t shared = SharedBytes<Element, StreamK>();
+  auto status = PrepareKernel(kernel, shared);
   if (status != cudaSuccess) return status;
   cudaFuncAttributes attributes;
-  status = cudaFuncGetAttributes(&attributes, PublishedGemm<Element>);
+  status = cudaFuncGetAttributes(&attributes, kernel);
   if (status != cudaSuccess) return status;
   resources[0] = attributes.numRegs;
-  resources[1] = attributes.sharedSizeBytes + SharedBytes<Element>();
-  resources[2] = Kernel<Element>::kThreadCount;
+  resources[1] = attributes.sharedSizeBytes + shared;
+  resources[2] = Kernel<Element, StreamK>::kThreadCount;
   resources[3] = Tile::kM;
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      occupancy, PublishedGemm<Element>, Kernel<Element>::kThreadCount, SharedBytes<Element>());
+      occupancy, kernel, Kernel<Element, StreamK>::kThreadCount, shared);
 }
 
-template <typename Element>
+template <typename Element, bool StreamK>
 cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
                 int ldd, uint8_t const* padding, int row_offset, Element* peer, int* publication,
                 int* peer_publication, int groups, void* workspace, int sms, int occupancy,
                 cudaStream_t stream) {
-  using Gemm = Kernel<Element>;
-  typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1, {1.0f, 0.0f},
-                                a, b, out, out, 0, 0, 0, 0, int64_t(lda), int64_t(ldb),
-                                int64_t(ldd), int64_t(ldd), sms);
-  typename Gemm::Params params(args, sms, occupancy);
+  using Gemm = Kernel<Element, StreamK>;
+  auto params = [&] {
+    if constexpr (StreamK) {
+      typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
+                                    {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),
+                                    int64_t(ldb), int64_t(ldd), int64_t(ldd), sms);
+      return typename Gemm::Params(args, sms, occupancy);
+    } else {
+      cutlass::gemm::GemmCoord problem(m, n, k);
+      auto grid = OutputTileMapping::get_tiled_shape(problem, {Tile::kM, Tile::kN, Tile::kK}, 1);
+      return typename Gemm::Params(problem, grid, {a, RowMajor(lda)}, {b, ColumnMajor(ldb)},
+                                   {out, RowMajor(ldd)}, {out, RowMajor(ldd)}, {1.0f, 0.0f});
+    }
+  }();
   params.params_A.padding = padding;
   params.params_A.row_offset = row_offset;
   params.params_D.peer = peer;
   params.params_D.publication = publication;
   params.params_D.peer_publication = peer_publication;
   params.params_D.groups = groups;
-  params.partials_workspace = workspace;
-  params.barrier_workspace = static_cast<char*>(workspace) + PartialBytes<Element>(sms * occupancy);
-  int const logical_blocks = params.block_mapping.get_num_blocks();
-  int const blocks = min(sms * occupancy, logical_blocks);
-  PublishedGemm<Element>
-      <<<blocks, Gemm::kThreadCount, SharedBytes<Element>(), stream>>>(params, logical_blocks);
+  int logical_blocks = 0;
+  dim3 grid;
+  if constexpr (StreamK) {
+    params.partials_workspace = workspace;
+    params.barrier_workspace =
+        static_cast<char*>(workspace) + PartialBytes<Element>(sms * occupancy);
+    logical_blocks = params.block_mapping.get_num_blocks();
+    grid = dim3(min(sms * occupancy, logical_blocks));
+  } else {
+    grid = OutputTileMapping::get_grid_shape(params.grid_tiled_shape);
+  }
+  PublishedGemm<Element, StreamK>
+      <<<grid, Gemm::kThreadCount, SharedBytes<Element, StreamK>(), stream>>>(params,
+                                                                              logical_blocks);
   return cudaGetLastError();
 }
 

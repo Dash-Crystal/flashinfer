@@ -27,7 +27,7 @@
 namespace flashinfer::ready_tma_gemm {
 
 using namespace cute;
-using ReadyTile = masked_gemm::Tile;
+using ReadyTile = cutlass::gemm::GemmShape<FLASHINFER_READY_ROW_TILE, 64, 64>;
 using TileShape = Shape<Int<ReadyTile::kM>, Int<ReadyTile::kN>, Int<ReadyTile::kK>>;
 using ClusterShape = Shape<_1, _1, _1>;
 using InputStride = Stride<int64_t, _1, int64_t>;
