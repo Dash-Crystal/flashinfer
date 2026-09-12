@@ -22,11 +22,11 @@ The online producer no longer searches reconstructed block-scale candidates.
 `b5e35a87` introduced that search on September 1; both the Claude snapshot
 `d0d7d602` and pre-merge head `bd0e5aaa` inherited it. Its historical presence
 did not authorize preserving it. The page-local cosine/peak-RMS filter chooses
-FP4, FP8 or A16 before any encoding. `mixed_kv_block_scale` now derives one
+FP4, FP8 or A16 before any encoding. The shared mixed-page codec derives one
 scale from block amax, using the direct normalization already present in the
 FP8/NVIDIA NVFP4 quantizers and the mixed format's scale bounds. The selected
 compressed format is encoded once. Rectangular and arena producers share this
-helper; v6 identifies the corrected producer module.
+helper; v6 introduced the corrected producer module.
 
 CUDA 13.3.73 compiles `4e7a0fbb` and parent `247a81e7` for SM120f with
 the same flags. Both FP16 and BF16 arena sealers go from 61 to 54 registers
@@ -49,6 +49,46 @@ The current arena owns one committed encoding per page. The selected SM120
 consumer still reserves A16-sized V shared workspace around packed payload;
 this is distinct from a duplicate persistent cache and remains an operand
 lifetime/layout correction. vLLM's TP2 execution tickets record that review.
+
+### Shared producer codec and layout specialization
+
+`4ee770ec` moves mixed-page arithmetic into `attention/page_codec.cuh`:
+cooperative amax takes an explicit warp lane, `BlockCodec<Format>` computes
+one rounded scale and packs payloads, and both producers reuse those operations.
+`mixed_kv_encode_page` owns traversal and writes; allocation, publication and
+release stay in the sealer. `KVPageGeometry::a16_index<NativeMMA>` is the single
+address formula for static and runtime layout consumers. The host realizes
+the sealer's layout specialization before launch/capture. Its page-format branch
+surrounds the encoding loop; it does not select or launch a different kernel.
+The JIT identity is v7.
+
+FP8 pairs use the existing `vec_cast` implementation's CUDA
+`__nv_cvt_float2_to_fp8x2` operation. The mixed FP4 conversion retains its
+existing midpoint ties toward smaller magnitude and its nonfinite handling;
+native NVFP4's ties-to-even/saturation is a different numerical contract.
+The source now has one mixed FP4 codebook for encoding and promotion decoding.
+The ordinary NVFP4 and direct FP8 APIs retain their existing scale arithmetic;
+they are not byte-equivalent aliases of the mixed codec. In particular, mixed
+nonzero scales have a minimum E4M3 subnormal floor.
+
+The Python reference stores its already-encoded scales instead of rounding
+them a second time. Zero blocks now store zero scales and avoid dividing their
+payloads by zero; global-scale clamping occurs after normalization. These
+reference edge corrections are distinct from the CUDA arithmetic refactor.
+The residual test requiring block quantization to beat tensor quantization's
+MSE-plus-tail objective is deleted; source/payload coverage remains in its
+existing suite. No standalone kernel test or benchmark was added or run.
+
+CUDA 13.3.73 builds `4ee770ec` for SM120f and SM90a. Every FP16/BF16 ×
+token-major/native-layout arena specialization uses 50 registers/thread,
+544 shared bytes, zero stack and zero spills. The preceding SM120 direct
+sealer used 54 registers. Rectangular SM120 producers remain at 39 registers,
+32 stack bytes and zero spills. Receipts are
+`ws-1:/data/h3-runtime/tp2-page-codec-v118-20260912/compile-sm{120,90}.log`.
+The 1,024-thread CTA and routing/encoding input rereads remain; fewer reported
+registers alone do not establish better occupancy or latency. Changed-file
+pre-commit hooks pass. Full-model numerical and Pareto measurements remain
+pending; the deployed service still uses V116.
 
 ### Packed storage integration, September 9 snapshot
 
