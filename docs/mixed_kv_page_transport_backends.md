@@ -3285,3 +3285,28 @@ latency at padded 1,024/2,048 and +2.32% at 512 (working errors 0.80/0.78/0.68
 percentage points). Decode comparisons remain mixed: the host improvement does
 not establish a uniform Pareto gain. The corrected implementation is promoted
 in the supervised TP2 service; vLLM's execution review retains full evidence.
+
+### Streaming QK operand reuse (2026-09-12)
+
+`247a81e7` hoists Q loading outside the key-tile traversal in
+`smemQKPartGemmMixed`. A16/FP8/FP4 conversion converges on shared MMA code;
+compressed operands still expand only in registers. Source Q-load counts fall
+2x for D256 decode and continuation, and 4x for D512 decode. The four BF16
+SM120 specializations retain 121/226/247/253 registers and zero stack/spills.
+Reduced PTX text and static MMA sites describe code sharing, not less matmul.
+
+The full-model V114 canonical adaptive SVG/video campaign measured partial
+decode gains over V112: 7.7--13.3% lower fitted latency across
+1,081--1,341 tokens/s/GPU at 4K input / 1K output, and 9.5% lower across
+1,081--1,273 at 8K input. Curves cross elsewhere. Pooled continuation changes
+at 2,048/4,096/8,192 rows are -1.14/-1.86/+1.96%, with working errors
+0.89/0.74/1.87 percentage points. These are composed network measurements,
+not isolated attention timings or uniform dominance over A16.
+
+`0f2547dd` shares operand closures between decode's Q reuse and multiquery's
+packed-first K pipeline. The existing compiled query family chooses traversal
+before capture. Multiquery resolves format outside the reduction, fetches the
+next packed K fragment, then converts and consumes the current fragment.
+Decode retains Q reuse. The mixed JIT identity is v20; all four BF16 resource
+counts remain unchanged. V115 measures this composition through the same
+full-model campaign; its serving result is recorded in vLLM's TP2 ticket ledger.
