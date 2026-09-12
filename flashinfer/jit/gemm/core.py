@@ -74,11 +74,13 @@ def gen_masked_gemm_module(
 ) -> JitSpec:
     source = jit_env.FLASHINFER_CSRC_DIR / "masked_gemm.cu"
     header = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer/gemm/masked_gemm.cuh"
+    published = header.with_name("published_gemm.cuh")
     tma = header.with_name("ready_tma_gemm.cuh")
     entry = jit_env.CUTLASS_INCLUDE_DIRS[0] / "cutlass/device_kernel.h"
     identity = sha256(
         source.read_bytes()
         + header.read_bytes()
+        + published.read_bytes()
         + (tma.read_bytes() + entry.read_bytes() if ready_tma else b"")
     ).hexdigest()[:16]
     return gen_jit_spec(
