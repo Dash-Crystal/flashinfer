@@ -86,25 +86,42 @@ using PeerEpilogue = cutlass::epilogue::threadblock::Epilogue<
     typename Epilogue::SharedLoadIterator, typename Epilogue::OutputOp, typename Epilogue::Padding>;
 
 template <typename Element, bool Publish, bool TilePublication = false>
-using ProducerBase =
-    LocalGemm<Element, cutlass::gemm::GemmShape<TilePublication ? 32 : 128, 64, 64>,
-              cutlass::gemm::GemmShape<TilePublication ? 16 : 64, 32, 64>>;
-
-template <typename Element, bool Publish, bool TilePublication = false>
 using Gemm = std::conditional_t<
     Publish,
-    cutlass::gemm::kernel::Gemm<
-        typename ProducerBase<Element, Publish, TilePublication>::Mma,
-        PeerEpilogue<typename ProducerBase<Element, Publish, TilePublication>::Epilogue>,
-        ProducerSwizzle<TilePublication>, false>,
-    ProducerBase<Element, Publish, TilePublication>>;
+    cutlass::gemm::kernel::Gemm<typename LocalGemm<Element>::Mma,
+                                PeerEpilogue<typename LocalGemm<Element>::Epilogue>,
+                                ProducerSwizzle<TilePublication>, false>,
+    LocalGemm<Element>>;
+
+template <int Rows>
+CUTLASS_DEVICE void PublishRows(int* publication, int* peer_publication, int groups, int tile_m,
+                                int tiles_n, int problem_rows) {
+  constexpr int group_rows = 32;
+  static_assert(Rows % group_rows == 0);
+  const int first = tile_m * Rows / group_rows;
+  const int end = min(first + Rows / group_rows, (problem_rows + group_rows - 1) / group_rows);
+  // One completion chain per compute tile; subgroups do not split its B reuse.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<int, cuda::thread_scope_device> fragments(publication[2 * groups + first]);
+    if (fragments.fetch_add(1, cuda::memory_order_acq_rel) == tiles_n - 1) {
+      fragments.store(0, cuda::memory_order_relaxed);
+      for (int group = first; group < end; ++group) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> local(publication[group]);
+        cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + group]);
+        peer.store(1, cuda::memory_order_release);
+        local.store(1, cuda::memory_order_release);
+      }
+    }
+  }
+}
 
 template <typename Element, bool Publish, bool TilePublication = false>
 __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCount) void MaskedGemm(
     typename Gemm<Element, Publish, TilePublication>::Params params, const uint8_t* is_padding,
     int row_offset, int* publication, int* peer_publication, int groups) {
   using Kernel = Gemm<Element, Publish, TilePublication>;
-  constexpr int rows = ProducerBase<Element, Publish, TilePublication>::Mma::Shape::kM;
+  constexpr int rows = LocalGemm<Element>::Mma::Shape::kM;
   const auto tile = ProducerSwizzle<TilePublication>::get_tile_offset(params.swizzle_log_tile);
   bool live = false;
   for (int i = threadIdx.x; i < rows; i += blockDim.x) {
@@ -115,20 +132,8 @@ __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCou
   if (__syncthreads_or(live))
     Kernel()(params, *reinterpret_cast<typename Kernel::SharedStorage*>(storage));
   if constexpr (TilePublication) {
-    // CTA synchronization and the device release sequence carry all writers
-    // into the final tile's cumulative system release. No remote atomic needed.
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      cuda::atomic_ref<int, cuda::thread_scope_device> fragments(
-          publication[2 * groups + tile.m()]);
-      if (fragments.fetch_add(1, cuda::memory_order_acq_rel) == params.grid_tiled_shape.n() - 1) {
-        fragments.store(0, cuda::memory_order_relaxed);
-        cuda::atomic_ref<int, cuda::thread_scope_device> local(publication[tile.m()]);
-        cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + tile.m()]);
-        peer.store(1, cuda::memory_order_release);
-        local.store(1, cuda::memory_order_release);
-      }
-    }
+    PublishRows<rows>(publication, peer_publication, groups, tile.m(), params.grid_tiled_shape.n(),
+                      params.problem_size.m());
   }
 }
 
@@ -154,6 +159,7 @@ cudaError_t Prepare(int* resources) {
   resources[0] = attributes.numRegs;
   resources[1] = attributes.sharedSizeBytes + shared;
   resources[2] = Kernel::kThreadCount;
+  resources[3] = LocalGemm<Element>::Mma::Shape::kM;
   return cudaSuccess;
 }
 
@@ -162,7 +168,7 @@ cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int l
                 int ldd, const uint8_t* is_padding, int row_offset, Element* peer, int* publication,
                 int* peer_publication, int groups, cudaStream_t stream) {
   using Kernel = Gemm<Element, Publish, TilePublication>;
-  using Shape = typename ProducerBase<Element, Publish, TilePublication>::Mma::Shape;
+  using Shape = typename LocalGemm<Element>::Mma::Shape;
   using Schedule = ProducerSwizzle<TilePublication>;
   const cutlass::gemm::GemmCoord problem(m, n, k);
   const auto grid = Schedule::get_tiled_shape(problem, {Shape::kM, Shape::kN, Shape::kK}, 1);

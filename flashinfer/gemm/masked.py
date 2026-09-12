@@ -13,26 +13,28 @@ from ..utils import get_compute_capability
 
 
 @cache
-def get_masked_gemm_module(
-    *, ready_tma: bool = False, math_registers: int = 0, row_tile: int = 128
-):
+def get_masked_gemm_module(*, ready_tma: bool = False, math_registers: int = 0):
     return gen_masked_gemm_module(
-        ready_tma=ready_tma, math_registers=math_registers, row_tile=row_tile
+        ready_tma=ready_tma, math_registers=math_registers
     ).build_and_load()
 
 
+class MaskedGemmInfo(NamedTuple):
+    module: Any
+    resources: tuple[int, int, int]
+    row_tile: int
+
+
 @cache
-def _prepared_module(device: int, dtype: torch.dtype, publish: bool, tiles: bool):
-    module = get_masked_gemm_module()
-    resources = tuple(module.prepare(device, dtype == torch.bfloat16, publish, tiles))
-    return module, resources
-
-
-def masked_gemm_resources(
+def masked_gemm_info(
     device: int, dtype: torch.dtype, *, publish: bool, tiles: bool
-):
-    """Return the prepared producer's registers/thread, shared bytes and threads."""
-    return _prepared_module(device, dtype, publish, tiles)[1]
+) -> MaskedGemmInfo:
+    """Return compiled resources and geometry, independent of publication groups."""
+    module = get_masked_gemm_module()
+    registers, shared, threads, rows = module.prepare(
+        device, dtype == torch.bfloat16, publish, tiles
+    )
+    return MaskedGemmInfo(module, (registers, shared, threads), rows)
 
 
 def _validate_mm_operands(x, weight, out):
@@ -87,7 +89,9 @@ def mm_masked_tiles(
     stores. Its owner must publish kernel completion to peer readers with system
     synchronization, and order reuse after the readers finish. Optional local
     and peer publication arrays have four rows: local-ready, peer-ready,
-    fragment completion, and consumed rows, with one column per 32-row tile.
+    fragment completion, and consumed rows, with one column per 32-row group.
+    Compute tiles retain the ordinary GEMM geometry; only the first subgroup
+    counts N-fragment completion, then all its row groups are published.
     The consumer acquires both flags and the last reader resets its local flags
     and consumed-row counter. Both ranks join consumption before slot reuse.
     No preparation tensor or launch is introduced.
@@ -130,9 +134,12 @@ def mm_masked_tiles(
         ):
             raise ValueError("Tile publication requires matching local/peer counters")
     if x.shape[0] and weight.shape[1]:
-        _prepared_module(
-            x.device.index, x.dtype, peer_output is not None, publication is not None
-        )[0].run(
+        masked_gemm_info(
+            x.device.index,
+            x.dtype,
+            publish=peer_output is not None,
+            tiles=publication is not None,
+        ).module.run(
             x,
             weight,
             out,
@@ -159,28 +166,15 @@ def ready_gemm_info(
     device: int,
     dtype: torch.dtype,
     producers: tuple[tuple[int, int, int], ...] = (),
-    *,
-    rows_per_partition: int = 128,
 ) -> ReadyGemmInfo:
-    if rows_per_partition <= 0:
-        raise ValueError("A projection partition must contain rows")
     ready_tma = get_compute_capability(torch.device("cuda", device))[0] == 12
-    # SM80 MMA's 2x2 warp layout covers at least 32 rows. Bind the largest
-    # supported tile within one publication partition before graph replay.
-    row_tile = (
-        max(32, min(128, 1 << (rows_per_partition.bit_length() - 1)))
-        if ready_tma
-        else 128
-    )
-    module = get_masked_gemm_module(ready_tma=ready_tma, row_tile=row_tile)
+    module = get_masked_gemm_module(ready_tma=ready_tma)
     args = (device, dtype == torch.bfloat16, producers)
     sms, occupancy, row_tile, workspace_bytes, budget, concurrent = (
         module.prepare_ready(*args)
     )
     if ready_tma and budget:
-        module = get_masked_gemm_module(
-            ready_tma=True, math_registers=budget, row_tile=row_tile
-        )
+        module = get_masked_gemm_module(ready_tma=True, math_registers=budget)
         sms, occupancy, row_tile, workspace_bytes, _, concurrent = module.prepare_ready(
             *args
         )
@@ -213,7 +207,6 @@ def mm_ready_rows(
     reserved_blocks,
     workspace,
     producers=(),
-    rows_per_partition=128,
 ):
     """Multiply once, consuming row groups published by a concurrent producer.
 
@@ -232,8 +225,8 @@ def mm_ready_rows(
     the native TMA pipeline with
     separate loading and compute warps. Other architectures use CUTLASS Stream-K.
     The resource plan is cached per compiled producer before graph replay.
-    ``rows_per_partition`` binds the consumer tile to the caller's static row
-    partition: a tile waits only for its own rows, with a minimum of 32 on SM120.
+    Communication groups do not select the GEMM's compute tile. SM120 traverses
+    N tiles within a row tile before advancing to later published rows.
     ``workspace`` is allocated and zeroed once with ``create_ready_workspace``;
     Stream-K partials and barriers occupy fixed, disjoint regions across shapes.
     The TMA path needs zero scratch bytes. Execution adds no allocation or
@@ -251,9 +244,7 @@ def mm_ready_rows(
         or any(torch._C._overlaps(readiness, t) for t in (x, weight, out))
     ):
         raise ValueError("Readiness requires one counter per row group and completion")
-    info = ready_gemm_info(
-        x.device.index, x.dtype, producers, rows_per_partition=rows_per_partition
-    )
+    info = ready_gemm_info(x.device.index, x.dtype, producers)
     if (
         workspace.device != x.device
         or workspace.dtype != torch.uint8

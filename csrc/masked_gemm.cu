@@ -28,7 +28,7 @@ using tvm::ffi::Optional;
 
 tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publish,
                                            bool tile_publication) {
-  int resources[3];
+  int resources[4];
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
   if (tile_publication) {
@@ -42,7 +42,7 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, false>(resources);
   }
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
-  return {resources[0], resources[1], resources[2]};
+  return {resources[0], resources[1], resources[2], resources[3]};
 }
 
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,

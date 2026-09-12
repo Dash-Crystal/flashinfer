@@ -27,7 +27,7 @@
 namespace flashinfer::ready_tma_gemm {
 
 using namespace cute;
-using ReadyTile = cutlass::gemm::GemmShape<FLASHINFER_READY_ROW_TILE, 64, 64>;
+using ReadyTile = masked_gemm::Tile;
 using TileShape = Shape<Int<ReadyTile::kM>, Int<ReadyTile::kN>, Int<ReadyTile::kK>>;
 using ClusterShape = Shape<_1, _1, _1>;
 using InputStride = Stride<int64_t, _1, int64_t>;
@@ -190,6 +190,17 @@ cudaError_t PlanReady(cudaDeviceProp const& device, Producers const& producers, 
     *concurrent &= occupancy.activeBlocksPerMultiprocessor > 0;
   }
   const int consumer_warps = Kernel::MaxThreadsPerBlock / device.warpSize;
+  const bool shared_capacity =
+      consumer_occupancy.allocatedSharedMemPerBlock + producer_shared <=
+          device.sharedMemPerMultiprocessor &&
+      (consumer_warps + producer_warps) * device.warpSize <= device.maxThreadsPerMultiProcessor &&
+      consumer_occupancy.blockLimitBlocks >= int(producers.size()) + 1;
+  if (!shared_capacity) {
+    // Register redistribution cannot repair a shared-memory or thread limit.
+    *math_registers = 0;
+    *concurrent = false;
+    return cudaSuccess;
+  }
   const int uniform_registers = (device.regsPerMultiprocessor - producer_regs) / consumer_warps /
                                 granularity * granularity / device.warpSize;
   constexpr int consumer_threads = Kernel::MaxThreadsPerBlock;
@@ -202,12 +213,7 @@ cudaError_t PlanReady(cudaDeviceProp const& device, Producers const& producers, 
   *math_registers =
       budget >= 24 ? std::min(DefaultRegisterAllocation::MathRegisters, budget / 8 * 8) : 0;
   *concurrent &=
-      consumer_occupancy.allocatedRegistersPerBlock + producer_regs <=
-          device.regsPerMultiprocessor &&
-      consumer_occupancy.allocatedSharedMemPerBlock + producer_shared <=
-          device.sharedMemPerMultiprocessor &&
-      (consumer_warps + producer_warps) * device.warpSize <= device.maxThreadsPerMultiProcessor &&
-      consumer_occupancy.blockLimitBlocks >= int(producers.size()) + 1;
+      consumer_occupancy.allocatedRegistersPerBlock + producer_regs <= device.regsPerMultiprocessor;
   return cudaSuccess;
 }
 
@@ -229,6 +235,8 @@ cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, 
   args.epilogue.ptr_D = out;
   args.epilogue.dD = {ldd, _1{}, 0};
   args.hw_info.sm_count = available_sms;
+  using RasterOrderOptions = typename Kernel::TileScheduler::RasterOrderOptions;
+  args.scheduler.raster_order = RasterOrderOptions::AlongN;
   typename Kernel::Params params{Kernel::to_underlying_arguments(args, workspace), readiness,
                                  (m + group_rows - 1) / group_rows, done_index};
   auto grid = Kernel::get_grid_shape(params);
