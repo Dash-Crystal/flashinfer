@@ -230,7 +230,7 @@ __device__ inline void smemQKPartGemmMixed(
       }
     }
   };
-  if constexpr (continuationTile) {
+  if constexpr (XQA_MAX_QUERY_LENGTH > 1) {
     // Wide query tiles amortize a Q load over several MMAs. Keep format
     // dispatch outside the reduction and prefetch packed K before conversion.
 #pragma unroll
