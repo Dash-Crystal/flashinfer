@@ -4,8 +4,6 @@
  */
 #pragma once
 
-#include <utility>
-
 #include "masked_gemm.cuh"
 
 namespace flashinfer::published_gemm {
@@ -16,8 +14,13 @@ struct WorkMapping : ReadySwizzle {
   using Base = ReadySwizzle;
   static constexpr auto kReductionStrategy = Base::kAtomic;
 
-  template <class... Args>
-  CUTLASS_HOST_DEVICE WorkMapping(Args&&... args) : Base(std::forward<Args>(args)...) {
+  WorkMapping() = default;
+
+  WorkMapping(cutlass::gemm::GemmUniversalMode mode, cutlass::gemm::GemmCoord problem,
+              cutlass::gemm::GemmCoord tile, int split, int occupancy, int sms, int available_sms,
+              size_t a_bytes, size_t b_bytes, size_t c_bytes, int fragments)
+      : Base(mode, problem, tile, split, occupancy, sms, available_sms, a_bytes, b_bytes, c_bytes,
+             fragments) {
     // The finishing K peer owns the complete tile and its publication.
     reduction_blocks = 0;
   }
