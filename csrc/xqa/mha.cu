@@ -68,7 +68,7 @@ static_assert(SPEC_DEC && SLIDING_WINDOW);
 // 1 is 8% slower than 4. 2/3 are 10% slower than 4.
 #if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && XQA_MAX_QUERY_LENGTH == 1 && \
     defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-#define CTA_ROW_MAX_BACKWARD_METHOD 2
+#define CTA_ROW_MAX_BACKWARD_METHOD 4
 #else
 #define CTA_ROW_MAX_BACKWARD_METHOD 1
 #endif

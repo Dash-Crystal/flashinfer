@@ -3408,17 +3408,25 @@ lose 13.6--20.0% across the identified upper rate interval; the shared-family
 fit also loses. These are composed serving estimates, not isolated kernel costs.
 
 Independent maxima can require PV probability rescaling indefinitely even after
-the global maximum stabilizes. The implementation now reuses upstream's existing
-delayed-hint path (method 2): softmax uses the previous hint, then QK waits for
-storage ownership and loads the next shared maximum. Producers converge on the
-consumer maximum, avoiding perpetual rescaling without reinstating the early
-wait. P/K/V ownership and continuation's pipeline remain unchanged. Packed KV
-still expands only into matrix operand registers. V124 measures this correction;
-source analysis alone does not establish its performance or rounding effects.
+the global maximum stabilizes. V124 (`f85f48cc`) compiled upstream's delayed-hint
+path and captured all 115 model graphs. Its normal workload was stopped early
+when the memory-model review established that upstream's existing atomic-hint
+path (method 4) needs no hint handoff at all. It is not a completed comparison.
+
+V125 reuses that implementation verbatim: PV atomically increases a common
+maximum, and QK reads it with PTX volatile shared loads. PTX gives volatile
+operations relaxed system-scope semantics. A stale maximum changes the partial's
+scale, not its normalization identity; each quad reduces its loaded hints with
+its actual scores before exponentiation. The existing PV merge uses the maximum
+actually emitted with P. K/V/P ownership barriers remain; the hint publishes no
+operand storage. Scheduling can change BF16 rounding, which is measured through
+full-model serving rather than requiring bitwise equality. Continuation retains
+its preceding pipeline. Packed KV still expands only into matrix registers.
+See the [PTX volatile-operation contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#volatile-operation).
 
 The donor's constant-mask quad broadcast is already enabled on SM120; the V122
 modules contain no WARPSYNC/MATCH.ANY sequences. The composed attention JIT
-identity is v23; producer work remains v8.
+identity is v24; producer work remains v8.
 
 ### Single-query work ownership (2026-09-12)
 
