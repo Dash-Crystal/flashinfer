@@ -3401,22 +3401,24 @@ in the supervised TP2 service; vLLM's execution review retains full evidence.
 ### Decode softmax ownership (2026-09-12)
 
 The executed SM120 D256/D512 decode kernels inherit upstream's backward row-max
-hint. QK waits on the PV consumer before softmax to read that hint, even though
-PV already merges partials with independent row maxima. The compiled decode
-family now keeps a running maximum in each QK warp. It can finish softmax while
-PV consumes the preceding tile, then waits before reusing the shared P and
-row-statistic buffers. PV's existing rescaling merges those partials. This
-removes the backward maximum's shared storage, initialization, stores and loads;
-the ownership barriers for P/K/V remain. Continuation retains its existing
-pipeline. Both families still stream packed KV into matrix operand registers.
+hint. Its default path waits before softmax. V123 (`a7377309`) instead retained
+independent producer maxima, moving the wait until shared P/statistics reuse.
+The canonical full-model comparison still regressed: independent 4K/1K curves
+lose 13.6--20.0% across the identified upper rate interval; the shared-family
+fit also loses. These are composed serving estimates, not isolated kernel costs.
 
-Each emitted P tile is bounded by its producer's running maximum, and the
-consumer rescales its sum and numerator to the maximum across producers. This
-preserves the online-softmax decomposition; BF16 rounding is measured through
-full-model serving. Source and binary inspection also establish that the older
-donor's constant-mask quad broadcast is already enabled on SM120: the V122
-modules contain no WARPSYNC/MATCH.ANY sequences. That is not an omitted fix.
-The composed attention JIT identity is v22; producer work remains v8.
+Independent maxima can require PV probability rescaling indefinitely even after
+the global maximum stabilizes. The implementation now reuses upstream's existing
+delayed-hint path (method 2): softmax uses the previous hint, then QK waits for
+storage ownership and loads the next shared maximum. Producers converge on the
+consumer maximum, avoiding perpetual rescaling without reinstating the early
+wait. P/K/V ownership and continuation's pipeline remain unchanged. Packed KV
+still expands only into matrix operand registers. V124 measures this correction;
+source analysis alone does not establish its performance or rounding effects.
+
+The donor's constant-mask quad broadcast is already enabled on SM120; the V122
+modules contain no WARPSYNC/MATCH.ANY sequences. The composed attention JIT
+identity is v23; producer work remains v8.
 
 ### Single-query work ownership (2026-09-12)
 
