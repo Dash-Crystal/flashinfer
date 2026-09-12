@@ -181,51 +181,57 @@ __device__ inline void smemQKPartGemmMixed(
     uint32_t cacheSeqLen, uint8_t const* scales, uint32_t part, float fp8GlobalScale,
     float fp4GlobalScale) {
   constexpr uint32_t rows = warpTile.y / 16;
-  // Preserve A16 queries for both PV implementations; K expands only in registers.
-  // Static accumulator indices, with a single format dispatch outside the rolled
-  // reduction loop. The old block/page unrolling replicated every converter.
+  constexpr uint32_t tiles = warpTile.x / 16;
+  static_assert(kHeadPartBytes <= 128);
+  Vec<Vec<uint32_t, 2>, tiles> scaleWords;
 #pragma unroll
-  for (uint32_t tile = 0; tile < warpTile.x / 16; ++tile) {
+  for (uint32_t tile = 0; tile < tiles; ++tile) {
     flashinfer::KVPageAddress const address{pages.values[tile * 16 / tokensPerPage]};
-    uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
-    mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
-      constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
-      flashinfer::KVPageFormatSpan page;
-      if constexpr (format == flashinfer::KVPageFormat::kA16) {
-        page = transport.span(address, static_cast<uint8_t>(format));
-      }
-      float const scale =
-          format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
-      static_assert(kHeadPartBytes <= 128);
-      Vec<uint32_t, 2> scaleWords;
-      if constexpr (format != flashinfer::KVPageFormat::kA16) {
+    bool const compressed =
+        address.allocated() && address.format() != flashinfer::KVPageFormat::kA16;
+#pragma unroll
+    for (uint32_t n = 0; n < 2; ++n) {
+      uint32_t const token = tile * 16 + n * 8 + laneId() / 4;
+      scaleWords[tile][n] = compressed ? reinterpret_cast<uint32_t const*>(scales)[token] : 0;
+    }
+  }
+  // Reuse one Q fragment across every key tile, keeping only two converted K
+  // fragments live. The reduction loop stays rolled; tile/accumulator indices
+  // are static. Compressed storage never expands into a shared A16 tile.
+#pragma unroll 1
+  for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
+    auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
+    auto const fetch = [&](uint32_t tile) {
+      flashinfer::KVPageAddress const address{pages.values[tile * 16 / tokensPerPage]};
+      uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
+      InstInMat<2, 2> result;
+      mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
+        constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
+        flashinfer::KVPageFormatSpan page;
+        if constexpr (format == flashinfer::KVPageFormat::kA16) {
+          page = transport.span(address, static_cast<uint8_t>(format));
+        }
+        float const scale =
+            format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
+        auto const fragment = mixed_kv_fragments::fetchK<format>(
+            k, tile * 16, block, part, page, head, tokenBase, skipTokens, cacheSeqLen);
+        uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
+        result =
+            mixed_kv_fragments::convertK<format>(fragment, scaleWords[tile], scaleColumn, scale);
+      });
+      return result;
+    };
+    auto const consume = [&](auto const& b, uint32_t tile) {
+#pragma unroll
+      for (uint32_t i = 0; i < rows; ++i) {
 #pragma unroll
         for (uint32_t n = 0; n < 2; ++n) {
-          uint32_t const token = tile * 16 + n * 8 + laneId() / 4;
-          scaleWords[n] = reinterpret_cast<uint32_t const*>(scales)[token];
+          uint32_t const operand[2][1] = {b.data[n][0], b.data[n][1]};
+          mma<InputElem>(acc(i, tile * 2 + n).data, a(i, 0).data, operand);
         }
       }
-      auto const fetch = [&](uint32_t block) {
-        return mixed_kv_fragments::fetchK<format>(k, tile * 16, block, part, page, head, tokenBase,
-                                                  skipTokens, cacheSeqLen);
-      };
-      auto const consume = [&](auto const& fragment, uint32_t block) {
-        uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
-        auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
-        auto const b =
-            mixed_kv_fragments::convertK<format>(fragment, scaleWords, scaleColumn, scale);
-#pragma unroll
-        for (uint32_t i = 0; i < rows; ++i) {
-#pragma unroll
-          for (uint32_t n = 0; n < 2; ++n) {
-            uint32_t const operand[2][1] = {b.data[n][0], b.data[n][1]};
-            mma<InputElem>(acc(i, tile * 2 + n).data, a(i, 0).data, operand);
-          }
-        }
-      };
-      // Fetch the next packed operand before converting and multiplying this one.
-      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32>(fetch, consume);
-    });
+    };
+    mixed_kv_fragments::pipelineFragments<tiles, true>(fetch, consume);
   }
 }
 
