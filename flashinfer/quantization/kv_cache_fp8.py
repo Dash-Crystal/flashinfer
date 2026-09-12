@@ -62,6 +62,8 @@ class MixedKVPagedCache(NamedTuple):
     page_addresses: torch.Tensor | None = None
     page_geometry: tuple[int, int, int] | None = None
     native_mma: bool = False
+    # Select transposed packed V storage; SM120 decodes only register fragments
+    # and reuses A16 probabilities for all page formats.
 
 
 class MixedKVPageUpdatePhase(IntEnum):

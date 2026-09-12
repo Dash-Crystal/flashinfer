@@ -79,8 +79,6 @@ constexpr uint32_t grainBytesGmemCache = grainBytes / CacheElemConverter::ElemsP
 constexpr uint32_t grainBytesSf = 4;
 #endif
 
-constexpr bool enableMicroFastPath = false;
-
 // SM12x consumes packed KV directly in matrix operand registers.
 #if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && \
     (XQA_MIXED_NATIVE_MMA ||                    \
@@ -473,11 +471,6 @@ struct alignas(128) SharedMem {
 #if XQA_MIXED_NATIVE_MMA
   using StoredVSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
                                     exactDiv(grpLoadV ? headElems : warpVHeadElems, grainBytes)>;
-  struct NativeProbabilities {
-    uint32_t values[warpTile.x / 16][qRows][4];
-    float scales[warpTile.x / 16][qRows];
-  };
-  NativeProbabilities nativeProbabilities[ctaShapeInWarps.y][ctaShapeInWarps.x];
 #else
   using StoredVSmemBuffer = VSmemBuffer;
 #endif
@@ -1241,7 +1234,7 @@ __device__ inline auto loadQueryMatrix(Warp const& warp, SharedMem::QSmemBuffer 
 
 #if ENABLE_MIXED_COMPACT_PAGES
 #if XQA_MIXED_NATIVE_MMA
-#include "mixed_kv_native_mma.cuh"
+#include "mixed_kv_packed_v.cuh"
 #endif
 #include "mixed_kv_fragments.cuh"
 #endif
@@ -1454,7 +1447,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
       exactDiv(SharedMem::VSmemBuffer::rows, 8 * kEx * nbInstInMatPerSliceInGemmKDim);
 
   Vec<InputElem2, QuadRegRowMax::size> xRowScalesQuad;
-  if (!enableMicroFastPath || !skipXRowRescale) {
+  if (!skipXRowRescale) {
     assertWarpConverged();
 #if INPUT_FP16
     Vec<InputElem2, ThrdRegRowMax::size> const xRowScalesF16 = __float2half2_rn(xRowScales);
@@ -1479,7 +1472,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
     Array2D<InstInMat<kEx, mnEx>, xSliceRows, xSliceCols> xSlice =
         loadMatrix<kEx, mnEx, xSliceRows, xSliceCols, false, false, false, false>(warp, x, 0u,
                                                                                   colBeg);
-    if (!enableMicroFastPath || !skipXRowRescale) {
+    if (!skipXRowRescale) {
 #pragma unroll
       for (uint32_t m = 0; m < xSliceRows; m++) {
 #pragma unroll
@@ -1690,21 +1683,30 @@ __device__ inline void pickAccRowsForBeamSearch(Warp const& warp, WarpAcc& dst, 
   }
 }
 
+__device__ inline ThrdRegRowMax rowRescaleFactors(ThrdRegRowMax const& previous,
+                                                  ThrdRegRowMax const& current) {
+  ThrdRegRowMax result;
+#pragma unroll
+  for (uint32_t i = 0; i < result.size; ++i) {
+    // Equal maxima include empty rows; do not subtract equal infinities.
+    result[i] = previous[i] == current[i] ? 1.0f : expf(previous[i] - current[i]);
+  }
+  return result;
+}
+
 __device__ inline void rescaleAcc(Warp const& warp, WarpAcc& acc,
                                   UniformRescaleMask const& rescaleMask,
                                   ThrdRegRowMax const& rowScales) {
   static_assert(WarpAcc::rows * InstAcc::rows * 8 <= ThrdRegRowMax::size * warp_size);
-// QuadRegRowMax const quadRowScales = replicateForQuad(warp, rowScales);
 #pragma unroll
   for (uint32_t m = 0; m < WarpAcc::rows; m++) {
 #pragma unroll
     for (uint32_t i = 0; i < InstAcc::rows; i++) {
       uint32_t const r = m * InstAcc::rows + i;  // in 8-row unit.
-      bool const skip = enableMicroFastPath && ((rescaleMask[r / 4] & (0xFFU << 8 * r)) == 0);
-      if (skip) {  // @fixme: do we need this?
+      bool const skip = (rescaleMask[r / 4] & (0xFFU << (8 * (r % 4)))) == 0;
+      if (skip) {
         continue;
       }
-      // float const scale = quadRowScales[r]; // @fixme: see if this is faster than the line below.
       float const scale = replicateValForQuad(warp, rowScales, r);
 #pragma unroll
       for (uint32_t n = 0; n < WarpAcc::cols; n++) {
@@ -2731,11 +2733,6 @@ CUBIN_EXPORT __global__
 #else
       storeOrderedGemmOutTile(warp, smem.x[warpIdx.y][warpIdx.x], fp16Acc);
 #endif
-#if XQA_MIXED_NATIVE_MMA
-      __syncwarp();
-      mixed_kv_fragments::prepareNativeProbabilities(smem.nativeProbabilities[warpIdx.y][warpIdx.x],
-                                                     smem.x[warpIdx.y][warpIdx.x]);
-#endif
       smem.warpRowMax[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowMax);
       smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
       unused(xBar.produced.arrive());
@@ -3022,7 +3019,7 @@ CUBIN_EXPORT __global__
       // }
 
 #if XQA_MIXED_NATIVE_MMA
-      mixed_kv_fragments::copyNativeVAsync(
+      mixed_kv_fragments::copyPackedVAsync(
           dst, getSmemVScales(idxNextSMemVBuf), cacheList.transport.storage, pageReferences,
           idxHeadGrp, tokenOffset, grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems,
           grpLoadV ? warpIdxInGrp : 0U);
@@ -3305,8 +3302,9 @@ CUBIN_EXPORT __global__
                 smem.ctaRowMax[warpIdx.y].atomicMaxUpdate(warp, globalRowMax);
 #endif
                 // update row sum and acc
-                if (!enableMicroFastPath || any(accRowNeedRescaleMask)) {
-                  ThrdRegRowMax const accRowScales = expf(globalRowMaxOld - globalRowMax);
+                if (any(accRowNeedRescaleMask)) {
+                  ThrdRegRowMax const accRowScales =
+                      rowRescaleFactors(globalRowMaxOld, globalRowMax);
                   globalRowSum = globalRowSum * accRowScales;
                   // @fixme: when tmpAcc is used, this can be delayed.
 #pragma unroll
@@ -3314,9 +3312,9 @@ CUBIN_EXPORT __global__
                     rescaleAcc(warp, accs[hs], accRowNeedRescaleMask, accRowScales);
                   }
                 }
-                if (!enableMicroFastPath || !skipXRowRescale) {
-                  xRowScales = skipXRowRescale ? xRowScales : expf(xTileRowMax - globalRowMax);
-                  xTileRowSum = skipXRowRescale ? xTileRowSum : xTileRowSum * xRowScales;
+                if (!skipXRowRescale) {
+                  xRowScales = rowRescaleFactors(xTileRowMax, globalRowMax);
+                  xTileRowSum = xTileRowSum * xRowScales;
                 }
               }
               globalRowSum = globalRowSum + xTileRowSum;
@@ -3399,7 +3397,6 @@ CUBIN_EXPORT __global__
                   warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale
 #if XQA_MIXED_NATIVE_MMA
                   ,
-                  smem.nativeProbabilities[warpIdx.y][idxXTile],
                   smem.vPages[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], cacheList.transport,
                   idxHeadGrp,
                   ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
@@ -3476,8 +3473,8 @@ CUBIN_EXPORT __global__
         auto const otherRowSum =
             smem.warpRowSum[warpIdx.y][otherWarpIdx].template loadToReg<false>(warp);
         auto const globalRowMaxNew = fmaxf(globalRowMax, otherRowMax);
-        auto const scaleForThis = expf(globalRowMax - globalRowMaxNew);
-        auto const scaleForOther = expf(otherRowMax - globalRowMaxNew);
+        auto const scaleForThis = rowRescaleFactors(globalRowMax, globalRowMaxNew);
+        auto const scaleForOther = rowRescaleFactors(otherRowMax, globalRowMaxNew);
 #pragma unroll
         for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
           rescaleAcc(warp, accs[hs], fullRescaleMask, scaleForThis);
