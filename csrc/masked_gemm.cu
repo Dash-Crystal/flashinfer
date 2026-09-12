@@ -36,10 +36,11 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
   if (tile_publication) {
-    using namespace flashinfer::published_gemm;
-    auto prepare =
-        bf16 ? (stream_k ? Prepare<cutlass::bfloat16_t, true> : Prepare<cutlass::bfloat16_t, false>)
-             : (stream_k ? Prepare<cutlass::half_t, true> : Prepare<cutlass::half_t, false>);
+    namespace published = flashinfer::published_gemm;
+    auto prepare = bf16 ? (stream_k ? published::Prepare<cutlass::bfloat16_t, true>
+                                    : published::Prepare<cutlass::bfloat16_t, false>)
+                        : (stream_k ? published::Prepare<cutlass::half_t, true>
+                                    : published::Prepare<cutlass::half_t, false>);
     status = prepare(resources, &occupancy);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     cudaDeviceProp properties;
@@ -47,8 +48,8 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     sms = properties.multiProcessorCount;
     if (stream_k)
-      workspace_bytes = bf16 ? WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
-                             : WorkspaceBytes<cutlass::half_t>(sms * occupancy);
+      workspace_bytes = bf16 ? published::WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
+                             : published::WorkspaceBytes<cutlass::half_t>(sms * occupancy);
   } else if (publish) {
     status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>(resources)
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>(resources);
