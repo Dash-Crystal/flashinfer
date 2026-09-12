@@ -1049,7 +1049,7 @@ __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, c
   }
 }
 
-constexpr int kMixedKVSealThreads = 256;
+constexpr int kMixedKVSealThreads = 1024;
 
 template <typename InType, int THREADS = kMixedKVSealThreads>
 __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
@@ -1066,8 +1066,8 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
   const int64_t values = storage.geometry.values();
   __shared__ float moments[4];
   __shared__ uint64_t pending;
-  // Four adjacent values per lane preserve 1024 values per iteration with
-  // eight warps. Four-lane scale groups halve the codec's shuffle depth.
+  // Preserve page-level parallelism while processing four values per lane.
+  // Four-lane scale groups halve the codec's shuffle depth.
   mixed_kv_route_moments<THREADS>(
       values - values_per_token, values / MIXED_KV_SIGNATURE_BLOCK_SIZE,
       [&](int64_t i) { return mixed_kv_to_float(input[i + values_per_token]); },
