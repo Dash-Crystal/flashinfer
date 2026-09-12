@@ -23,6 +23,9 @@ class MaskedGemmInfo(NamedTuple):
     module: Any
     resources: tuple[int, int, int]
     row_tile: int
+    sms: int
+    occupancy: int
+    workspace_bytes: int
 
 
 @cache
@@ -31,10 +34,12 @@ def masked_gemm_info(
 ) -> MaskedGemmInfo:
     """Return compiled resources and geometry, independent of publication groups."""
     module = get_masked_gemm_module()
-    registers, shared, threads, rows = module.prepare(
+    registers, shared, threads, rows, sms, occupancy, workspace_bytes = module.prepare(
         device, dtype == torch.bfloat16, publish, tiles
     )
-    return MaskedGemmInfo(module, (registers, shared, threads), rows)
+    return MaskedGemmInfo(
+        module, (registers, shared, threads), rows, sms, occupancy, workspace_bytes
+    )
 
 
 def _validate_mm_operands(x, weight, out):
@@ -79,8 +84,9 @@ def mm_masked_tiles(
     peer_output=None,
     publication=None,
     peer_publication=None,
+    workspace=None,
 ):
-    """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
+    """Compute visible GEMM tiles and publish complete reduced output rows.
 
     The caller must consume outputs with the same row mask. Arbitrary holes in
     the mask are supported; partially visible tiles use ordinary GEMM arithmetic.
@@ -94,7 +100,9 @@ def mm_masked_tiles(
     counts N-fragment completion, then all its row groups are published.
     The consumer acquires both flags and the last reader resets its local flags
     and consumed-row counter. Both ranks join consumption before slot reuse.
-    No preparation tensor or launch is introduced.
+    Published tiles use Stream-K with caller-owned FP32 partial workspace;
+    wholly padded tiles skip MMA but still retire contributors and publish zeros.
+    Workspace is initialized once and reused only after this launch completes.
     """
     _validate_mm_operands(x, weight, out)
     if (
@@ -134,12 +142,23 @@ def mm_masked_tiles(
         ):
             raise ValueError("Tile publication requires matching local/peer counters")
     if x.shape[0] and weight.shape[1]:
-        masked_gemm_info(
+        info = masked_gemm_info(
             x.device.index,
             x.dtype,
             publish=peer_output is not None,
             tiles=publication is not None,
-        ).module.run(
+        )
+        if publication is not None and (
+            workspace is None
+            or workspace.device != x.device
+            or workspace.dtype != torch.uint8
+            or workspace.ndim != 1
+            or not workspace.is_contiguous()
+            or workspace.data_ptr() % 128
+            or workspace.numel() < info.workspace_bytes
+        ):
+            raise ValueError("Published GEMM requires its prepared partial workspace")
+        info.module.run(
             x,
             weight,
             out,
@@ -148,6 +167,9 @@ def mm_masked_tiles(
             peer_output,
             publication,
             peer_publication,
+            workspace,
+            info.sms,
+            info.occupancy,
         )
     return out
 

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <flashinfer/gemm/masked_gemm.cuh>
+#include <flashinfer/gemm/published_gemm.cuh>
 
 #if FLASHINFER_READY_TMA_SM120
 #include <flashinfer/gemm/ready_tma_gemm.cuh>
@@ -29,11 +30,22 @@ using tvm::ffi::Optional;
 tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publish,
                                            bool tile_publication) {
   int resources[4];
+  int occupancy = 0;
+  int sms = 0;
+  size_t workspace_bytes = 0;
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
   if (tile_publication) {
-    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true, true>(resources)
-                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true, true>(resources);
+    status = bf16 ? flashinfer::published_gemm::Prepare<cutlass::bfloat16_t>(resources, &occupancy)
+                  : flashinfer::published_gemm::Prepare<cutlass::half_t>(resources, &occupancy);
+    TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
+    cudaDeviceProp properties;
+    status = cudaGetDeviceProperties(&properties, device);
+    TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
+    sms = properties.multiProcessorCount;
+    workspace_bytes =
+        bf16 ? flashinfer::published_gemm::WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
+             : flashinfer::published_gemm::WorkspaceBytes<cutlass::half_t>(sms * occupancy);
   } else if (publish) {
     status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>(resources)
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>(resources);
@@ -42,30 +54,50 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, false>(resources);
   }
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
-  return {resources[0], resources[1], resources[2], resources[3]};
+  return {resources[0],
+          resources[1],
+          resources[2],
+          resources[3],
+          sms,
+          occupancy,
+          int64_t(workspace_bytes)};
 }
 
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,
                    int64_t row_offset, Optional<TensorView> peer_output,
-                   Optional<TensorView> publication, Optional<TensorView> peer_publication) {
+                   Optional<TensorView> publication, Optional<TensorView> peer_publication,
+                   Optional<TensorView> workspace, int64_t sms, int64_t occupancy) {
   ffi::CUDADeviceGuard guard(x.device().device_id);
   const auto stream = get_stream(x.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
     using Element = std::conditional_t<std::is_same_v<c_type, nv_bfloat16>, cutlass::bfloat16_t,
                                        cutlass::half_t>;
-    auto run = publication.has_value()   ? flashinfer::masked_gemm::Run<Element, true, true>
-               : peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
+    cudaError_t status;
+    if (publication.has_value()) {
+      TVM_FFI_ICHECK(workspace.has_value() && peer_output.has_value() &&
+                     peer_publication.has_value());
+      TVM_FFI_ICHECK(sms > 0 && occupancy > 0);
+      TVM_FFI_ICHECK(workspace.value().size(0) >=
+                     flashinfer::published_gemm::WorkspaceBytes<Element>(sms * occupancy));
+      status = flashinfer::published_gemm::Run(
+          static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
+          static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
+          weight.stride(1), out.stride(0), static_cast<uint8_t const*>(is_padding.data_ptr()),
+          row_offset, static_cast<Element*>(peer_output.value().data_ptr()),
+          static_cast<int*>(publication.value().data_ptr()),
+          static_cast<int*>(peer_publication.value().data_ptr()), publication.value().size(1),
+          workspace.value().data_ptr(), sms, occupancy, stream);
+    } else {
+      auto run = peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
                                          : flashinfer::masked_gemm::Run<Element, false>;
-    auto status = run(
-        static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
-        static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
-        weight.stride(1), out.stride(0), static_cast<const uint8_t*>(is_padding.data_ptr()),
-        row_offset,
-        peer_output.has_value() ? static_cast<Element*>(peer_output.value().data_ptr()) : nullptr,
-        publication.has_value() ? static_cast<int*>(publication.value().data_ptr()) : nullptr,
-        peer_publication.has_value() ? static_cast<int*>(peer_publication.value().data_ptr())
-                                     : nullptr,
-        publication.has_value() ? publication.value().size(1) : 0, stream);
+      status = run(
+          static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
+          static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
+          weight.stride(1), out.stride(0), static_cast<uint8_t const*>(is_padding.data_ptr()),
+          row_offset,
+          peer_output.has_value() ? static_cast<Element*>(peer_output.value().data_ptr()) : nullptr,
+          stream);
+    }
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     return true;
   });

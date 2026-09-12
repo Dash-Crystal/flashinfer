@@ -27,16 +27,6 @@ using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
 using RowMajor = cutlass::layout::RowMajor;
 using ColumnMajor = cutlass::layout::ColumnMajor;
 
-// Complete adjacent N tiles of each row group before moving to later rows.
-struct PublishedRowSwizzle : cutlass::gemm::threadblock::GemmHorizontalThreadblockSwizzle {
-  CUTLASS_DEVICE static cutlass::gemm::GemmCoord get_tile_offset(int) {
-    return GemmHorizontalThreadblockSwizzle::get_tile_offset({});
-  }
-};
-
-template <bool TilePublication>
-using ProducerSwizzle = std::conditional_t<TilePublication, PublishedRowSwizzle, Swizzle>;
-
 template <typename Element, typename Shape = Tile,
           typename WarpShape = cutlass::gemm::GemmShape<64, 32, 64>>
 using LocalGemm = typename cutlass::gemm::kernel::DefaultGemm<
@@ -78,20 +68,23 @@ struct PeerStoreIterator : Iterator {
   }
 };
 
-template <typename Epilogue>
-using PeerEpilogue = cutlass::epilogue::threadblock::Epilogue<
-    typename Epilogue::Shape, typename Epilogue::WarpMmaOperator, Epilogue::kPartitionsK,
-    PeerStoreIterator<typename Epilogue::OutputTileIterator>,
+template <typename Epilogue, typename Iterator>
+using RebindEpilogue = cutlass::epilogue::threadblock::Epilogue<
+    typename Epilogue::Shape, typename Epilogue::WarpMmaOperator, Epilogue::kPartitionsK, Iterator,
     typename Epilogue::AccumulatorFragmentIterator, typename Epilogue::WarpTileIterator,
     typename Epilogue::SharedLoadIterator, typename Epilogue::OutputOp, typename Epilogue::Padding>;
 
-template <typename Element, bool Publish, bool TilePublication = false>
-using Gemm = std::conditional_t<
-    Publish,
-    cutlass::gemm::kernel::Gemm<typename LocalGemm<Element>::Mma,
-                                PeerEpilogue<typename LocalGemm<Element>::Epilogue>,
-                                ProducerSwizzle<TilePublication>, false>,
-    LocalGemm<Element>>;
+template <typename Epilogue>
+using PeerEpilogue =
+    RebindEpilogue<Epilogue, PeerStoreIterator<typename Epilogue::OutputTileIterator>>;
+
+template <typename Element, bool Publish>
+using Gemm =
+    std::conditional_t<Publish,
+                       cutlass::gemm::kernel::Gemm<
+                           typename LocalGemm<Element>::Mma,
+                           PeerEpilogue<typename LocalGemm<Element>::Epilogue>, Swizzle, false>,
+                       LocalGemm<Element>>;
 
 template <int Rows>
 CUTLASS_DEVICE void PublishRows(int* publication, int* peer_publication, int groups, int tile_m,
@@ -116,13 +109,12 @@ CUTLASS_DEVICE void PublishRows(int* publication, int* peer_publication, int gro
   }
 }
 
-template <typename Element, bool Publish, bool TilePublication = false>
-__global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCount) void MaskedGemm(
-    typename Gemm<Element, Publish, TilePublication>::Params params, const uint8_t* is_padding,
-    int row_offset, int* publication, int* peer_publication, int groups) {
-  using Kernel = Gemm<Element, Publish, TilePublication>;
+template <typename Element, bool Publish>
+__global__ __launch_bounds__(Gemm<Element, Publish>::kThreadCount) void MaskedGemm(
+    typename Gemm<Element, Publish>::Params params, const uint8_t* is_padding, int row_offset) {
+  using Kernel = Gemm<Element, Publish>;
   constexpr int rows = LocalGemm<Element>::Mma::Shape::kM;
-  const auto tile = ProducerSwizzle<TilePublication>::get_tile_offset(params.swizzle_log_tile);
+  const auto tile = Swizzle::get_tile_offset(params.swizzle_log_tile);
   bool live = false;
   for (int i = threadIdx.x; i < rows; i += blockDim.x) {
     const int row = tile.m() * rows + i;
@@ -131,10 +123,6 @@ __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCou
   extern __shared__ char storage[];
   if (__syncthreads_or(live))
     Kernel()(params, *reinterpret_cast<typename Kernel::SharedStorage*>(storage));
-  if constexpr (TilePublication) {
-    PublishRows<rows>(publication, peer_publication, groups, tile.m(), params.grid_tiled_shape.n(),
-                      params.problem_size.m());
-  }
 }
 
 template <typename Kernel>
@@ -146,11 +134,11 @@ cudaError_t PrepareKernel(Kernel kernel, size_t shared_bytes) {
                               cudaSharedmemCarveoutMaxShared);
 }
 
-template <typename Element, bool Publish, bool TilePublication = false>
+template <typename Element, bool Publish>
 cudaError_t Prepare(int* resources) {
-  using Kernel = Gemm<Element, Publish, TilePublication>;
+  using Kernel = Gemm<Element, Publish>;
   constexpr size_t shared = sizeof(typename Kernel::SharedStorage);
-  auto kernel = MaskedGemm<Element, Publish, TilePublication>;
+  auto kernel = MaskedGemm<Element, Publish>;
   auto status = PrepareKernel(kernel, shared);
   if (status != cudaSuccess) return status;
   cudaFuncAttributes attributes;
@@ -163,22 +151,21 @@ cudaError_t Prepare(int* resources) {
   return cudaSuccess;
 }
 
-template <typename Element, bool Publish, bool TilePublication = false>
+template <typename Element, bool Publish>
 cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
-                int ldd, const uint8_t* is_padding, int row_offset, Element* peer, int* publication,
-                int* peer_publication, int groups, cudaStream_t stream) {
-  using Kernel = Gemm<Element, Publish, TilePublication>;
+                int ldd, const uint8_t* is_padding, int row_offset, Element* peer,
+                cudaStream_t stream) {
+  using Kernel = Gemm<Element, Publish>;
   using Shape = typename LocalGemm<Element>::Mma::Shape;
-  using Schedule = ProducerSwizzle<TilePublication>;
+  using Schedule = Swizzle;
   const cutlass::gemm::GemmCoord problem(m, n, k);
   const auto grid = Schedule::get_tiled_shape(problem, {Shape::kM, Shape::kN, Shape::kK}, 1);
   typename Kernel::Params params(problem, grid, {a, RowMajor(lda)}, {b, ColumnMajor(ldb)},
                                  {out, RowMajor(ldd)}, {out, RowMajor(ldd)}, {1.0f, 0.0f});
   if constexpr (Publish) params.params_D.peer = peer;
-  MaskedGemm<Element, Publish, TilePublication>
+  MaskedGemm<Element, Publish>
       <<<Schedule::get_grid_shape(grid), Kernel::kThreadCount,
-         sizeof(typename Kernel::SharedStorage), stream>>>(params, is_padding, row_offset,
-                                                           publication, peer_publication, groups);
+         sizeof(typename Kernel::SharedStorage), stream>>>(params, is_padding, row_offset);
   return cudaGetLastError();
 }
 
@@ -238,15 +225,25 @@ using ReadyGemm =
                                                 typename ReadyBase<Element>::Epilogue,
                                                 ReadySwizzle>;
 
+template <typename Kernel>
+constexpr size_t PersistentSharedBytes() {
+  static_assert(alignof(typename Kernel::SharedStorage) <= 128);
+  return 128 + sizeof(typename Kernel::SharedStorage);
+}
+
+template <typename Kernel>
+constexpr size_t PartialWorkspaceBytes(int slots) {
+  return (slots * Kernel::kWorkspaceBytesPerBlock + 127) / 128 * 128;
+}
+
 template <typename Element>
 constexpr size_t ReadySharedBytes() {
-  static_assert(alignof(typename ReadyGemm<Element>::SharedStorage) <= 128);
-  return 128 + sizeof(typename ReadyGemm<Element>::SharedStorage);
+  return PersistentSharedBytes<ReadyGemm<Element>>();
 }
 
 template <typename Element>
 constexpr size_t ReadyPartialBytes(int slots) {
-  return (slots * ReadyGemm<Element>::kWorkspaceBytesPerBlock + 127) / 128 * 128;
+  return PartialWorkspaceBytes<ReadyGemm<Element>>(slots);
 }
 
 template <typename Element>
@@ -269,18 +266,24 @@ CUTLASS_DEVICE void FinishReady(int* readiness, int groups, int done_index) {
   }
 }
 
+template <typename Kernel>
+CUTLASS_DEVICE void RunResidentWork(typename Kernel::Params const& params, char* storage,
+                                    int logical_blocks) {
+  auto& shared = *reinterpret_cast<typename Kernel::SharedStorage*>(storage + 128);
+  for (int offset = 0; int(blockIdx.x) + offset < logical_blocks; offset += gridDim.x) {
+    if (threadIdx.x == 0) *reinterpret_cast<int*>(storage) = offset;
+    __syncthreads();
+    Kernel::invoke(params, shared);
+    __syncthreads();
+  }
+}
+
 template <typename Element>
 __global__ __launch_bounds__(ReadyGemm<Element>::kThreadCount) void ReadyRowsGemm(
     typename ReadyGemm<Element>::Params params, int* readiness, int groups, int done_index,
     int logical_blocks) {
   extern __shared__ char storage[];
-  auto& shared = *reinterpret_cast<typename ReadyGemm<Element>::SharedStorage*>(storage + 128);
-  for (int offset = 0; int(blockIdx.x) + offset < logical_blocks; offset += gridDim.x) {
-    if (threadIdx.x == 0) *reinterpret_cast<int*>(storage) = offset;
-    __syncthreads();
-    ReadyGemm<Element>::invoke(params, shared);
-    __syncthreads();
-  }
+  RunResidentWork<ReadyGemm<Element>>(params, storage, logical_blocks);
   FinishReady(readiness, groups, done_index);
 }
 
