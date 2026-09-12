@@ -258,7 +258,6 @@ def gen_xqa_module(
             f"-DXQA_CONTINUATION_TILE={int(continuation)}",
             f"-DXQA_MAX_QUERY_LENGTH={q_seq_len}",
         ],
-        extra_include_paths=jit_env.CUTLASS_INCLUDE_DIRS if native_mma else None,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
 

@@ -18,7 +18,6 @@
 #include "cuda_hint.cuh"
 #include "defines.h"
 #if XQA_MIXED_NATIVE_MMA
-#include <cute/arch/mma_sm120.hpp>
 #include <flashinfer/math.cuh>
 #endif
 #if !(IS_MLA)
@@ -224,8 +223,8 @@ constexpr bool kCompactVScaleStorage = false;
 #endif
 // constexpr uint32_t cacheElemsPerKHeadPart = exactDiv(kHeadPartBytes, cacheElemSize);
 
-constexpr bool persistentQ = XQA_MIXED_NATIVE_MMA || paddedInputHeadBytes * ctaTile.y <=
-                                                         ((continuationTile ? 32u : 16u) << 10);
+constexpr bool persistentQ =
+    paddedInputHeadBytes * ctaTile.y <= ((continuationTile ? 32u : 16u) << 10);
 static_assert(persistentQ);
 constexpr uint32_t qHeadPartBytes = persistentQ ? paddedInputHeadBytes : kHeadPartBytes;
 constexpr uint32_t qHeadPartElems = exactDiv(qHeadPartBytes, inputElemSize);
@@ -474,13 +473,6 @@ struct alignas(128) SharedMem {
 #if XQA_MIXED_NATIVE_MMA
   using StoredVSmemBuffer = Array2D<LdGrain, cacheVTileSeqLen,
                                     exactDiv(grpLoadV ? headElems : warpVHeadElems, grainBytes)>;
-  struct NativeQuery {
-    uint32_t fp8[headElems / 16][qRows][4];
-    uint32_t fp4[headElems / 16][qRows][2];
-    float fp8Scales[headElems / 16][qRows];
-    uint8_t fp4Scales[headElems / 16][qRows];
-  };
-  NativeQuery nativeQuery;
   struct NativeProbabilities {
     uint32_t values[warpTile.x / 16][qRows][4];
     float scales[warpTile.x / 16][qRows];
@@ -505,9 +497,7 @@ struct alignas(128) SharedMem {
               (grpLoadV ? headElems : warpVHeadElems) / CacheElemConverter::QuantVectorSize>;
 #endif
 
-#if !XQA_MIXED_NATIVE_MMA
   QSmemBuffer q[ctaShapeInWarps.y][nbQBuffers];
-#endif
   KSmemBuffer k[ctaShapeInWarps.x][nbKBuffers];
   XSmemBuffer x[ctaShapeInWarps.y][ctaShapeInWarps.x];
   static_assert(nbXBuffers == 1);
@@ -2063,19 +2053,7 @@ CUBIN_EXPORT __global__
 #endif
 
   // load whole Q heads into shared memory
-#if XQA_MIXED_NATIVE_MMA
 #if SPEC_DEC
-  mixed_kv_fragments::QueryRows const nativeQueryRows{
-      reinterpret_cast<InputElem const*>(q) +
-          uint64_t(reqSeqOffset * nbQHeads + idxHeadGrp * headGrpSize) * headElems,
-      idxHeadTokenInGrp, nbValidHeadTokens, nbQHeads};
-#else
-  mixed_kv_fragments::QueryRows const nativeQueryRows{
-      reinterpret_cast<InputElem const*>(q) +
-          uint64_t(idxReq * nbQHeads + idxHeadGrp * headGrpSize) * headElems,
-      0, headGrpSize, nbQHeads};
-#endif
-#elif SPEC_DEC
   if (warpIdx.z == 0) {
     // map from idxQHead to idxHead in q input.
     auto const localQHeadTokenIdxMap = [nbQHeads, headGrpSize, reqSeqOffset, idxReq,
@@ -2507,11 +2485,6 @@ CUBIN_EXPORT __global__
 
     bool qBarParityNext = false;
     auto& qBar = smem.qBarrier[warpIdx.y];
-#if XQA_MIXED_NATIVE_MMA
-    mixed_kv_fragments::prepareNativeQuery(smem.nativeQuery, nativeQueryRows, warpIdx.x);
-    unused(qBar.arrive());
-    qBar.wait_parity(qBarParityNext);
-#else
     qBar.wait_parity(qBarParityNext);
     qBarParityNext = !qBarParityNext;
     constexpr bool reorderForKCache =
@@ -2524,7 +2497,6 @@ CUBIN_EXPORT __global__
       qBarParityNext = !qBarParityNext;
       assertWarpConverged();
     }
-#endif
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
     ThrdRegRowMax initRowMax;
     initRowMax.fill(safeInitRowMax);
@@ -2576,11 +2548,9 @@ CUBIN_EXPORT __global__
             }
 #endif
           }
-#if !XQA_MIXED_NATIVE_MMA
           SharedMem::QSmemBuffer const& smemQ = smem.q[warpIdx.y][0];
           constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
           uint32_t const smemQOffset = qOffsetPerPart * p;
-#endif
           SharedMem::KSmemBuffer& smemKPart = getSMemKTile(idxCurrSMemKBuf);
 #if ENABLE_MIXED_KV_CACHE && !ENABLE_MIXED_COMPACT_PAGES
           if constexpr (!compactMixedPages) {
@@ -2638,27 +2608,13 @@ CUBIN_EXPORT __global__
 #if ENABLE_MIXED_COMPACT_PAGES
           if constexpr (compactMixedPages) {
             uint32_t const tokenBase = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
-            smemQKPartGemmMixed(warp, acc,
-#if XQA_MIXED_NATIVE_MMA
-                                nativeQueryRows,
-#else
-                                smemQ, smemQOffset,
+            smemQKPartGemmMixed(warp, acc, smemQ, smemQOffset, smemKPart,
+                                smem.kPages[warpIdx.x][idxCurrSMemKBuf], cacheList.transport,
+                                idxHeadGrp, tokenBase, nbTotalSkipTokens, cacheSeqLen,
+                                &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p, fp8KGlobalScale,
+                                fp4KGlobalScale);
+          } else
 #endif
-                                smemKPart, smem.kPages[warpIdx.x][idxCurrSMemKBuf],
-                                cacheList.transport, idxHeadGrp, tokenBase, nbTotalSkipTokens,
-                                cacheSeqLen, &smem.kScales[warpIdx.x][idxCurrSMemKBuf][0][0], p,
-                                fp8KGlobalScale, fp4KGlobalScale
-#if XQA_MIXED_NATIVE_MMA
-                                ,
-                                smem.nativeQuery
-#endif
-            );
-          }
-#if !XQA_MIXED_NATIVE_MMA
-          else
-#endif
-#endif
-#if !XQA_MIXED_NATIVE_MMA
           {
             smemQKPartGemm<KElemType>(warp, acc, smemQ, smemQOffset, smemKPart
 #if ENABLE_4BIT_KV_CACHE
@@ -2667,7 +2623,6 @@ CUBIN_EXPORT __global__
 #endif
             );
           }
-#endif
           idxCurrSMemKBuf++;
 #if MIXED_HOISTED_COPY && MIXED_PAGE_STATIC_FORMAT < 0
           kTagWordCurr = kTagWordNext;  // [45c] rotation (see the prologue site)

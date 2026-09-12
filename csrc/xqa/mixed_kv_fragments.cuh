@@ -174,37 +174,14 @@ __device__ inline InstInMat<2, 2> convertV(Fragment<format> const& fragment,
 
 }  // namespace mixed_kv_fragments
 
-__device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
-#if XQA_MIXED_NATIVE_MMA
-                                           mixed_kv_fragments::QueryRows const& q,
-#else
-                                           SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
-#endif
-                                           SharedMem::KSmemBuffer const& k,
-                                           MixedPageReferences<nbPagesPerWarpTile> const& pages,
-                                           PageTransport const& transport, uint32_t head,
-                                           uint32_t tokenBase, uint32_t skipTokens,
-                                           uint32_t cacheSeqLen, uint8_t const* scales,
-                                           uint32_t part, float fp8GlobalScale, float fp4GlobalScale
-#if XQA_MIXED_NATIVE_MMA
-                                           ,
-                                           SharedMem::NativeQuery const& nativeQuery
-#endif
-) {
+__device__ inline void smemQKPartGemmMixed(
+    Warp const& warp, WarpAcc& acc, SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
+    SharedMem::KSmemBuffer const& k, MixedPageReferences<nbPagesPerWarpTile> const& pages,
+    PageTransport const& transport, uint32_t head, uint32_t tokenBase, uint32_t skipTokens,
+    uint32_t cacheSeqLen, uint8_t const* scales, uint32_t part, float fp8GlobalScale,
+    float fp4GlobalScale) {
   constexpr uint32_t rows = warpTile.y / 16;
-#if XQA_MIXED_NATIVE_MMA
-  Vec<mixed_kv_fragments::NativeQueryFP4, rows> qFP4;
-  Array2D<mixed_kv_fragments::NativeOperandFP8, rows, kHeadPartBytes / 32> qFP8;
-#pragma unroll
-  for (uint32_t i = 0; i < rows; ++i) {
-    qFP4[i] = mixed_kv_fragments::loadQueryFP4(nativeQuery, i * 16, part);
-#pragma unroll
-    for (uint32_t block = 0; block < kHeadPartBytes / 32; ++block) {
-      qFP8(i, block) = mixed_kv_fragments::loadQueryFP8(nativeQuery, i * 16,
-                                                        part * (kHeadPartBytes / 32) + block);
-    }
-  }
-#endif
+  // Preserve A16 queries for both PV implementations; K expands only in registers.
   // Static accumulator indices, with a single format dispatch outside the rolled
   // reduction loop. The old block/page unrolling replicated every converter.
 #pragma unroll
@@ -213,12 +190,6 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
     uint8_t const pageFormat = address.allocated() ? static_cast<uint8_t>(address.format()) : 0;
     mixed_kv_fragments::visit(pageFormat, [&](auto tag) {
       constexpr auto format = static_cast<flashinfer::KVPageFormat>(decltype(tag)::value);
-#if XQA_MIXED_NATIVE_MMA
-      if constexpr (format == flashinfer::KVPageFormat::kBlockScaledFP4) {
-        mixed_kv_fragments::nativeFP4QK(acc, qFP4, k, scales, tile, fp4GlobalScale);
-        return;
-      }
-#endif
       flashinfer::KVPageFormatSpan page;
       if constexpr (format == flashinfer::KVPageFormat::kA16) {
         page = transport.span(address, static_cast<uint8_t>(format));
@@ -240,25 +211,7 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
       };
       auto const consume = [&](auto const& fragment, uint32_t block) {
         uint32_t const scaleColumn = (part * (kHeadPartBytes / 32) + block) % 4;
-#if XQA_MIXED_NATIVE_MMA
-        if constexpr (format == flashinfer::KVPageFormat::kBlockScaledFP8) {
-#pragma unroll
-          for (uint32_t n = 0; n < 2; ++n) {
-            auto const b = mixed_kv_fragments::prepareValueFP8(
-                fragment[n], uint8_t(scaleWords[n] >> (scaleColumn * 8)), scale);
-#pragma unroll
-            for (uint32_t i = 0; i < rows; ++i)
-              mixed_kv_fragments::nativeFP8Mma(acc(i, tile * 2 + n), qFP8(i, block), b);
-          }
-          return;
-        }
-#endif
-#if XQA_MIXED_NATIVE_MMA
-        auto const a = q.template matrix<rows>(part * (kHeadPartBytes / inputElemSize) + block * 16,
-                                               mixed_kv_fragments::A16KColumns{});
-#else
         auto const a = loadQueryMatrix<2, 2, rows, 1>(warp, q, qColBeg + block * 2);
-#endif
         auto const b =
             mixed_kv_fragments::convertK<format>(fragment, scaleWords, scaleColumn, scale);
 #pragma unroll
@@ -271,8 +224,7 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
         }
       };
       // Fetch the next packed operand before converting and multiplying this one.
-      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32, bool(XQA_MIXED_NATIVE_MMA)>(
-          fetch, consume);
+      mixed_kv_fragments::pipelineFragments<kHeadPartBytes / 32>(fetch, consume);
     });
   }
 }
