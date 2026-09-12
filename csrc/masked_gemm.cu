@@ -26,10 +26,13 @@ namespace ready_gemm = flashinfer::masked_gemm;
 
 using tvm::ffi::Optional;
 
-void PrepareMaskedGemm(int64_t device, bool bf16, bool publish) {
+void PrepareMaskedGemm(int64_t device, bool bf16, bool publish, bool tile_publication) {
   ffi::CUDADeviceGuard guard(device);
   cudaError_t status;
-  if (publish) {
+  if (tile_publication) {
+    status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true, true>()
+                  : flashinfer::masked_gemm::Prepare<cutlass::half_t, true, true>();
+  } else if (publish) {
     status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>()
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>();
   } else {
@@ -40,21 +43,26 @@ void PrepareMaskedGemm(int64_t device, bool bf16, bool publish) {
 }
 
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,
-                   int64_t row_offset, Optional<TensorView> peer_output) {
+                   int64_t row_offset, Optional<TensorView> peer_output,
+                   Optional<TensorView> publication, Optional<TensorView> peer_publication) {
   ffi::CUDADeviceGuard guard(x.device().device_id);
   const auto stream = get_stream(x.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
     using Element = std::conditional_t<std::is_same_v<c_type, nv_bfloat16>, cutlass::bfloat16_t,
                                        cutlass::half_t>;
-    auto run = peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
-                                       : flashinfer::masked_gemm::Run<Element, false>;
+    auto run = publication.has_value()   ? flashinfer::masked_gemm::Run<Element, true, true>
+               : peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
+                                         : flashinfer::masked_gemm::Run<Element, false>;
     auto status = run(
         static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
         static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
         weight.stride(1), out.stride(0), static_cast<const uint8_t*>(is_padding.data_ptr()),
         row_offset,
         peer_output.has_value() ? static_cast<Element*>(peer_output.value().data_ptr()) : nullptr,
-        stream);
+        publication.has_value() ? static_cast<int*>(publication.value().data_ptr()) : nullptr,
+        peer_publication.has_value() ? static_cast<int*>(peer_publication.value().data_ptr())
+                                     : nullptr,
+        publication.has_value() ? publication.value().size(1) : 0, stream);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     return true;
   });

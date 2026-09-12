@@ -625,17 +625,18 @@ struct MixedKVQuantizedBlock {
   uint8_t payload;
 };
 
-// Both rectangular and packed page writers use the original 16-lane codec.
-__device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float value,
-                                                                         float global_scale,
-                                                                         uint8_t selected_format) {
-  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
-  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
-  float block_max = fabsf(value);
+template <int VALUES>
+__device__ __forceinline__ float mixed_kv_choose_scale(float const (&values)[VALUES],
+                                                       float global_scale,
+                                                       uint8_t selected_format) {
+  constexpr int lanes = BSFP8_BLOCK_SIZE / VALUES;
+  const uint32_t subgroup_mask = ((1U << lanes) - 1) << (threadIdx.x % 32 / lanes * lanes);
+  float block_max = 0;
 #pragma unroll
-  for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
-    block_max =
-        fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, BSFP8_BLOCK_SIZE));
+  for (int i = 0; i < VALUES; ++i) block_max = fmaxf(block_max, fabsf(values[i]));
+#pragma unroll
+  for (int offset = lanes / 2; offset > 0; offset /= 2) {
+    block_max = fmaxf(block_max, __shfl_xor_sync(subgroup_mask, block_max, offset, lanes));
   }
 
   const float format_max = selected_format == 2 ? 6.0f : 448.0f;
@@ -654,22 +655,28 @@ __device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float v
       __nv_fp8_e4m3 candidate_sf_fp8 = __nv_fp8_e4m3(candidate_sf);
       candidate_sf = static_cast<float>(candidate_sf_fp8);
       const float encode_scale = reciprocal_approximate_ftz(global_scale * candidate_sf);
-      float reconstructed;
-      if (selected_format == 2) {
-        reconstructed = decode_e2m1_nibble(encode_e2m1_nibble(value * encode_scale)) *
-                        candidate_sf * global_scale;
-      } else {
-        __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
-        reconstructed = static_cast<float>(encoded) * candidate_sf * global_scale;
-      }
-      const float residual = fabsf(reconstructed - value);
-      float sum_squared = residual * residual;
-      float max_residual = residual;
+      float sum_squared = 0;
+      float max_residual = 0;
 #pragma unroll
-      for (int offset = BSFP8_BLOCK_SIZE / 2; offset > 0; offset /= 2) {
-        sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, BSFP8_BLOCK_SIZE);
-        max_residual = fmaxf(
-            max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset, BSFP8_BLOCK_SIZE));
+      for (int i = 0; i < VALUES; ++i) {
+        const float value = values[i];
+        float reconstructed;
+        if (selected_format == 2) {
+          reconstructed = decode_e2m1_nibble(encode_e2m1_nibble(value * encode_scale)) *
+                          candidate_sf * global_scale;
+        } else {
+          __nv_fp8_e4m3 encoded = __nv_fp8_e4m3(value * encode_scale);
+          reconstructed = static_cast<float>(encoded) * candidate_sf * global_scale;
+        }
+        const float residual = fabsf(reconstructed - value);
+        sum_squared += residual * residual;
+        max_residual = fmaxf(max_residual, residual);
+      }
+#pragma unroll
+      for (int offset = lanes / 2; offset > 0; offset /= 2) {
+        sum_squared += __shfl_xor_sync(subgroup_mask, sum_squared, offset, lanes);
+        max_residual =
+            fmaxf(max_residual, __shfl_xor_sync(subgroup_mask, max_residual, offset, lanes));
       }
       const float objective =
           sum_squared / float(BSFP8_BLOCK_SIZE) + 0.05f * max_residual * max_residual;
@@ -679,6 +686,16 @@ __device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float v
       }
     }
   }
+  return sf_value;
+}
+
+__device__ __forceinline__ MixedKVQuantizedBlock mixed_kv_quantize_block(float value,
+                                                                         float global_scale,
+                                                                         uint8_t selected_format) {
+  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
+  const uint32_t subgroup_mask = 0xffffU << (threadIdx.x & 16);
+  const float values[1] = {value};
+  const float sf_value = mixed_kv_choose_scale(values, global_scale, selected_format);
   __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
   const float encode_scale =
       sf_value == 0.0f ? 0.0f : reciprocal_approximate_ftz(global_scale * sf_value);
@@ -1032,7 +1049,7 @@ __global__ void mixed_kv_arena_write_kernel(flashinfer::KVPageStorage storage, c
   }
 }
 
-constexpr int kMixedKVSealThreads = 1024;
+constexpr int kMixedKVSealThreads = 256;
 
 template <typename InType, int THREADS = kMixedKVSealThreads>
 __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
@@ -1049,9 +1066,8 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
   const int64_t values = storage.geometry.values();
   __shared__ float moments[4];
   __shared__ uint64_t pending;
-  // A page owns its decision, encoding, and publication. A full CTA distributes
-  // codec blocks across 32 warps; 128 threads serialized 256 blocks per lane
-  // for Gemma's 32768-value pages.
+  // Four adjacent values per lane preserve 1024 values per iteration with
+  // eight warps. Four-lane scale groups halve the codec's shuffle depth.
   mixed_kv_route_moments<THREADS>(
       values - values_per_token, values / MIXED_KV_SIGNATURE_BLOCK_SIZE,
       [&](int64_t i) { return mixed_kv_to_float(input[i + values_per_token]); },
@@ -1078,17 +1094,35 @@ __global__ __launch_bounds__(THREADS) void mixed_kv_arena_seal_kernel(
   const auto format = static_cast<uint8_t>(destination.format());
   auto* payload = storage.data + destination.offset();
   auto* scales = payload + storage.geometry.payload_bytes(destination.format());
-  const int lane = threadIdx.x % BSFP8_BLOCK_SIZE;
-  for (int64_t i = threadIdx.x; i < values; i += THREADS) {
+  for (int64_t i = int64_t(threadIdx.x) * 4; i < values; i += THREADS * 4) {
     uint64_t const input_index = storage.geometry.a16_index(i);
     const int kv = (input_index / storage.geometry.head_dim) % 2;
-    const auto encoded = mixed_kv_quantize_block(mixed_kv_to_float(input[input_index]),
-                                                 global_scales[(format - 1) * 2 + kv], format);
-    if (lane == 0) scales[i / BSFP8_BLOCK_SIZE] = encoded.scale;
+    float vector[4];
+    if (!storage.geometry.native_mma || kv == 0) {
+      const uint64_t packed = *reinterpret_cast<uint64_t const*>(input + input_index);
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        vector[j] = mixed_kv_to_float(reinterpret_cast<InType const*>(&packed)[j]);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        vector[j] = mixed_kv_to_float(input[storage.geometry.a16_index(i + j)]);
+    }
+    const float global_scale = global_scales[(format - 1) * 2 + kv];
+    const float scale = mixed_kv_choose_scale(vector, global_scale, format);
+    if (threadIdx.x % 4 == 0) scales[i / BSFP8_BLOCK_SIZE] = __nv_fp8_e4m3(scale).__x;
+    const float inverse = scale == 0 ? 0 : reciprocal_approximate_ftz(global_scale * scale);
+    uint32_t encoded = 0;
     if (format == 1) {
-      payload[i] = encoded.payload;
-    } else if (lane < BSFP8_BLOCK_SIZE / 2) {
-      payload[(i / BSFP8_BLOCK_SIZE) * (BSFP8_BLOCK_SIZE / 2) + lane] = encoded.payload;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        encoded |= uint32_t(__nv_fp8_e4m3(vector[j] * inverse).__x) << (j * 8);
+      *reinterpret_cast<uint32_t*>(payload + i) = encoded;
+    } else {
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        encoded |= uint32_t(encode_e2m1_nibble(vector[j] * inverse)) << (j * 4);
+      *reinterpret_cast<uint16_t*>(payload + i / 2) = uint16_t(encoded);
     }
   }
   __syncthreads();

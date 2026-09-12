@@ -186,18 +186,31 @@ __device__ inline NativeOperandFP8 quantizeOperandFP8(Load const& load) {
   return result;
 }
 
-__device__ inline void nativeFP8Mma(InstAcc& acc, NativeOperandFP8 const& a, uint32_t b,
-                                    uint8_t scaleBits, float globalScale) {
+struct NativeValueFP8 {
+  uint32_t values;
+  float scales[2];
+};
+
+__device__ inline NativeValueFP8 prepareValueFP8(uint32_t values, uint8_t scaleBits,
+                                                 float globalScale) {
   __nv_fp8_e4m3 scale;
   scale.__x = scaleBits;
   float const decoded = float(scale) * globalScale;
+  NativeValueFP8 result{values, {}};
+#pragma unroll
+  for (uint32_t j = 0; j < 2; ++j)
+    result.scales[j] = __shfl_sync(~0U, decoded, ((laneId() % 4) * 2 + j) * 4);
+  return result;
+}
+
+__device__ inline void nativeFP8Mma(InstAcc& acc, NativeOperandFP8 const& a,
+                                    NativeValueFP8 const& b) {
   float partial[2][2] = {};
-  mmaF8_k16(partial, a.values, b);
+  mmaF8_k16(partial, a.values, b.values);
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    float const columnScale = __shfl_sync(~0U, decoded, ((laneId() % 4) * 2 + j) * 4);
 #pragma unroll
-    for (uint32_t m = 0; m < 2; ++m) acc(m, j) += partial[m][j] * (a.scales[m] * columnScale);
+    for (uint32_t m = 0; m < 2; ++m) acc(m, j) += partial[m][j] * (a.scales[m] * b.scales[j]);
   }
 }
 
@@ -268,13 +281,12 @@ __device__ inline InstInMat<2, 1> fetchNativeA16V(flashinfer::KVPageFormatSpan c
   return result;
 }
 
-template <flashinfer::KVPageFormat format>
-__device__ inline void nativePV(WarpAcc& acc, SharedMem::XSmemBuffer const& x, uint32_t xColumn,
-                                QuadRegRowMax const& rowScales,
-                                SharedMem::StoredVSmemBuffer const& tile, uint8_t const* scales,
-                                uint32_t headColumn, uint32_t token, float globalScale) {
-  constexpr bool fp4 = format == flashinfer::KVPageFormat::kBlockScaledFP4;
-  Vec<NativeOperandFP8, warpTile.y / 16> a;
+using NativePVOperands = Vec<NativeOperandFP8, warpTile.y / 16>;
+
+__device__ inline NativePVOperands prepareNativePV(SharedMem::XSmemBuffer const& x,
+                                                   uint32_t xColumn,
+                                                   QuadRegRowMax const& rowScales) {
+  NativePVOperands a;
 #pragma unroll
   for (uint32_t i = 0; i < warpTile.y / 16; ++i) {
     a[i] = quantizeOperandFP8([&](uint32_t row, uint32_t k) {
@@ -282,6 +294,14 @@ __device__ inline void nativePV(WarpAcc& acc, SharedMem::XSmemBuffer const& x, u
       return float(reinterpret_cast<InputElem const*>(&grain)[k % 8]) * rowScales[i * 2 + row / 8];
     });
   }
+  return a;
+}
+
+template <flashinfer::KVPageFormat format>
+__device__ inline void nativePV(WarpAcc& acc, NativePVOperands const& a,
+                                SharedMem::StoredVSmemBuffer const& tile, uint8_t const* scales,
+                                uint32_t headColumn, uint32_t token, float globalScale) {
+  constexpr bool fp4 = format == flashinfer::KVPageFormat::kBlockScaledFP4;
 #pragma unroll
   for (uint32_t n = 0; n < warpTile.x / 8; ++n) {
     uint32_t const coefficient = headColumn + n * 8 + laneId() / 4;
@@ -290,10 +310,9 @@ __device__ inline void nativePV(WarpAcc& acc, SharedMem::XSmemBuffer const& x, u
     uint32_t const b =
         fp4 ? expandFP4ToFP8(reinterpret_cast<uint16_t const*>(payload)[laneId() % 4])
             : reinterpret_cast<uint32_t const*>(payload)[laneId() % 4];
-    uint8_t const sf = scales[index];
+    auto const operand = prepareValueFP8(b, scales[index], globalScale);
 #pragma unroll
-    for (uint32_t i = 0; i < warpTile.y / 16; ++i)
-      nativeFP8Mma(acc(i, n), a[i], b, sf, globalScale);
+    for (uint32_t i = 0; i < warpTile.y / 16; ++i) nativeFP8Mma(acc(i, n), a[i], operand);
   }
 }
 

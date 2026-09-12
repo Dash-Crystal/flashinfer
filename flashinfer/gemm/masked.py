@@ -22,9 +22,9 @@ def get_masked_gemm_module(
 
 
 @cache
-def _prepared_module(device: int, dtype: torch.dtype, publish: bool):
+def _prepared_module(device: int, dtype: torch.dtype, publish: bool, tiles: bool):
     module = get_masked_gemm_module()
-    module.prepare(device, dtype == torch.bfloat16, publish)
+    module.prepare(device, dtype == torch.bfloat16, publish, tiles)
     return module
 
 
@@ -60,7 +60,17 @@ def _validate_mm_operands(x, weight, out):
         raise ValueError("Expected aligned CUDA TN GEMM operands")
 
 
-def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=None):
+def mm_masked_tiles(
+    x,
+    weight,
+    out,
+    is_padding,
+    *,
+    row_offset=0,
+    peer_output=None,
+    publication=None,
+    peer_publication=None,
+):
     """Write GEMM tiles containing visible rows; wholly padded tiles stay untouched.
 
     The caller must consume outputs with the same row mask. Arbitrary holes in
@@ -68,7 +78,11 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
     Operands are A row-major, B column-major, and output row-major, aligned to
     eight FP16/BF16 values. An optional peer mapping receives the same epilogue
     stores. Its owner must publish kernel completion to peer readers with system
-    synchronization, and order reuse after the readers finish.
+    synchronization, and order reuse after the readers finish. Optional local
+    and peer publication arrays have four rows: local-ready, peer-ready,
+    fragment completion, and consumed rows, with one column per 32-row tile.
+    The consumer acquires both flags and the last reader resets its local flags
+    and consumed-row counter. Both ranks join consumption before slot reuse.
     No preparation tensor or launch is introduced.
     """
     _validate_mm_operands(x, weight, out)
@@ -92,9 +106,34 @@ def mm_masked_tiles(x, weight, out, is_padding, *, row_offset=0, peer_output=Non
         raise ValueError(
             "Peer output must be a distinct mapping with the output layout"
         )
+    if publication is not None or peer_publication is not None:
+        if (
+            peer_output is None
+            or any(
+                p is None
+                or p.device != x.device
+                or p.dtype != torch.int32
+                or p.ndim != 2
+                or p.shape[0] != 4
+                or p.shape[1] < (x.shape[0] + 31) // 32
+                or not p.is_contiguous()
+                for p in (publication, peer_publication)
+            )
+            or publication.shape != peer_publication.shape
+        ):
+            raise ValueError("Tile publication requires matching local/peer counters")
     if x.shape[0] and weight.shape[1]:
-        _prepared_module(x.device.index, x.dtype, peer_output is not None).run(
-            x, weight, out, is_padding, row_offset, peer_output
+        _prepared_module(
+            x.device.index, x.dtype, peer_output is not None, publication is not None
+        ).run(
+            x,
+            weight,
+            out,
+            is_padding,
+            row_offset,
+            peer_output,
+            publication,
+            peer_publication,
         )
     return out
 

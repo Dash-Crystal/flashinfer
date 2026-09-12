@@ -75,29 +75,52 @@ using PeerEpilogue = cutlass::epilogue::threadblock::Epilogue<
     typename Epilogue::AccumulatorFragmentIterator, typename Epilogue::WarpTileIterator,
     typename Epilogue::SharedLoadIterator, typename Epilogue::OutputOp, typename Epilogue::Padding>;
 
-template <typename Element, bool Publish>
-using Gemm =
-    std::conditional_t<Publish,
-                       cutlass::gemm::kernel::Gemm<
-                           typename LocalGemm<Element>::Mma,
-                           PeerEpilogue<typename LocalGemm<Element>::Epilogue>, Swizzle, false>,
-                       LocalGemm<Element>>;
+template <typename Element, bool Publish, bool TilePublication = false>
+using ProducerBase =
+    LocalGemm<Element, cutlass::gemm::GemmShape<TilePublication ? 32 : 128, 64, 64>,
+              cutlass::gemm::GemmShape<TilePublication ? 16 : 64, 32, 64>>;
 
-template <typename Element, bool Publish>
-__global__ __launch_bounds__(Gemm<Element, Publish>::kThreadCount) void MaskedGemm(
-    typename Gemm<Element, Publish>::Params params, const uint8_t* is_padding, int row_offset) {
+template <typename Element, bool Publish, bool TilePublication = false>
+using Gemm = std::conditional_t<
+    Publish,
+    cutlass::gemm::kernel::Gemm<
+        typename ProducerBase<Element, Publish, TilePublication>::Mma,
+        PeerEpilogue<typename ProducerBase<Element, Publish, TilePublication>::Epilogue>, Swizzle,
+        false>,
+    ProducerBase<Element, Publish, TilePublication>>;
+
+template <typename Element, bool Publish, bool TilePublication = false>
+__global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCount) void MaskedGemm(
+    typename Gemm<Element, Publish, TilePublication>::Params params, const uint8_t* is_padding,
+    int row_offset, int* publication, int* peer_publication, int groups) {
+  using Kernel = Gemm<Element, Publish, TilePublication>;
+  constexpr int rows = ProducerBase<Element, Publish, TilePublication>::Mma::Shape::kM;
   const auto tile = Swizzle::get_tile_offset(params.swizzle_log_tile);
   bool live = false;
-  for (int i = threadIdx.x; i < Tile::kM; i += blockDim.x) {
-    const int row = tile.m() * Tile::kM + i;
+  for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+    const int row = tile.m() * rows + i;
     live |= row < params.problem_size.m() && !is_padding[row_offset + row];
   }
-  if (!__syncthreads_or(live)) return;
   extern __shared__ char storage[];
-  Gemm<Element, Publish>()(
-      params, *reinterpret_cast<typename Gemm<Element, Publish>::SharedStorage*>(storage));
-  // Kernel completion orders every producer thread before dependent work.
-  // The caller's system release/acquire handoff then publishes peer stores.
+  if (__syncthreads_or(live))
+    Kernel()(params, *reinterpret_cast<typename Kernel::SharedStorage*>(storage));
+  if constexpr (TilePublication) {
+    // Every epilogue writer publishes its PCIe stores before the final N tile
+    // releases the row group. No remote atomic operation is required.
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      cuda::atomic_ref<int, cuda::thread_scope_device> fragments(
+          publication[2 * groups + tile.m()]);
+      if (fragments.fetch_add(1, cuda::memory_order_acq_rel) == params.grid_tiled_shape.n() - 1) {
+        fragments.store(0, cuda::memory_order_relaxed);
+        cuda::atomic_ref<int, cuda::thread_scope_system> local(publication[tile.m()]);
+        cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + tile.m()]);
+        peer.store(1, cuda::memory_order_release);
+        local.store(1, cuda::memory_order_release);
+      }
+    }
+  }
 }
 
 template <typename Kernel>
@@ -109,26 +132,27 @@ cudaError_t PrepareKernel(Kernel kernel, size_t shared_bytes) {
                               cudaSharedmemCarveoutMaxShared);
 }
 
-template <typename Element, bool Publish>
+template <typename Element, bool Publish, bool TilePublication = false>
 cudaError_t Prepare() {
-  return PrepareKernel(MaskedGemm<Element, Publish>,
-                       sizeof(typename Gemm<Element, Publish>::SharedStorage));
+  return PrepareKernel(MaskedGemm<Element, Publish, TilePublication>,
+                       sizeof(typename Gemm<Element, Publish, TilePublication>::SharedStorage));
 }
 
-template <typename Element, bool Publish>
+template <typename Element, bool Publish, bool TilePublication = false>
 cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
-                int ldd, const uint8_t* is_padding, int row_offset, Element* peer,
-                cudaStream_t stream) {
+                int ldd, const uint8_t* is_padding, int row_offset, Element* peer, int* publication,
+                int* peer_publication, int groups, cudaStream_t stream) {
+  using Kernel = Gemm<Element, Publish, TilePublication>;
+  using Shape = typename ProducerBase<Element, Publish, TilePublication>::Mma::Shape;
   const cutlass::gemm::GemmCoord problem(m, n, k);
-  const auto grid = Swizzle::get_tiled_shape(problem, {Tile::kM, Tile::kN, Tile::kK}, 1);
-  typename Gemm<Element, Publish>::Params params(problem, grid, {a, RowMajor(lda)},
-                                                 {b, ColumnMajor(ldb)}, {out, RowMajor(ldd)},
-                                                 {out, RowMajor(ldd)}, {1.0f, 0.0f});
+  const auto grid = Swizzle::get_tiled_shape(problem, {Shape::kM, Shape::kN, Shape::kK}, 1);
+  typename Kernel::Params params(problem, grid, {a, RowMajor(lda)}, {b, ColumnMajor(ldb)},
+                                 {out, RowMajor(ldd)}, {out, RowMajor(ldd)}, {1.0f, 0.0f});
   if constexpr (Publish) params.params_D.peer = peer;
-  MaskedGemm<Element, Publish>
-      <<<Swizzle::get_grid_shape(grid), Gemm<Element, Publish>::kThreadCount,
-         sizeof(typename Gemm<Element, Publish>::SharedStorage), stream>>>(params, is_padding,
-                                                                           row_offset);
+  MaskedGemm<Element, Publish, TilePublication>
+      <<<Swizzle::get_grid_shape(grid), Kernel::kThreadCount,
+         sizeof(typename Kernel::SharedStorage), stream>>>(params, is_padding, row_offset,
+                                                           publication, peer_publication, groups);
   return cudaGetLastError();
 }
 

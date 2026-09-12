@@ -3425,57 +3425,50 @@ CUBIN_EXPORT __global__
             auto const& smemVSfPart = getSmemVSfTile(idxCurrSMemVBuf);
 #endif
 
-            // do computation from shared memory X and V tiles. With nbHeadSplits > 1
-            // (headElems > 256), each warp computes multiple head-dim slices from the
-            // group-shared full-head V tile.
-#pragma unroll
-            for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
-              WarpAcc& acc = accs[hs];
-              uint32_t const idxNSplit = grpLoadV ? vHeadSlice(warpIdxInGrp, hs) : hs;
-#if BEAM_WIDTH == 1
-#if ENABLE_MIXED_COMPACT_PAGES
-              if constexpr (compactMixedPages) {
-                smemXVPartGemmMixed(
-                    warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile,
-                    idxVTile, smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
-                    &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
-                    idxNSplit, fp8VGlobalScale, fp4VGlobalScale
+#if ENABLE_MIXED_COMPACT_PAGES && BEAM_WIDTH == 1
+            if constexpr (compactMixedPages) {
+              smemXVPartGemmMixed(
+                  warp, accs, skipXRowRescale, xRowNeedRescaleMask, xRowScales, smemXTile, idxVTile,
+                  smemVTile, smem.vFormats[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf],
+                  &smem.vScales[warpGrpIdx][grpLoadV ? 0 : warpIdxInGrp][idxCurrSMemVBuf][0][0],
+                  warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale
 #if XQA_MIXED_NATIVE_MMA
-                    ,
-                    smem.vPages[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], cacheList.transport,
-                    idxHeadGrp,
-                    ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
-                        cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx,
-                    grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems, nbTotalSkipTokens, cacheSeqLen
+                  ,
+                  smem.vPages[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], cacheList.transport,
+                  idxHeadGrp,
+                  ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
+                      cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx,
+                  grpLoadV ? 0U : warpIdxInGrp * warpVHeadElems, nbTotalSkipTokens, cacheSeqLen
 #endif
-                );
-              }
+              );
+            }
 #if !XQA_MIXED_NATIVE_MMA
-              else
+            else
 #endif
 #endif
 #if !XQA_MIXED_NATIVE_MMA
-              {
+            {
+#pragma unroll
+              for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+                uint32_t const idxNSplit = grpLoadV ? vHeadSlice(warpIdxInGrp, hs) : hs;
+#if BEAM_WIDTH == 1
+                auto& acc = accs[hs];
+#else
+                WarpAcc acc{};
+#endif
                 smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask,
                                           xRowScales, smemXTile, idxVTile, smemVTile,
 #if ENABLE_4BIT_KV_CACHE
                                           smemVSfPart,
 #endif
                                           idxNSplit);
+#if BEAM_WIDTH > 1
+                pickAccRowsForBeamSearch(warp, accs[hs], acc, isConvergedTile(seqIter), idxBeam,
+                                         [](float& d, float s) { d += s; });
+#endif
               }
-#endif
-#else
-              WarpAcc tmpAcc{};
-              smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
-                                        xRowScales, smemXTile, idxVTile, smemVTile,
-#if ENABLE_4BIT_KV_CACHE
-                                        smemVSfPart,
-#endif
-                                        idxNSplit);
-              pickAccRowsForBeamSearch(warp, accs[hs], tmpAcc, isConvergedTile(seqIter), idxBeam,
-                                       [](float& d, float s) { d += s; });
-#endif
             }
+#endif
             if (grpLoadV) {
               unused(pWarpGrpBar->arrive());
             }

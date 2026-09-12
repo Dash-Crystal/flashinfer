@@ -243,12 +243,12 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
 #if XQA_MIXED_NATIVE_MMA
         if constexpr (format == flashinfer::KVPageFormat::kBlockScaledFP8) {
 #pragma unroll
-          for (uint32_t i = 0; i < rows; ++i) {
-            auto const& a = qFP8(i, block);
+          for (uint32_t n = 0; n < 2; ++n) {
+            auto const b = mixed_kv_fragments::prepareValueFP8(
+                fragment[n], uint8_t(scaleWords[n] >> (scaleColumn * 8)), scale);
 #pragma unroll
-            for (uint32_t n = 0; n < 2; ++n)
-              mixed_kv_fragments::nativeFP8Mma(acc(i, tile * 2 + n), a, fragment[n],
-                                               uint8_t(scaleWords[n] >> (scaleColumn * 8)), scale);
+            for (uint32_t i = 0; i < rows; ++i)
+              mixed_kv_fragments::nativeFP8Mma(acc(i, tile * 2 + n), qFP8(i, block), b);
           }
           return;
         }
@@ -277,11 +277,12 @@ __device__ inline void smemQKPartGemmMixed(Warp const& warp, WarpAcc& acc,
   }
 }
 
+template <uint32_t HeadSplits>
 __device__ inline void smemXVPartGemmMixed(
-    Warp const& warp, WarpAcc& acc, bool skipRescale, UniformRescaleMask, ThrdRegRowMax rowScales,
-    SharedMem::XSmemBuffer const& x, uint32_t vTile, SharedMem::StoredVSmemBuffer const& v,
-    MixedPageFormats<nbPagesPerVTile> const& formats, uint8_t const* scales, uint32_t headSlice,
-    float fp8GlobalScale, float fp4GlobalScale
+    Warp const& warp, Vec<WarpAcc, HeadSplits>& accs, bool skipRescale, UniformRescaleMask,
+    ThrdRegRowMax rowScales, SharedMem::XSmemBuffer const& x, uint32_t vTile,
+    SharedMem::StoredVSmemBuffer const& v, MixedPageFormats<nbPagesPerVTile> const& formats,
+    uint8_t const* scales, uint32_t warpInGroup, float fp8GlobalScale, float fp4GlobalScale
 #if XQA_MIXED_NATIVE_MMA
     ,
     MixedPageReferences<nbPagesPerVTile> const& pages, PageTransport const& transport,
@@ -314,8 +315,13 @@ __device__ inline void smemXVPartGemmMixed(
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
 #if XQA_MIXED_NATIVE_MMA
       if constexpr (format != flashinfer::KVPageFormat::kA16) {
-        mixed_kv_fragments::nativePV<format>(acc, x, column, nativeScales, v, scales,
-                                             headSlice * warpTile.x, tile * 16, scale);
+        auto const a = mixed_kv_fragments::prepareNativePV(x, column, nativeScales);
+#pragma unroll
+        for (uint32_t hs = 0; hs < HeadSplits; ++hs) {
+          uint32_t const headSlice = grpLoadV ? vHeadSlice(warpInGroup, hs) : hs;
+          mixed_kv_fragments::nativePV<format>(accs[hs], a, v, scales, headSlice * warpTile.x,
+                                               tile * 16, scale);
+        }
         return;
       }
 #endif
@@ -332,20 +338,25 @@ __device__ inline void smemXVPartGemmMixed(
         }
       }
       static_assert(warpTile.x <= 64);
+#pragma unroll
+      for (uint32_t hs = 0; hs < HeadSplits; ++hs) {
+        auto& acc = accs[hs];
+        uint32_t const headSlice = grpLoadV ? vHeadSlice(warpInGroup, hs) : hs;
 #if XQA_MIXED_NATIVE_MMA
-      if constexpr (format == flashinfer::KVPageFormat::kA16) {
-        auto const page =
-            transport.span(flashinfer::KVPageAddress{pages.values[tile * 16 / tokensPerPage]},
-                           static_cast<uint8_t>(format));
+        if constexpr (format == flashinfer::KVPageFormat::kA16) {
+          auto const page =
+              transport.span(flashinfer::KVPageAddress{pages.values[tile * 16 / tokensPerPage]},
+                             static_cast<uint8_t>(format));
 #pragma unroll
-        for (uint32_t n = 0; n < warpTile.x / 8; ++n) {
-          auto const b = mixed_kv_fragments::fetchNativeA16V(
-              page, head, headColumn + headSlice * warpTile.x + n * 8, tokenBase + tile * 16,
-              skipTokens, cacheSeqLen);
+          for (uint32_t n = 0; n < warpTile.x / 8; ++n) {
+            auto const b = mixed_kv_fragments::fetchNativeA16V(
+                page, head, headColumn + headSlice * warpTile.x + n * 8, tokenBase + tile * 16,
+                skipTokens, cacheSeqLen);
 #pragma unroll
-          for (uint32_t i = 0; i < rows; ++i) mma<InputElem>(acc(i, n).data, a(i, 0).data, b.data);
+            for (uint32_t i = 0; i < rows; ++i)
+              mma<InputElem>(acc(i, n).data, a(i, 0).data, b.data);
+          }
         }
-      }
 #else
       constexpr uint32_t blocks = warpTile.x / 16;
       uint32_t const firstBlock = headSlice * blocks;
@@ -381,6 +392,7 @@ __device__ inline void smemXVPartGemmMixed(
       // The output block must stay static so accumulators remain in registers.
       mixed_kv_fragments::pipelineFragments<blocks, true>(fetch, consume);
 #endif
+      }
     });
   }
 }
