@@ -44,8 +44,8 @@ struct MaskedIterator : Base {
   bool live;
 
   CUTLASS_DEVICE MaskedIterator(Params const& params, Element* pointer, TensorCoord extent,
-                                int thread, TensorCoord offset)
-      : Base(params, pointer, extent, thread, offset) {
+                                int thread, TensorCoord offset, int const* indices = nullptr)
+      : Base(params, pointer, extent, thread, offset, indices) {
     bool visible = false;
     for (int row = offset.row() + thread; row < min(offset.row() + Rows, extent.row());
          row += Threads)
@@ -85,8 +85,8 @@ struct OutputIterator : Base {
   int tile_m;
 
   CUTLASS_DEVICE OutputIterator(Params const& params, Element* pointer, TensorCoord extent,
-                                int thread, TensorCoord offset)
-      : Base(params, pointer, extent, thread, offset),
+                                int thread, TensorCoord offset, int const* indices = nullptr)
+      : Base(params, pointer, extent, thread, offset, indices),
         publication(params.publication),
         peer_publication(params.peer_publication),
         groups(params.groups),
