@@ -27,6 +27,16 @@ using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
 using RowMajor = cutlass::layout::RowMajor;
 using ColumnMajor = cutlass::layout::ColumnMajor;
 
+// Complete adjacent N tiles of each row group before moving to later rows.
+struct PublishedRowSwizzle : cutlass::gemm::threadblock::GemmHorizontalThreadblockSwizzle {
+  CUTLASS_DEVICE static cutlass::gemm::GemmCoord get_tile_offset(int) {
+    return GemmHorizontalThreadblockSwizzle::get_tile_offset({});
+  }
+};
+
+template <bool TilePublication>
+using ProducerSwizzle = std::conditional_t<TilePublication, PublishedRowSwizzle, Swizzle>;
+
 template <typename Element, typename Shape = Tile,
           typename WarpShape = cutlass::gemm::GemmShape<64, 32, 64>>
 using LocalGemm = typename cutlass::gemm::kernel::DefaultGemm<
@@ -85,8 +95,8 @@ using Gemm = std::conditional_t<
     Publish,
     cutlass::gemm::kernel::Gemm<
         typename ProducerBase<Element, Publish, TilePublication>::Mma,
-        PeerEpilogue<typename ProducerBase<Element, Publish, TilePublication>::Epilogue>, Swizzle,
-        false>,
+        PeerEpilogue<typename ProducerBase<Element, Publish, TilePublication>::Epilogue>,
+        ProducerSwizzle<TilePublication>, false>,
     ProducerBase<Element, Publish, TilePublication>>;
 
 template <typename Element, bool Publish, bool TilePublication = false>
@@ -95,7 +105,7 @@ __global__ __launch_bounds__(Gemm<Element, Publish, TilePublication>::kThreadCou
     int row_offset, int* publication, int* peer_publication, int groups) {
   using Kernel = Gemm<Element, Publish, TilePublication>;
   constexpr int rows = ProducerBase<Element, Publish, TilePublication>::Mma::Shape::kM;
-  const auto tile = Swizzle::get_tile_offset(params.swizzle_log_tile);
+  const auto tile = ProducerSwizzle<TilePublication>::get_tile_offset(params.swizzle_log_tile);
   bool live = false;
   for (int i = threadIdx.x; i < rows; i += blockDim.x) {
     const int row = tile.m() * rows + i;
@@ -144,13 +154,14 @@ cudaError_t Run(Element* a, Element* b, Element* out, int m, int n, int k, int l
                 int* peer_publication, int groups, cudaStream_t stream) {
   using Kernel = Gemm<Element, Publish, TilePublication>;
   using Shape = typename ProducerBase<Element, Publish, TilePublication>::Mma::Shape;
+  using Schedule = ProducerSwizzle<TilePublication>;
   const cutlass::gemm::GemmCoord problem(m, n, k);
-  const auto grid = Swizzle::get_tiled_shape(problem, {Shape::kM, Shape::kN, Shape::kK}, 1);
+  const auto grid = Schedule::get_tiled_shape(problem, {Shape::kM, Shape::kN, Shape::kK}, 1);
   typename Kernel::Params params(problem, grid, {a, RowMajor(lda)}, {b, ColumnMajor(ldb)},
                                  {out, RowMajor(ldd)}, {out, RowMajor(ldd)}, {1.0f, 0.0f});
   if constexpr (Publish) params.params_D.peer = peer;
   MaskedGemm<Element, Publish, TilePublication>
-      <<<Swizzle::get_grid_shape(grid), Kernel::kThreadCount,
+      <<<Schedule::get_grid_shape(grid), Kernel::kThreadCount,
          sizeof(typename Kernel::SharedStorage), stream>>>(params, is_padding, row_offset,
                                                            publication, peer_publication, groups);
   return cudaGetLastError();
