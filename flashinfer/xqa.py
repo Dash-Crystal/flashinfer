@@ -274,6 +274,7 @@ def _get_xqa_module_cached(
         # JIT module URI (== cached_ops directory name), for attribution.
         uri=spec.name,
         sequence_tile=module.xqa_sequence_tile,
+        work_query_rows=module.xqa_work_query_rows,
         grid_capacity=module.xqa_grid_capacity,
         resident_slots=module.xqa_resident_slots,
         split_kv_geometry=module.xqa_split_kv_geometry,
@@ -333,7 +334,7 @@ class XQAWork:
             page_transport.native_mma,
         )
         self.sequence_tile = module.sequence_tile()
-        self.query_rows = module.split_kv_geometry()[1]
+        self.query_rows = module.work_query_rows()
         self.module = module
         self.resident_slots = module.resident_slots(
             get_device_sm_count(addresses.device)

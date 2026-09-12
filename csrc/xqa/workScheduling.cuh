@@ -120,7 +120,8 @@ __device__ inline uint32_t chooseSplitsWarp(uint32_t slots, uint32_t sequences, 
   return select(best, single);
 }
 
-// One warp produces [live jobs, splits, optional compact request indices].
+// queryRows == 0 compacts requests; offsets still identify empty queries.
+// Otherwise one warp schedules ragged query tiles without materializing them.
 __device__ inline void prepareWarp(uint32_t const* lengths, uint32_t requests, uint32_t heads,
                                    uint32_t slots, uint32_t tile, uint32_t window, uint32_t* output,
                                    uint32_t const* queryOffsets = nullptr, uint32_t queryHeads = 0,
@@ -139,7 +140,7 @@ __device__ inline void prepareWarp(uint32_t const* lengths, uint32_t requests, u
     uint32_t const begin = window != 0 && len > span ? len - span : 0;
     uint32_t const tiles = active ? (len + tile - 1) / tile - begin / tile : 0;
     maxTiles = max(maxTiles, tiles);
-    if (queryOffsets != nullptr) {
+    if (queryRows != 0) {
       if (active)
         queryJobs =
             max(queryJobs, raggedTileStart(queryOffsets[r + 1], r + 1, queryHeads, queryRows));
@@ -149,7 +150,7 @@ __device__ inline void prepareWarp(uint32_t const* lengths, uint32_t requests, u
       live += __popc(mask);
     }
   }
-  if (queryOffsets != nullptr) live = __reduce_max_sync(~0U, queryJobs);
+  if (queryRows != 0) live = __reduce_max_sync(~0U, queryJobs);
   maxTiles = __reduce_max_sync(~0U, maxTiles);
   uint32_t const splits = chooseSplitsWarp(slots, live * heads, maxTiles);
   if (lane == 0) {

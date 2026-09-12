@@ -261,6 +261,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
 #else
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_sequence_tile, xqaSequenceTile);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_work_query_rows, xqaWorkQueryRows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_grid_capacity, xqaGridCapacity);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_resident_slots, xqaResidentSlots);
 tvm::ffi::Array<int64_t> xqa_split_kv_geometry() {

@@ -3398,6 +3398,24 @@ percentage points). Decode comparisons remain mixed: the host improvement does
 not establish a uniform Pareto gain. The corrected implementation is promoted
 in the supervised TP2 service; vLLM's execution review retains full evidence.
 
+### Single-query work ownership (2026-09-12)
+
+The original compressed fork (`bd0e5aaa`) and upstream XQA assign decode work
+by request and KV head. Our logical-mask integration instead equated accepting
+query offsets with scheduling multiple query tiles. For one query, the ragged
+tile formula adds a guard tile per request: GQA 8 / M16 plans 1.5 jobs per
+request, and GQA 2 / M16 plans 1.125. Empty jobs return, but count toward split-KV
+planning and require a request binary search.
+
+The compiled single-query family now uses compact live request indices whenever
+its head group fits one query tile. Query offsets still filter empty requests
+and locate Q/output rows. Multiquery and larger head groups retain ragged tiles.
+`xqaWorkQueryRows` exports that compiled scheduling contract to the shared page
+metadata producer; zero means request compaction. Mask closures, page codecs,
+matrix instructions and reduction ownership are preserved. JIT identities v21
+and producer v8 prevent loading the previous work-buffer contract. Serving
+measurements are recorded separately in vLLM's TP2 ledger.
+
 ### Streaming QK operand reuse (2026-09-12)
 
 `247a81e7` hoists Q loading outside the key-tile traversal in

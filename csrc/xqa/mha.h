@@ -169,6 +169,7 @@ void launchMHA(
     cudaStream_t stream);
 
 uint32_t xqaSequenceTile();
+uint32_t xqaWorkQueryRows();
 uint32_t xqaGridCapacity(uint32_t slots, uint32_t heads, uint32_t window, uint32_t maxSeqLen,
                          uint32_t requests, uint32_t queryTokens, uint32_t queryLength);
 uint32_t xqaResidentSlots(uint32_t multiProcessorCount);

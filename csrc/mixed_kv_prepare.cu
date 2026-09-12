@@ -77,11 +77,12 @@ void mixed_kv_prepare_metadata(TensorView slots, TensorView writable, TensorView
     TVM_FFI_ICHECK(work.value().dtype() == dl_int32 && work.value().IsContiguous() &&
                    work.value().numel() >= lengths.value().numel() + 2);
     CHECK_DEVICE(work.value(), slots);
+    TVM_FFI_ICHECK(queryRows == 0 || queryOffsets.has_value());
     if (queryOffsets.has_value()) {
       auto const offsets = queryOffsets.value();
       TVM_FFI_ICHECK(offsets.dtype() == dl_int32 && offsets.IsContiguous() &&
                      offsets.numel() == lengths.value().numel() + 1 && queryHeads > 0 &&
-                     queryRows > 0);
+                     queryRows >= 0);
       CHECK_DEVICE(offsets, slots);
     }
     TVM_FFI_ICHECK(heads > 0 && residentSlots > 0 && sequenceTile > 0 && window >= 0);

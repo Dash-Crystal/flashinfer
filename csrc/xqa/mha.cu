@@ -33,7 +33,9 @@
 #include "workScheduling.cuh"
 
 #define XQA_DEVICE_WORK_SCHEDULE (ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1)
-#define XQA_RAGGED_QUERY_SCHEDULE (ENABLE_MIXED_KV_CACHE && SPEC_DEC && BEAM_WIDTH == 1)
+#define XQA_RAGGED_QUERY_SCHEDULE          \
+  (XQA_DEVICE_WORK_SCHEDULE && SPEC_DEC && \
+   (XQA_MAX_QUERY_LENGTH != 1 || HEAD_GRP_SIZE > M_TILESIZE))
 #if defined(XQA_MASK_MOD)
 #include "mask_mod.cuh"
 static_assert(SPEC_DEC && SLIDING_WINDOW);
@@ -1906,7 +1908,7 @@ CUBIN_EXPORT __global__
     workGrid = dim3{splits, nbKHeads, jobs};
     workBlock = uint3{blockIdx.x % splits, (blockIdx.x / splits) % nbKHeads, ordinal};
     workBatchSize = jobs;
-#if !SPEC_DEC
+#if !XQA_RAGGED_QUERY_SCHEDULE
     request = attentionWork[2 + ordinal];
 #endif
   }
@@ -4043,6 +4045,13 @@ static uint32_t chooseNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSe
 }
 
 uint32_t xqaSequenceTile() { return hostGeometry.sequenceTile(); }
+uint32_t xqaWorkQueryRows() {
+#if XQA_RAGGED_QUERY_SCHEDULE
+  return hostGeometry.splitKV.rows;
+#else
+  return 0;
+#endif
+}
 uint32_t xqaResidentSlots(uint32_t multiProcessorCount) {
   return residentSlots(multiProcessorCount);
 }
@@ -4178,8 +4187,10 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if defined(XQA_MASK_MOD)
     window = xqa_mask_window_size;
 #endif
-#if XQA_RAGGED_QUERY_SCHEDULE
+#if SPEC_DEC
     queryOffsets = qCuSeqLens;
+#endif
+#if XQA_RAGGED_QUERY_SCHEDULE
     queryHeads = headGrpSize;
     queryRows = hostGeometry.splitKV.rows;
     queryTokensForWork = queryTokens;
