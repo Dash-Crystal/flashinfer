@@ -3398,6 +3398,26 @@ percentage points). Decode comparisons remain mixed: the host improvement does
 not establish a uniform Pareto gain. The corrected implementation is promoted
 in the supervised TP2 service; vLLM's execution review retains full evidence.
 
+### Decode softmax ownership (2026-09-12)
+
+The executed SM120 D256/D512 decode kernels inherit upstream's backward row-max
+hint. QK waits on the PV consumer before softmax to read that hint, even though
+PV already merges partials with independent row maxima. The compiled decode
+family now keeps a running maximum in each QK warp. It can finish softmax while
+PV consumes the preceding tile, then waits before reusing the shared P and
+row-statistic buffers. PV's existing rescaling merges those partials. This
+removes the backward maximum's shared storage, initialization, stores and loads;
+the ownership barriers for P/K/V remain. Continuation retains its existing
+pipeline. Both families still stream packed KV into matrix operand registers.
+
+Each emitted P tile is bounded by its producer's running maximum, and the
+consumer rescales its sum and numerator to the maximum across producers. This
+preserves the online-softmax decomposition; BF16 rounding is measured through
+full-model serving. Source and binary inspection also establish that the older
+donor's constant-mask quad broadcast is already enabled on SM120: the V122
+modules contain no WARPSYNC/MATCH.ANY sequences. That is not an omitted fix.
+The composed attention JIT identity is v22; producer work remains v8.
+
 ### Single-query work ownership (2026-09-12)
 
 The original compressed fork (`bd0e5aaa`) and upstream XQA assign decode work

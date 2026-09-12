@@ -49,6 +49,7 @@ static_assert(SPEC_DEC && SLIDING_WINDOW);
 #endif
 #endif
 
+// 0 retains a producer-local running maximum; PV merges the normalized partials.
 // There are 4 ways to pass ctaRowMax backward from gemm1 warps to gemm0 warps:
 //  1. Protect with xFwdBarriers+xBwdBarriers. This way, ctaRowMax is available to gemm0 warps
 //  together with x tiles and warpRowMax/warpRowSum. But ctaRowMax is required before warp tile
@@ -66,7 +67,12 @@ static_assert(SPEC_DEC && SLIDING_WINDOW);
 //  lowest cost, but the result is non-deterministic up to an small numeric error.
 // #define CTA_ROW_MAX_BACKWARD_METHOD 4
 // 1 is 8% slower than 4. 2/3 are 10% slower than 4.
+#if ENABLE_MIXED_KV_CACHE && BEAM_WIDTH == 1 && XQA_MAX_QUERY_LENGTH == 1 && \
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#define CTA_ROW_MAX_BACKWARD_METHOD 0
+#else
 #define CTA_ROW_MAX_BACKWARD_METHOD 1
+#endif
 
 static_assert(inputElemSize >= cacheElemSize);
 
@@ -2501,7 +2507,10 @@ CUBIN_EXPORT __global__
       qBarParityNext = !qBarParityNext;
       assertWarpConverged();
     }
-#if CTA_ROW_MAX_BACKWARD_METHOD == 2
+#if CTA_ROW_MAX_BACKWARD_METHOD == 0
+    QuadRegRowMax localRowMax;
+    localRowMax.fill(safeInitRowMax);
+#elif CTA_ROW_MAX_BACKWARD_METHOD == 2
     ThrdRegRowMax initRowMax;
     initRowMax.fill(safeInitRowMax);
 #endif
@@ -2650,8 +2659,7 @@ CUBIN_EXPORT __global__
       // apply qkScale
       rescaleAcc(warp, acc, qkScale);
 #if CTA_ROW_MAX_BACKWARD_METHOD == 0
-      QuadRegRowMax initRowMaxQuad;
-      initRowMaxQuad.fill(safeInitRowMax);
+      QuadRegRowMax const initRowMaxQuad = localRowMax;
 #elif CTA_ROW_MAX_BACKWARD_METHOD == 1
       // load hint
       xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
@@ -2719,6 +2727,9 @@ CUBIN_EXPORT __global__
 
       // find max and update acc into exp(acc-max).
       QuadRegRowMax const regRowMax = warpTileOnlineSoftmax(warp, initRowMaxQuad, acc);
+#if CTA_ROW_MAX_BACKWARD_METHOD == 0
+      localRowMax = regRowMax;
+#endif
 
       // store result and max to shared memory.
       GemmOutRegTile const fp16Acc = toFp16(acc);
