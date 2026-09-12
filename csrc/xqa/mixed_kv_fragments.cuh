@@ -285,6 +285,7 @@ __device__ inline void smemXVPartGemmMixed(
     uint8_t const* scales, uint32_t warpInGroup, float fp8GlobalScale, float fp4GlobalScale
 #if XQA_MIXED_NATIVE_MMA
     ,
+    SharedMem::NativeProbabilities const& probabilities,
     MixedPageReferences<nbPagesPerVTile> const& pages, PageTransport const& transport,
     uint32_t head, uint32_t tokenBase, uint32_t headColumn, uint32_t skipTokens,
     uint32_t cacheSeqLen
@@ -315,7 +316,7 @@ __device__ inline void smemXVPartGemmMixed(
           format == flashinfer::KVPageFormat::kBlockScaledFP8 ? fp8GlobalScale : fp4GlobalScale;
 #if XQA_MIXED_NATIVE_MMA
       if constexpr (format != flashinfer::KVPageFormat::kA16) {
-        auto const a = mixed_kv_fragments::prepareNativePV(x, column, nativeScales);
+        auto const a = mixed_kv_fragments::prepareNativePV(probabilities, column / 2, nativeScales);
 #pragma unroll
         for (uint32_t hs = 0; hs < HeadSplits; ++hs) {
           uint32_t const headSlice = grpLoadV ? vHeadSlice(warpInGroup, hs) : hs;

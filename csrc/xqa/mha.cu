@@ -481,6 +481,11 @@ struct alignas(128) SharedMem {
     uint8_t fp4Scales[headElems / 16][qRows];
   };
   NativeQuery nativeQuery;
+  struct NativeProbabilities {
+    uint32_t values[warpTile.x / 16][qRows][4];
+    float scales[warpTile.x / 16][qRows];
+  };
+  NativeProbabilities nativeProbabilities[ctaShapeInWarps.y][ctaShapeInWarps.x];
 #else
   using StoredVSmemBuffer = VSmemBuffer;
 #endif
@@ -2771,6 +2776,11 @@ CUBIN_EXPORT __global__
 #else
       storeOrderedGemmOutTile(warp, smem.x[warpIdx.y][warpIdx.x], fp16Acc);
 #endif
+#if XQA_MIXED_NATIVE_MMA
+      __syncwarp();
+      mixed_kv_fragments::prepareNativeProbabilities(smem.nativeProbabilities[warpIdx.y][warpIdx.x],
+                                                     smem.x[warpIdx.y][warpIdx.x]);
+#endif
       smem.warpRowMax[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowMax);
       smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
       unused(xBar.produced.arrive());
@@ -3434,6 +3444,7 @@ CUBIN_EXPORT __global__
                   warpIdxInGrp, fp8VGlobalScale, fp4VGlobalScale
 #if XQA_MIXED_NATIVE_MMA
                   ,
+                  smem.nativeProbabilities[warpIdx.y][idxXTile],
                   smem.vPages[warpGrpIdx][warpIdxInGrp][idxCurrSMemVBuf], cacheList.transport,
                   idxHeadGrp,
                   ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +

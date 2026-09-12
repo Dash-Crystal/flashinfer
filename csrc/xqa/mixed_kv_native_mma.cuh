@@ -283,16 +283,42 @@ __device__ inline InstInMat<2, 1> fetchNativeA16V(flashinfer::KVPageFormatSpan c
 
 using NativePVOperands = Vec<NativeOperandFP8, warpTile.y / 16>;
 
-__device__ inline NativePVOperands prepareNativePV(SharedMem::XSmemBuffer const& x,
-                                                   uint32_t xColumn,
-                                                   QuadRegRowMax const& rowScales) {
+__device__ inline void prepareNativeProbabilities(SharedMem::NativeProbabilities& dst,
+                                                  SharedMem::XSmemBuffer const& x) {
+  // The softmax producer converts once; every V warp and head slice reuses it.
+  // The original A16 tile remains available to A16 pages.
+#pragma unroll
+  for (uint32_t block = 0; block < warpTile.x / 16; ++block) {
+#pragma unroll
+    for (uint32_t i = 0; i < divUp(SharedMem::qRows, 16U); ++i) {
+      auto const a = quantizeOperandFP8([&](uint32_t row, uint32_t k) {
+        if (i * 16 + row >= SharedMem::qRows) return 0.0f;
+        auto const& grain = x.template at<true>(i * 16 + row, block * 2 + k / 8);
+        return float(reinterpret_cast<InputElem const*>(&grain)[k % 8]);
+      });
+#pragma unroll
+      for (uint32_t m = 0; m < 2; ++m) {
+        uint32_t const row = i * 16 + laneId() / 4 + m * 8;
+        if (row < SharedMem::qRows) {
+          dst.values[block][row][laneId() % 4] = a.values[m];
+          if (laneId() % 4 == 0) dst.scales[block][row] = a.scales[m];
+        }
+      }
+    }
+  }
+}
+
+__device__ inline NativePVOperands prepareNativePV(SharedMem::NativeProbabilities const& p,
+                                                   uint32_t block, QuadRegRowMax const& rowScales) {
   NativePVOperands a;
 #pragma unroll
   for (uint32_t i = 0; i < warpTile.y / 16; ++i) {
-    a[i] = quantizeOperandFP8([&](uint32_t row, uint32_t k) {
-      auto const& grain = x.template at<true>(i * 16 + row, xColumn + k / 8);
-      return float(reinterpret_cast<InputElem const*>(&grain)[k % 8]) * rowScales[i * 2 + row / 8];
-    });
+#pragma unroll
+    for (uint32_t m = 0; m < 2; ++m) {
+      uint32_t const row = i * 16 + laneId() / 4 + m * 8;
+      a[i].values[m] = row < SharedMem::qRows ? p.values[block][row][laneId() % 4] : 0;
+      a[i].scales[m] = row < SharedMem::qRows ? p.scales[block][row] * rowScales[i * 2 + m] : 0;
+    }
   }
   return a;
 }
