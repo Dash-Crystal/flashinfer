@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda/atomic>
 
@@ -1329,6 +1330,241 @@ void mixed_kv_arena_capacity(TensorView data, TensorView pages, TensorView slabs
       static_cast<int64_t*>(output.data_ptr()));
 }
 
+// Fixed slots retain vLLM page ownership. Transform into disjoint event scratch,
+// then commit in a second launch: compact output must not overwrite unread A16.
+template <typename InType, bool Seal, int THREADS = kMixedKVSealThreads>
+__global__ void mixed_kv_fixed_stage_kernel(flashinfer::KVPageStorage storage,
+                                            const int32_t* events, const int32_t* count,
+                                            uint8_t* scratch, uint64_t* pending, float* stats,
+                                            int64_t stats_stride, const float* thresholds,
+                                            const float* global_scales) {
+  const int event = blockIdx.x;
+  if (event >= *count) return;
+  const auto source = storage.address(events[event]);
+  const auto geometry = storage.geometry;
+  const uint64_t scratch_offset = uint64_t(event) * geometry.extent_bytes(KVPageFormat::kA16);
+  auto* output = scratch + scratch_offset;
+  if (threadIdx.x == 0) pending[event] = flashinfer::kUnallocatedKVPage;
+  if constexpr (Seal) {
+    if (!source.allocated() || source.format() != KVPageFormat::kA16) return;
+    const auto* input = reinterpret_cast<const InType*>(storage.data + source.offset());
+    const int64_t values_per_token = 2 * geometry.heads * geometry.head_dim;
+    __shared__ float moments[4];
+    __shared__ uint8_t format;
+    mixed_kv_route_moments<THREADS>(
+        geometry.values() - values_per_token, geometry.values() / MIXED_KV_SIGNATURE_BLOCK_SIZE,
+        [&](int64_t i) { return mixed_kv_to_float(input[i + values_per_token]); },
+        [&](int64_t block, int lane) {
+          return mixed_kv_to_float(input[block * MIXED_KV_SIGNATURE_BLOCK_SIZE + lane]);
+        },
+        moments);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const auto route = mixed_kv_route_stats(moments[0], moments[1], moments[2], moments[3]);
+      stats[event * stats_stride] = route.x;
+      stats[event * stats_stride + 1] = route.y;
+      format = mixed_kv_select_format(route.x, route.y, thresholds);
+    }
+    __syncthreads();
+    if (format == 0) return;
+    if (format == 1) {
+      mixed_kv_encode_page<KVPageFormat::kBlockScaledFP8, false, THREADS>(
+          input, output, geometry, global_scales, threadIdx.x);
+    } else {
+      mixed_kv_encode_page<KVPageFormat::kBlockScaledFP4, false, THREADS>(
+          input, output, geometry, global_scales, threadIdx.x);
+    }
+    if (threadIdx.x == 0) pending[event] = scratch_offset | format;
+  } else {
+    if (source.allocated() && source.format() == KVPageFormat::kA16) return;
+    auto* decoded = reinterpret_cast<InType*>(output);
+    for (uint64_t i = threadIdx.x; i < geometry.values(); i += THREADS) {
+      InType value = InType(0.0f);
+      if (source.allocated()) {
+        const auto format = source.format();
+        const auto* payload = storage.data + source.offset();
+        const auto* scales = payload + geometry.payload_bytes(format);
+        __nv_fp8_e4m3 scale;
+        scale.__x = scales[i / BSFP8_BLOCK_SIZE];
+        float coefficient;
+        if (format == KVPageFormat::kBlockScaledFP8) {
+          __nv_fp8_e4m3 encoded;
+          encoded.__x = payload[i];
+          coefficient = float(encoded);
+        } else {
+          coefficient = decode_e2m1_nibble((payload[i / 2] >> ((i % 2) * 4)) & 15);
+        }
+        const int kv = (i / geometry.head_dim) % 2;
+        const InType block_scale = InType(float(scale) * global_scales[(int(format) - 1) * 2 + kv]);
+        value = InType(coefficient * mixed_kv_to_float(block_scale));
+      }
+      decoded[i] = value;
+    }
+    if (threadIdx.x == 0) pending[event] = scratch_offset;
+  }
+}
+
+__global__ void mixed_kv_fixed_commit_kernel(flashinfer::KVPageStorage storage,
+                                             const int32_t* events, const int32_t* count,
+                                             const uint64_t* offsets, const uint8_t* scratch,
+                                             const uint64_t* pending) {
+  const int event = blockIdx.x;
+  if (event >= *count) return;
+  const flashinfer::KVPageAddress staged{pending[event]};
+  if (!staged.allocated()) return;
+  const int page = events[event];
+  const uint64_t offset = offsets[page];
+  const auto* src = reinterpret_cast<const uint32_t*>(scratch + staged.offset());
+  auto* dst = reinterpret_cast<uint32_t*>(storage.data + offset);
+  for (uint64_t i = threadIdx.x; i < storage.geometry.encoded_bytes(staged.format()) / 4;
+       i += blockDim.x)
+    dst[i] = src[i];
+  __syncthreads();
+  if (threadIdx.x == 0) storage.entry(page) = offset | uint8_t(staged.format());
+}
+
+void mixed_kv_fixed_update(TensorView k, TensorView v, TensorView slots, TensorView writable,
+                           TensorView writable_count, TensorView completed,
+                           TensorView completed_count, TensorView data, TensorView pages,
+                           TensorView offsets, TensorView scratch, TensorView pending,
+                           TensorView stats, TensorView global_scales, TensorView thresholds,
+                           int64_t page_size, int64_t phase) {
+  CHECK_CUDA(k);
+  TVM_FFI_ICHECK(k.ndim() == 3 && v.ndim() == 3 && k.dtype() == v.dtype());
+  TVM_FFI_ICHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2));
+  TVM_FFI_ICHECK(k.stride(2) == 1 && v.stride(2) == 1 && k.size(2) % 16 == 0);
+  TVM_FFI_ICHECK(page_size > 1 && k.size(1) > 0 && k.size(2) > 0);
+  for (auto bytes : {data, scratch}) {
+    TVM_FFI_ICHECK(bytes.ndim() == 1 && bytes.dtype() == dl_uint8 && bytes.stride(0) == 1);
+  }
+  TVM_FFI_ICHECK(pages.ndim() == 2 && pages.dtype() == dl_int64 && pages.stride(1) == 1);
+  TVM_FFI_ICHECK(offsets.ndim() == 1 && offsets.dtype() == dl_int64 && offsets.stride(0) == 1 &&
+                 offsets.numel() == pages.numel());
+  TVM_FFI_ICHECK(slots.ndim() == 1 && slots.dtype() == dl_int64 && slots.stride(0) == 1 &&
+                 slots.numel() <= k.size(0));
+  for (auto events : {writable, completed}) {
+    TVM_FFI_ICHECK(events.ndim() == 1 && events.dtype() == dl_int32 && events.stride(0) == 1);
+  }
+  for (auto count : {writable_count, completed_count}) {
+    TVM_FFI_ICHECK(count.numel() == 1 && count.dtype() == dl_int32);
+  }
+  const int capacity = std::max(writable.numel(), completed.numel());
+  TVM_FFI_ICHECK(pending.ndim() == 1 && pending.dtype() == dl_int64 && pending.stride(0) == 1 &&
+                 pending.numel() >= capacity);
+  TVM_FFI_ICHECK(stats.ndim() == 2 && stats.dtype() == dl_float32 &&
+                 stats.size(0) >= completed.numel() && stats.size(1) == 2 && stats.stride(1) == 1);
+  for (auto parameters : {global_scales, thresholds}) {
+    TVM_FFI_ICHECK(parameters.ndim() == 1 && parameters.dtype() == dl_float32 &&
+                   parameters.numel() == 4 && parameters.stride(0) == 1);
+  }
+  TVM_FFI_ICHECK(phase >= 1 && phase <= 3);
+  for (auto tensor : {v, slots, writable, writable_count, completed, completed_count, data, pages,
+                      offsets, scratch, pending, stats, global_scales, thresholds}) {
+    TVM_FFI_ICHECK(tensor.device().device_type == k.device().device_type &&
+                   tensor.device().device_id == k.device().device_id);
+  }
+  flashinfer::KVPageStorage storage{
+      static_cast<uint8_t*>(data.data_ptr()),
+      static_cast<uint64_t*>(pages.data_ptr()),
+      static_cast<uint32_t>(pages.stride(0)),
+      static_cast<uint32_t>(pages.size(1)),
+      {static_cast<uint32_t>(page_size), static_cast<uint32_t>(k.size(1)),
+       static_cast<uint32_t>(k.size(2)), false}};
+  TVM_FFI_ICHECK(scratch.numel() >= capacity * storage.geometry.extent_bytes(KVPageFormat::kA16));
+  ffi::CUDADeviceGuard device_guard(k.device().device_id);
+  cudaStream_t stream = get_stream(k.device());
+  auto* temporary = static_cast<uint8_t*>(scratch.data_ptr());
+  auto* tags = static_cast<uint64_t*>(pending.data_ptr());
+  const auto* fixed = static_cast<const uint64_t*>(offsets.data_ptr());
+  auto* routing = static_cast<float*>(stats.data_ptr());
+  const auto* limits = static_cast<const float*>(thresholds.data_ptr());
+  const auto* scales = static_cast<const float*>(global_scales.data_ptr());
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
+    if ((phase & 1) && writable.numel()) {
+      const auto* events = static_cast<const int32_t*>(writable.data_ptr());
+      const auto* count = static_cast<const int32_t*>(writable_count.data_ptr());
+      mixed_kv_fixed_stage_kernel<c_type, false>
+          <<<writable.numel(), kMixedKVSealThreads, 0, stream>>>(
+              storage, events, count, temporary, tags, routing, stats.stride(0), limits, scales);
+      mixed_kv_fixed_commit_kernel<<<writable.numel(), 128, 0, stream>>>(storage, events, count,
+                                                                         fixed, temporary, tags);
+    }
+    if ((phase & 1) && slots.numel()) {
+      mixed_kv_arena_write_kernel<c_type><<<dim3(slots.numel(), k.size(1)), 128, 0, stream>>>(
+          storage, static_cast<const c_type*>(k.data_ptr()),
+          static_cast<const c_type*>(v.data_ptr()), static_cast<const int64_t*>(slots.data_ptr()),
+          slots.numel(), k.stride(0), k.stride(1), v.stride(0), v.stride(1));
+    }
+    if ((phase & 2) && completed.numel()) {
+      const auto* events = static_cast<const int32_t*>(completed.data_ptr());
+      const auto* count = static_cast<const int32_t*>(completed_count.data_ptr());
+      mixed_kv_fixed_stage_kernel<c_type, true>
+          <<<completed.numel(), kMixedKVSealThreads, 0, stream>>>(
+              storage, events, count, temporary, tags, routing, stats.stride(0), limits, scales);
+      mixed_kv_fixed_commit_kernel<<<completed.numel(), 128, 0, stream>>>(storage, events, count,
+                                                                          fixed, temporary, tags);
+    }
+    return true;
+  });
+}
+
+__global__ void mixed_kv_fixed_copy_kernel(flashinfer::KVPageStorage storage,
+                                           const uint64_t* offsets, const int64_t* sources,
+                                           int64_t source_stride, const int64_t* destinations,
+                                           int64_t destination_stride) {
+  const int column = blockIdx.y;
+  const int64_t src = sources[blockIdx.x * source_stride] * storage.pages_per_block + column;
+  const int64_t dst =
+      destinations[blockIdx.x * destination_stride] * storage.pages_per_block + column;
+  if (src == dst) return;
+  const auto address = storage.address(src);
+  if (address.allocated()) {
+    const auto* input = reinterpret_cast<const uint32_t*>(storage.data + address.offset());
+    auto* output = reinterpret_cast<uint32_t*>(storage.data + offsets[dst]);
+    for (uint64_t i = threadIdx.x; i < storage.geometry.encoded_bytes(address.format()) / 4;
+         i += blockDim.x)
+      output[i] = input[i];
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    storage.entry(dst) = address.allocated() ? offsets[dst] | uint8_t(address.format())
+                                             : flashinfer::kUnallocatedKVPage;
+  }
+}
+
+void mixed_kv_fixed_copy(TensorView data, TensorView pages, TensorView offsets, TensorView sources,
+                         TensorView destinations, int64_t tokens, int64_t heads, int64_t dim) {
+  CHECK_CUDA(data);
+  TVM_FFI_ICHECK(data.ndim() == 1 && data.dtype() == dl_uint8 && data.stride(0) == 1);
+  TVM_FFI_ICHECK(pages.ndim() == 2 && pages.dtype() == dl_int64 && pages.stride(1) == 1);
+  TVM_FFI_ICHECK(offsets.ndim() == 1 && offsets.dtype() == dl_int64 && offsets.stride(0) == 1 &&
+                 offsets.numel() == pages.numel());
+  for (auto indices : {sources, destinations}) {
+    TVM_FFI_ICHECK(indices.ndim() == 1 && indices.dtype() == dl_int64 && indices.stride(0) > 0);
+  }
+  TVM_FFI_ICHECK(sources.numel() == destinations.numel());
+  TVM_FFI_ICHECK(tokens > 1 && heads > 0 && dim > 0 && dim % 16 == 0);
+  for (auto tensor : {pages, offsets, sources, destinations}) {
+    TVM_FFI_ICHECK(tensor.device().device_type == data.device().device_type &&
+                   tensor.device().device_id == data.device().device_id);
+  }
+  if (!sources.numel()) return;
+  flashinfer::KVPageStorage storage{static_cast<uint8_t*>(data.data_ptr()),
+                                    static_cast<uint64_t*>(pages.data_ptr()),
+                                    static_cast<uint32_t>(pages.stride(0)),
+                                    static_cast<uint32_t>(pages.size(1)),
+                                    {static_cast<uint32_t>(tokens), static_cast<uint32_t>(heads),
+                                     static_cast<uint32_t>(dim), false}};
+  ffi::CUDADeviceGuard device_guard(data.device().device_id);
+  mixed_kv_fixed_copy_kernel<<<dim3(sources.numel(), pages.size(1)), 128, 0,
+                               get_stream(data.device())>>>(
+      storage, static_cast<const uint64_t*>(offsets.data_ptr()),
+      static_cast<const int64_t*>(sources.data_ptr()), sources.stride(0),
+      static_cast<const int64_t*>(destinations.data_ptr()), destinations.stride(0));
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_fixed_update, mixed_kv_fixed_update);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_fixed_copy, mixed_kv_fixed_copy);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_kv_quant, nvfp4_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bsfp8_kv_quant, bsfp8_kv_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mixed_kv_quant_pages, mixed_kv_quant_pages);

@@ -68,6 +68,37 @@ class MixedKVPageUpdatePhase(IntEnum):
     PLACE_AND_SEAL = 3
 
 
+class MixedKVPageStorage:
+    """Compact encodings inside fixed A16-capacity page slots.
+
+    Offsets are realized from the owner's allocation layout. Page descriptors
+    publish the current format. Transitions use event scratch before committing
+    back to a slot; readers depend on completion of the entire update.
+    """
+
+    def __init__(self, data, offsets, geometry):
+        from .fp4_quantization import get_fp4_kv_quantization_module
+
+        self.data = data
+        self.pages = torch.full_like(offsets, -1)
+        self.offsets = offsets.flatten()
+        self.geometry = geometry
+        module = get_fp4_kv_quantization_module()
+        self.update = module.mixed_kv_fixed_update
+        self._copy = module.mixed_kv_fixed_copy
+
+    def reset_blocks(self, blocks: torch.Tensor) -> None:
+        self.pages.index_fill_(0, blocks, -1)
+
+    def release_blocks(self, blocks: torch.Tensor) -> None:
+        self.pages.index_fill_(0, blocks, -1)
+
+    def copy_blocks(self, sources, destinations, num_blocks) -> None:
+        self._copy(
+            self.data, self.pages, self.offsets, sources, destinations, *self.geometry
+        )
+
+
 class MixedKVPageArena:
     """One byte allocation with format-tagged addresses and reusable size classes.
 

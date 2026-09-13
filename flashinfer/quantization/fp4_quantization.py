@@ -2162,6 +2162,8 @@ def get_fp4_kv_quantization_module():
         bsfp8_kv_quant=bsfp8_kv_quant,
         mixed_kv_quant_pages=mixed_kv_quant_pages,
         mixed_kv_arena_update=module.mixed_kv_arena_update,
+        mixed_kv_fixed_update=module.mixed_kv_fixed_update,
+        mixed_kv_fixed_copy=module.mixed_kv_fixed_copy,
         mixed_kv_arena_blocks=module.mixed_kv_arena_blocks,
         mixed_kv_arena_capacity=module.mixed_kv_arena_capacity,
         mixed_kv_prepare_metadata=module.mixed_kv_prepare_metadata,
