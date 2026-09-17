@@ -356,7 +356,7 @@ def test_alpha_dtype_must_be_float32():
 
 
 @pytest.mark.parametrize(
-    "m,k,split_k", [(1, 32, 1), (9, 160, 1), (56, 128, 4), (1120, 128, 1)]
+    "m,k,split_k", [(1, 32, 1), (9, 160, 1), (56, 128, 4), (1120, 3840, 1)]
 )
 @pytest.mark.parametrize("activation_scale", [1.0, 2.0**20])
 @pytest.mark.parametrize("paired", [False, True])
