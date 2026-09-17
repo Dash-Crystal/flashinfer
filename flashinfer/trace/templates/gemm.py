@@ -741,6 +741,72 @@ mm_bf16_fp4_cudnn_trace = TraceTemplate(
     init=_mm_bf16_fp4_cudnn_init,
 )
 
+
+def _mm_bf16_fp4_sparse_reference(
+    a, b, b_descale, metadata, alpha, paired=False, **kwargs
+):
+    nt, kt, _ = b.shape
+    n, k = nt * 16, kt * 32
+    raw = b.view(torch.uint8).reshape(nt, kt, 8, 4, 2, 2)
+    raw = raw.permute(0, 5, 2, 1, 4, 3).reshape(n, k // 4)
+    retained = torch.stack((raw & 15, raw >> 4), -1).long()
+    meta = metadata.to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(4, device=a.device) * 4
+    if paired:
+        meta = torch.stack((meta & 65535, meta >> 16), 2)
+        meta = meta.permute(0, 2, 3, 1).reshape(n, k // 32)
+        nibble = (
+            ((meta.unsqueeze(-1) >> shifts) & 15)
+            .reshape(n, k // 8)
+            .repeat_interleave(2, dim=1)
+        )
+    else:
+        meta = meta.reshape(nt, kt, 8, 2)
+        meta = torch.stack((meta & 65535, meta >> 16), 2)
+        meta = meta.permute(0, 2, 3, 1, 4).reshape(n, k // 16)
+        nibble = ((meta.unsqueeze(-1) >> shifts) & 15).reshape(n, k // 4)
+    indices = torch.stack((nibble & 3, nibble >> 2), -1)
+    codes = torch.zeros(n, k // 4, 4, device=a.device, dtype=torch.long)
+    codes.scatter_(-1, indices, retained)
+    if paired:
+        codes = codes.reshape(n, k // 8, 2, 4).transpose(-1, -2)
+    codes = codes.reshape(n, k)
+    sf = b_descale.view(torch.uint8).reshape(nt, kt, 8, 2, 2)
+    sf = sf.permute(0, 4, 2, 1, 3).reshape(n, k // 16)
+    sf = (sf.to(torch.int16) << 7).view(torch.float16).float()
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6], device=a.device
+    )
+    weight = lut[codes] * sf.repeat_interleave(16, -1)
+    return (a.float() @ weight.T * alpha).to(a.dtype)
+
+
+mm_bf16_fp4_sparse_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4_sparse",
+    name_prefix="mm_bf16_fp4_sparse",
+    description="SM120 BF16 x structured sparse NVFP4; compressed weights and sparse BF16 MMA.",
+    axes={
+        "M": Var(),
+        "N_tiles": Const(),
+        "K": Const(),
+        "paired": Const(),
+        "metadata_words": Const(),
+    },
+    inputs={
+        "a": Tensor(["M", "K"]),
+        "b": Tensor(["N_tiles", "K_div_32", "32"]),
+        "b_descale": Tensor(["N_tiles", "K_div_32", "8"]),
+        "metadata": Tensor(["N_tiles", "K_div_32", "metadata_words"]),
+        "alpha": Tensor(["1"]),
+        "paired": Scalar("bool"),
+    },
+    outputs={"out": Tensor(["M", "N_tiles_mul_16"], dtype_from="a")},
+    tags=["status:verified", "quantization:fp4", "sparsity:structured"],
+    reference=_mm_bf16_fp4_sparse_reference,
+    check=_fp4_gemm_check,
+)
+
+
 mm_bf16_fp4_cute_dsl_trace = TraceTemplate(
     op_type="gemm_bf16_fp4",
     name_prefix="mm_bf16_fp4_cute_dsl",

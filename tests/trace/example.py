@@ -44,6 +44,7 @@ mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
+mm_bf16_fp4_sparse_N_tiles8_K128_paired0_metadata_words16.json
 mono_moe_topk8_h2048_i512.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
@@ -86,6 +87,7 @@ trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPU
 
 import contextlib
 import json
+import argparse
 import os
 from pathlib import Path
 
@@ -117,6 +119,25 @@ from flashinfer.prefill import (
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 device = "cuda"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--only-sparse-w4a16", action="store_true")
+args = parser.parse_args()
+
+if torch.cuda.get_device_capability() == (12, 0):
+    sparse_codes = torch.full((128, 64), 0x22, dtype=torch.uint8, device=device)
+    sparse_codes[:, 1::2] = 0
+    sparse_sf = flashinfer.block_scale_interleave(
+        torch.full((128, 8), 0x38, dtype=torch.uint8, device=device)
+    )
+    sparse_args = flashinfer.prepare_bf16_fp4_sparse_weights(sparse_codes, sparse_sf)
+    flashinfer.mm_bf16_fp4_sparse(
+        torch.ones((7, 128), dtype=torch.bfloat16, device=device),
+        *sparse_args,
+        torch.ones(1, device=device),
+        paired=False,
+    )
+if args.only_sparse_w4a16:
+    raise SystemExit(0)
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
 
 print(f"\nAuto-dumping fi_trace JSON files to {SAVE_DIR}/\n")
