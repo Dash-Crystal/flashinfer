@@ -353,3 +353,113 @@ def test_alpha_dtype_must_be_float32():
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(TypeError):
         prepare_bf16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
+
+
+@pytest.mark.parametrize("m,k,split_k", [(1, 32, 1), (9, 160, 1), (56, 128, 4)])
+@pytest.mark.parametrize("activation_scale", [1.0, 2.0**20])
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("prepared_a", [False, True])
+def test_sparse_w4a16_preserves_codes_metadata_and_bf16_range(
+    m, k, split_k, activation_scale, paired, prepared_a
+):
+    """Every 2:4 pattern, E2M1 code, and finite E4M3 scale survives packing/MMA."""
+    from flashinfer.gemm.gemm_bf16_fp4_sparse import (
+        mm_bf16_fp4_sparse,
+        prepare_bf16_fp4_sparse_weights,
+    )
+
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("SM120 sparse W4A16")
+    n = 256
+    device = "cuda"
+    pairs = torch.tensor(
+        [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]], device=device
+    )
+    pattern = pairs[torch.arange(n * k // 4, device=device) % 6].reshape(n, k // 4, 2)
+    if paired:
+        pattern = (
+            pairs[torch.arange(n * k // 8, device=device) % 6]
+            .reshape(n, k // 8, 2)
+            .repeat_interleave(2, dim=1)
+        )
+    codes = torch.zeros(n, k // 4, 4, device=device, dtype=torch.uint8)
+    retained = (
+        (torch.arange(n * k // 2, device=device) % 16)
+        .to(torch.uint8)
+        .reshape(n, k // 4, 2)
+    )
+    codes.scatter_(-1, pattern, retained)
+    if paired:
+        codes = codes.reshape(n, k // 8, 2, 4).transpose(-1, -2).contiguous()
+    codes = codes.reshape(n, k)
+    packed = codes[:, 0::2] | codes[:, 1::2] << 4
+    scales = (
+        (torch.arange(n * k // 16, device=device) % 127)
+        .to(torch.uint8)
+        .reshape(n, k // 16)
+    )
+    swizzled = flashinfer.block_scale_interleave(scales)
+    alpha = torch.tensor([0.001], device=device)
+    prepared = prepare_bf16_fp4_sparse_weights(packed, swizzled, paired=paired)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * activation_scale
+    lut = torch.tensor(_E2M1_VALUES_FP32, device=device)
+    w = lut[codes.long()] * scales.view(torch.float8_e4m3fn).float().repeat_interleave(
+        16, -1
+    )
+
+    def run():
+        return mm_bf16_fp4_sparse(
+            x, *prepared, alpha, split_k=split_k, paired=paired, prepared_a=prepared_a
+        )
+
+    out = run()
+    ref = (x.float() @ w.T * alpha).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, rtol=0.008, atol=0.001 * activation_scale)
+    from flashinfer.trace.templates.gemm import _mm_bf16_fp4_sparse_reference
+
+    trace_ref = _mm_bf16_fp4_sparse_reference(x, *prepared, alpha, paired=paired)
+    torch.testing.assert_close(trace_ref, ref, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    x.mul_(0.5)
+    graph.replay()
+    torch.testing.assert_close(captured, run(), rtol=0, atol=0)
+
+
+def test_sparse_w4a16_rejects_dense_or_paired_4of8_patterns():
+    """Packing must not silently discard extra nonzeros within a scalar quartet."""
+    from flashinfer.gemm.gemm_bf16_fp4_sparse import prepare_bf16_fp4_sparse_weights
+
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("SM120 sparse W4A16")
+    packed = torch.zeros(64, 16, device="cuda", dtype=torch.uint8)
+    packed[:, :2] = 0x22  # Four nonzeros in the first quartet; the next is zero.
+    scales = flashinfer.block_scale_interleave(
+        torch.full((64, 2), 0x38, device="cuda", dtype=torch.uint8)
+    )
+    with pytest.raises(ValueError, match="scalar 2:4"):
+        prepare_bf16_fp4_sparse_weights(packed, scales)
+
+
+def test_sparse_w4a16_rejects_incompatible_prepared_operands():
+    """Reject shape/scale errors before launching kernels with raw packed operands."""
+    from flashinfer import mm_bf16_fp4_sparse, prepare_bf16_fp4_sparse_weights
+
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("SM120 sparse W4A16")
+    b = torch.zeros((64, 16), device="cuda", dtype=torch.uint8)
+    sf = flashinfer.block_scale_interleave(
+        torch.full((64, 2), 127, device="cuda", dtype=torch.uint8)
+    )
+    with pytest.raises(ValueError, match="finite E4M3"):
+        prepare_bf16_fp4_sparse_weights(b, sf)
+    sf.zero_()
+    w, scales, meta = prepare_bf16_fp4_sparse_weights(b, sf)
+    x = torch.ones((2, 32), device="cuda", dtype=torch.bfloat16)
+    alpha = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="metadata"):
+        mm_bf16_fp4_sparse(x, w, scales, meta[..., :8], alpha)
+    with pytest.raises(ValueError, match="tile or split-K"):
+        mm_bf16_fp4_sparse(x, w, scales, meta, alpha, split_k=0)
+    assert mm_bf16_fp4_sparse(x[:0], w, scales, meta, alpha).shape == (0, 64)

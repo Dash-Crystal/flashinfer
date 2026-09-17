@@ -28,6 +28,10 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_fp4_sparse import (
+    mm_bf16_fp4_sparse as mm_bf16_fp4_sparse,
+    prepare_bf16_fp4_sparse_weights as prepare_bf16_fp4_sparse_weights,
+)
 
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,

@@ -1,0 +1,86 @@
+{
+  "name": "mm_bf16_fp4_sparse_N_tiles8_K128_paired0_metadata_words16",
+  "description": "SM120 BF16 x structured sparse NVFP4; compressed weights and sparse BF16 MMA.",
+  "op_type": "gemm_bf16_fp4_sparse",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_bf16_fp4_sparse.mm_bf16_fp4_sparse",
+    "status:verified",
+    "quantization:fp4",
+    "sparsity:structured"
+  ],
+  "axes": {
+    "M": {
+      "type": "var"
+    },
+    "N_tiles": {
+      "type": "const",
+      "value": 8
+    },
+    "K": {
+      "type": "const",
+      "value": 128
+    },
+    "paired": {
+      "type": "const",
+      "value": 0
+    },
+    "metadata_words": {
+      "type": "const",
+      "value": 16
+    }
+  },
+  "inputs": {
+    "a": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "bfloat16"
+    },
+    "b": {
+      "shape": [
+        "N_tiles",
+        "K_div_32",
+        "32"
+      ],
+      "dtype": "int32"
+    },
+    "b_descale": {
+      "shape": [
+        "N_tiles",
+        "K_div_32",
+        "8"
+      ],
+      "dtype": "int32"
+    },
+    "metadata": {
+      "shape": [
+        "N_tiles",
+        "K_div_32",
+        "metadata_words"
+      ],
+      "dtype": "int32"
+    },
+    "alpha": {
+      "shape": [
+        "1"
+      ],
+      "dtype": "float32"
+    },
+    "paired": {
+      "shape": null,
+      "dtype": "bool"
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "M",
+        "N_tiles_mul_16"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\ndef _mm_bf16_fp4_sparse_reference(\n    a, b, b_descale, metadata, alpha, paired=False, **kwargs\n):\n    nt, kt, _ = b.shape\n    n, k = nt * 16, kt * 32\n    raw = b.view(torch.uint8).reshape(nt, kt, 8, 4, 2, 2)\n    raw = raw.permute(0, 5, 2, 1, 4, 3).reshape(n, k // 4)\n    retained = torch.stack((raw & 15, raw >> 4), -1).long()\n    meta = metadata.to(torch.int64) & 0xFFFFFFFF\n    shifts = torch.arange(4, device=a.device) * 4\n    if paired:\n        meta = torch.stack((meta & 65535, meta >> 16), 2)\n        meta = meta.permute(0, 2, 3, 1).reshape(n, k // 32)\n        nibble = (\n            ((meta.unsqueeze(-1) >> shifts) & 15)\n            .reshape(n, k // 8)\n            .repeat_interleave(2, dim=1)\n        )\n    else:\n        meta = meta.reshape(nt, kt, 8, 2)\n        meta = torch.stack((meta & 65535, meta >> 16), 2)\n        meta = meta.permute(0, 2, 3, 1, 4).reshape(n, k // 16)\n        nibble = ((meta.unsqueeze(-1) >> shifts) & 15).reshape(n, k // 4)\n    indices = torch.stack((nibble & 3, nibble >> 2), -1)\n    codes = torch.zeros(n, k // 4, 4, device=a.device, dtype=torch.long)\n    codes.scatter_(-1, indices, retained)\n    if paired:\n        codes = codes.reshape(n, k // 8, 2, 4).transpose(-1, -2)\n    codes = codes.reshape(n, k)\n    sf = b_descale.view(torch.uint8).reshape(nt, kt, 8, 2, 2)\n    sf = sf.permute(0, 4, 2, 1, 3).reshape(n, k // 16)\n    sf = (sf.to(torch.int16) << 7).view(torch.float16).float()\n    lut = torch.tensor(\n        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6], device=a.device\n    )\n    weight = lut[codes] * sf.repeat_interleave(16, -1)\n    return (a.float() @ weight.T * alpha).to(a.dtype)\n",
+  "check": "def _fp4_gemm_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    rtol=None,\n    atol=None,\n    max_mismatch_pct=100.0,\n    min_cos_sim=0.97,\n):\n    from flashinfer.trace import default_check\n\n    # Matches tests/gemm/test_mm_fp4.py.\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
