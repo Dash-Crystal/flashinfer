@@ -298,10 +298,10 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
         lane = tid % 32
         group, t = lane // 4, lane % 4
         storage = utils.SmemAllocator().allocate(self.storage)
-        sx = storage.x.get_tensor(self.x_layout)
-        sw = storage.w.get_tensor(self.w_layout)
-        ssf = storage.sf.get_tensor(self.sf_layout)
-        se = storage.e.get_tensor(self.e_layout)
+        sx = storage.x.get_tensor(cute.make_layout((*self.x_shape, self.stages)))
+        sw = storage.w.get_tensor(cute.make_layout((*self.w_shape, self.stages)))
+        ssf = storage.sf.get_tensor(cute.make_layout((*self.sf_shape, self.stages)))
+        se = storage.e.get_tensor(cute.make_layout((*self.e_shape, self.stages)))
         pxs, pxg = self.partition(copy_x, tx, sx, self.x_shape, bm)
         pws, pwg = self.partition(copy_w, tw, sw, self.w_shape, bn)
         pss, psg = self.partition(copy_sf, tsf, ssf, self.sf_shape, bn)
