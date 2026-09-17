@@ -355,7 +355,9 @@ def test_alpha_dtype_must_be_float32():
         prepare_bf16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
 
 
-@pytest.mark.parametrize("m,k,split_k", [(1, 32, 1), (9, 160, 1), (56, 128, 4)])
+@pytest.mark.parametrize(
+    "m,k,split_k", [(1, 32, 1), (9, 160, 1), (56, 128, 4), (1120, 128, 1)]
+)
 @pytest.mark.parametrize("activation_scale", [1.0, 2.0**20])
 @pytest.mark.parametrize("paired", [False, True])
 @pytest.mark.parametrize("prepared_a", [False, True])

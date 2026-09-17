@@ -106,8 +106,13 @@ def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a):
         )
 
     def compile_kernel():
+        implementation = (
+            kernel.SparseGemmBf16Fp4Tma
+            if prepared_a and split_k == 1 and m >= 128 and k % 128 == 0
+            else kernel.SparseGemmBf16Fp4
+        )
         return cute.compile(
-            kernel.SparseGemmBf16Fp4(m, n, k, m_tiles, split_k, paired, prepared_a),
+            implementation(m, n, k, m_tiles, split_k, paired, prepared_a),
             tensor(
                 cutlass.Int32,
                 (((m + m_tiles * 8 - 1) // (m_tiles * 8)) * m_tiles * k // 8, 32)
