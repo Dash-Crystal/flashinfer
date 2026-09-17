@@ -1330,14 +1330,14 @@ void mixed_kv_arena_capacity(TensorView data, TensorView pages, TensorView slabs
       static_cast<int64_t*>(output.data_ptr()));
 }
 
-// Fixed slots retain vLLM page ownership. Transform into disjoint event scratch,
-// then commit in a second launch: compact output must not overwrite unread A16.
+// Each unique page event has one CTA. Stage into disjoint scratch before
+// overwriting the fixed slot; a CTA barrier suffices before its own commit.
 template <typename InType, bool Seal, int THREADS = kMixedKVSealThreads>
 __global__ void mixed_kv_fixed_stage_kernel(flashinfer::KVPageStorage storage,
                                             const int32_t* events, const int32_t* count,
-                                            uint8_t* scratch, uint64_t* pending, float* stats,
-                                            int64_t stats_stride, const float* thresholds,
-                                            const float* global_scales) {
+                                            const uint64_t* offsets, uint8_t* scratch,
+                                            uint64_t* pending, float* stats, int64_t stats_stride,
+                                            const float* thresholds, const float* global_scales) {
   const int event = blockIdx.x;
   if (event >= *count) return;
   const auto source = storage.address(events[event]);
@@ -1402,16 +1402,8 @@ __global__ void mixed_kv_fixed_stage_kernel(flashinfer::KVPageStorage storage,
     }
     if (threadIdx.x == 0) pending[event] = scratch_offset;
   }
-}
-
-__global__ void mixed_kv_fixed_commit_kernel(flashinfer::KVPageStorage storage,
-                                             const int32_t* events, const int32_t* count,
-                                             const uint64_t* offsets, const uint8_t* scratch,
-                                             const uint64_t* pending) {
-  const int event = blockIdx.x;
-  if (event >= *count) return;
+  __syncthreads();
   const flashinfer::KVPageAddress staged{pending[event]};
-  if (!staged.allocated()) return;
   const int page = events[event];
   const uint64_t offset = offsets[page];
   const auto* src = reinterpret_cast<const uint32_t*>(scratch + staged.offset());
@@ -1484,10 +1476,9 @@ void mixed_kv_fixed_update(TensorView k, TensorView v, TensorView slots, TensorV
       const auto* events = static_cast<const int32_t*>(writable.data_ptr());
       const auto* count = static_cast<const int32_t*>(writable_count.data_ptr());
       mixed_kv_fixed_stage_kernel<c_type, false>
-          <<<writable.numel(), kMixedKVSealThreads, 0, stream>>>(
-              storage, events, count, temporary, tags, routing, stats.stride(0), limits, scales);
-      mixed_kv_fixed_commit_kernel<<<writable.numel(), 128, 0, stream>>>(storage, events, count,
-                                                                         fixed, temporary, tags);
+          <<<writable.numel(), kMixedKVSealThreads, 0, stream>>>(storage, events, count, fixed,
+                                                                 temporary, tags, routing,
+                                                                 stats.stride(0), limits, scales);
     }
     if ((phase & 1) && slots.numel()) {
       mixed_kv_arena_write_kernel<c_type><<<dim3(slots.numel(), k.size(1)), 128, 0, stream>>>(
@@ -1499,10 +1490,9 @@ void mixed_kv_fixed_update(TensorView k, TensorView v, TensorView slots, TensorV
       const auto* events = static_cast<const int32_t*>(completed.data_ptr());
       const auto* count = static_cast<const int32_t*>(completed_count.data_ptr());
       mixed_kv_fixed_stage_kernel<c_type, true>
-          <<<completed.numel(), kMixedKVSealThreads, 0, stream>>>(
-              storage, events, count, temporary, tags, routing, stats.stride(0), limits, scales);
-      mixed_kv_fixed_commit_kernel<<<completed.numel(), 128, 0, stream>>>(storage, events, count,
-                                                                          fixed, temporary, tags);
+          <<<completed.numel(), kMixedKVSealThreads, 0, stream>>>(storage, events, count, fixed,
+                                                                  temporary, tags, routing,
+                                                                  stats.stride(0), limits, scales);
     }
     return true;
   });

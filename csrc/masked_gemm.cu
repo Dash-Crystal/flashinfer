@@ -28,7 +28,10 @@ namespace ready_gemm = flashinfer::masked_gemm;
 using tvm::ffi::Optional;
 
 tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publish,
-                                           bool tile_publication, bool stream_k) {
+                                           bool tile_publication, bool stream_k,
+                                           bool persistent_dp) {
+  TVM_FFI_ICHECK(!persistent_dp || (tile_publication && !stream_k));
+  stream_k = stream_k || persistent_dp;
   int resources[4];
   int occupancy = 0;
   int sms = 0;
@@ -41,15 +44,25 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
                                     : published::Prepare<cutlass::bfloat16_t, false>)
                         : (stream_k ? published::Prepare<cutlass::half_t, true>
                                     : published::Prepare<cutlass::half_t, false>);
+    if (!publish)
+      prepare = bf16 ? (stream_k ? published::Prepare<cutlass::bfloat16_t, true, true>
+                                 : published::Prepare<cutlass::bfloat16_t, false, true>)
+                     : (stream_k ? published::Prepare<cutlass::half_t, true, true>
+                                 : published::Prepare<cutlass::half_t, false, true>);
     status = prepare(resources, &occupancy);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     cudaDeviceProp properties;
     status = cudaGetDeviceProperties(&properties, device);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     sms = properties.multiProcessorCount;
-    if (stream_k)
+    if (stream_k) {
       workspace_bytes = bf16 ? published::WorkspaceBytes<cutlass::bfloat16_t>(sms * occupancy)
                              : published::WorkspaceBytes<cutlass::half_t>(sms * occupancy);
+      if (!publish)
+        workspace_bytes =
+            bf16 ? published::WorkspaceBytes<cutlass::bfloat16_t, true>(sms * occupancy)
+                 : published::WorkspaceBytes<cutlass::half_t, true>(sms * occupancy);
+    }
   } else if (publish) {
     status = bf16 ? flashinfer::masked_gemm::Prepare<cutlass::bfloat16_t, true>(resources)
                   : flashinfer::masked_gemm::Prepare<cutlass::half_t, true>(resources);
@@ -70,7 +83,16 @@ tvm::ffi::Array<int64_t> PrepareMaskedGemm(int64_t device, bool bf16, bool publi
 void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView is_padding,
                    int64_t row_offset, Optional<TensorView> peer_output,
                    Optional<TensorView> publication, Optional<TensorView> peer_publication,
-                   Optional<TensorView> workspace, int64_t sms, int64_t occupancy, bool stream_k) {
+                   Optional<TensorView> workspace, int64_t sms, int64_t occupancy, bool stream_k,
+                   bool persistent_dp, int64_t native_region, Optional<TensorView> task_state,
+                   Optional<TensorView> retire_readiness, int64_t retire_group_rows,
+                   int64_t retire_rows, int64_t retire_workers, int64_t publication_epoch) {
+  TVM_FFI_ICHECK(!native_region ||
+                 (persistent_dp && publication.has_value() && !peer_output.has_value() &&
+                  !peer_publication.has_value() && out.stride(0) == out.size(1)));
+  TVM_FFI_ICHECK(!persistent_dp || (publication.has_value() && !stream_k));
+  TVM_FFI_ICHECK(!publication_epoch || (persistent_dp && peer_output.has_value()));
+  stream_k = stream_k || persistent_dp;
   ffi::CUDADeviceGuard guard(x.device().device_id);
   const auto stream = get_stream(x.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
@@ -78,23 +100,38 @@ void RunMaskedGemm(TensorView x, TensorView weight, TensorView out, TensorView i
                                        cutlass::half_t>;
     cudaError_t status;
     if (publication.has_value()) {
-      TVM_FFI_ICHECK(peer_output.has_value() && peer_publication.has_value());
+      TVM_FFI_ICHECK(peer_output.has_value() == peer_publication.has_value());
+      const bool local_only = !peer_output.has_value();
       TVM_FFI_ICHECK(sms > 0 && occupancy > 0);
       if (stream_k) {
         TVM_FFI_ICHECK(workspace.has_value());
-        TVM_FFI_ICHECK(workspace.value().size(0) >=
-                       flashinfer::published_gemm::WorkspaceBytes<Element>(sms * occupancy));
+        const auto bytes =
+            local_only ? flashinfer::published_gemm::WorkspaceBytes<Element, true>(sms * occupancy)
+                       : flashinfer::published_gemm::WorkspaceBytes<Element>(sms * occupancy);
+        TVM_FFI_ICHECK(workspace.value().size(0) >= bytes);
       }
       auto run = stream_k ? flashinfer::published_gemm::Run<Element, true>
                           : flashinfer::published_gemm::Run<Element, false>;
+      if (local_only)
+        run = stream_k ? flashinfer::published_gemm::Run<Element, true, true>
+                       : flashinfer::published_gemm::Run<Element, false, true>;
       status = run(
           static_cast<Element*>(x.data_ptr()), static_cast<Element*>(weight.data_ptr()),
           static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
           weight.stride(1), out.stride(0), static_cast<uint8_t const*>(is_padding.data_ptr()),
-          row_offset, static_cast<Element*>(peer_output.value().data_ptr()),
+          row_offset,
+          peer_output.has_value() ? static_cast<Element*>(peer_output.value().data_ptr()) : nullptr,
           static_cast<int*>(publication.value().data_ptr()),
-          static_cast<int*>(peer_publication.value().data_ptr()), publication.value().size(1),
-          workspace.has_value() ? workspace.value().data_ptr() : nullptr, sms, occupancy, stream);
+          peer_publication.has_value() ? static_cast<int*>(peer_publication.value().data_ptr())
+                                       : nullptr,
+          publication.value().size(1),
+          workspace.has_value() ? workspace.value().data_ptr() : nullptr, sms, occupancy, stream,
+          persistent_dp, reinterpret_cast<tp_region::DeviceRegion const*>(native_region),
+          {task_state.has_value() ? static_cast<int*>(task_state.value().data_ptr()) : nullptr,
+           retire_readiness.has_value() ? static_cast<int*>(retire_readiness.value().data_ptr())
+                                        : nullptr,
+           int(retire_group_rows), int(x.size(0)), int(retire_rows), int(retire_workers)},
+          reinterpret_cast<flashinfer::masked_gemm::PushPublication const*>(publication_epoch));
     } else {
       auto run = peer_output.has_value() ? flashinfer::masked_gemm::Run<Element, true>
                                          : flashinfer::masked_gemm::Run<Element, false>;
@@ -147,9 +184,10 @@ tvm::ffi::Array<int64_t> PrepareReadyGemm(
 
 void RunReadyGemm(TensorView x, TensorView weight, TensorView out, TensorView readiness,
                   TensorView workspace, int64_t group_rows, int64_t sms, int64_t occupancy,
-                  int64_t reserved_blocks) {
+                  int64_t reserved_blocks, int64_t tile_swizzle, Optional<TensorView> task_state) {
   ffi::CUDADeviceGuard guard(x.device().device_id);
   TVM_FFI_ICHECK(reserved_blocks >= 0 && reserved_blocks < sms);
+  TVM_FFI_ICHECK(tile_swizzle == 1 || tile_swizzle == 2 || tile_swizzle == 4 || tile_swizzle == 8);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), c_type, [&] {
     using Element = std::conditional_t<std::is_same_v<c_type, nv_bfloat16>, cutlass::bfloat16_t,
                                        cutlass::half_t>;
@@ -159,7 +197,8 @@ void RunReadyGemm(TensorView x, TensorView weight, TensorView out, TensorView re
         static_cast<Element*>(out.data_ptr()), x.size(0), weight.size(1), x.size(1), x.stride(0),
         weight.stride(1), out.stride(0), static_cast<int*>(readiness.data_ptr()), group_rows,
         readiness.size(0) - 1, workspace.data_ptr(), sms, occupancy, sms - reserved_blocks,
-        get_stream(x.device()));
+        get_stream(x.device()), tile_swizzle, false,
+        task_state.has_value() ? static_cast<int*>(task_state.value().data_ptr()) : nullptr);
     TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
     return true;
   });

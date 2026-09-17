@@ -20,7 +20,24 @@
 
 #include <cuda/atomic>
 
+#include "region_channel.cuh"
+
 namespace flashinfer::masked_gemm {
+
+struct PushPublication {
+  uint64_t* local;
+  uint64_t* remote;
+  uint64_t* generation;
+
+  CUTLASS_DEVICE void publish(int group) const {
+    auto epoch = mscclpp::atomicLoad<uint64_t, mscclpp::scopeDevice>(generation,
+                                                                     mscclpp::memoryOrderRelaxed);
+    mscclpp::atomicStore<uint64_t, mscclpp::scopeSystem>(remote + group, epoch,
+                                                         mscclpp::memoryOrderRelease);
+    mscclpp::atomicStore<uint64_t, mscclpp::scopeDevice>(local + group, epoch,
+                                                         mscclpp::memoryOrderRelease);
+  }
+};
 
 using Tile = cutlass::gemm::GemmShape<128, 64, 64>;
 using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
@@ -86,9 +103,12 @@ using Gemm =
                            PeerEpilogue<typename LocalGemm<Element>::Epilogue>, Swizzle, false>,
                        LocalGemm<Element>>;
 
-template <int Rows>
+template <int Rows, bool LocalOnly = false>
 CUTLASS_DEVICE void PublishRows(int* publication, int* peer_publication, int groups, int tile_m,
-                                int tiles_n, int problem_rows) {
+                                int tiles_n, int problem_rows,
+                                tp_region::DeviceRegion const* native_region = nullptr,
+                                int output_columns = 0,
+                                PushPublication const* publication_epoch = nullptr) {
   constexpr int group_rows = 32;
   static_assert(Rows % group_rows == 0);
   const int first = tile_m * Rows / group_rows;
@@ -100,10 +120,24 @@ CUTLASS_DEVICE void PublishRows(int* publication, int* peer_publication, int gro
     if (fragments.fetch_add(1, cuda::memory_order_acq_rel) == tiles_n - 1) {
       fragments.store(0, cuda::memory_order_relaxed);
       for (int group = first; group < end; ++group) {
-        cuda::atomic_ref<int, cuda::thread_scope_device> local(publication[group]);
-        cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + group]);
-        peer.store(1, cuda::memory_order_release);
-        local.store(1, cuda::memory_order_release);
+        if constexpr (LocalOnly) {
+          cuda::atomic_ref<int, cuda::thread_scope_system> local(publication[group]);
+          local.store(1, cuda::memory_order_release);
+        } else {
+          cuda::atomic_ref<int, cuda::thread_scope_device> local(publication[group]);
+          if (!publication_epoch) {
+            cuda::atomic_ref<int, cuda::thread_scope_system> peer(peer_publication[groups + group]);
+            peer.store(1, cuda::memory_order_release);
+          }
+          local.store(1, cuda::memory_order_release);
+        }
+        if (publication_epoch) publication_epoch->publish(group);
+      }
+      if (native_region) {
+        static_assert(Rows == 128);
+        int valid_rows = min(Rows, problem_rows - tile_m * Rows);
+        tp_region::publish_completed_group(*native_region, tile_m,
+                                           uint64_t(valid_rows) * output_columns * 2);
       }
     }
   }
@@ -255,11 +289,15 @@ constexpr size_t ReadyWorkspaceBytes(int slots) {
          (slots * flags_per_slot * sizeof(int) + 127) / 128 * 128;
 }
 
-CUTLASS_DEVICE void FinishReady(int* readiness, int groups, int done_index) {
+CUTLASS_DEVICE void FinishReady(int* readiness, int groups, int done_index,
+                                int* task_state = nullptr, int task_words = 0) {
   if (threadIdx.x == 0) {
     cuda::atomic_ref<int, cuda::thread_scope_device> done(readiness[done_index]);
     const int blocks = gridDim.x * gridDim.y * gridDim.z;
     if (done.fetch_add(1, cuda::memory_order_acq_rel) == blocks - 1) {
+      if (task_state) {
+        for (int word = 0; word < task_words; ++word) task_state[word] = 0;
+      }
       for (int group = 0; group < groups; ++group) readiness[group] = 0;
       done.store(0, cuda::memory_order_relaxed);
     }
@@ -299,7 +337,10 @@ cudaError_t PrepareReady(int* occupancy) {
 template <typename Element>
 cudaError_t RunReady(Element* a, Element* b, Element* out, int m, int n, int k, int lda, int ldb,
                      int ldd, int* readiness, int group_rows, int done_index, void* workspace,
-                     int sms, int occupancy, int available_sms, cudaStream_t stream) {
+                     int sms, int occupancy, int available_sms, cudaStream_t stream,
+                     int tile_swizzle = 1, bool raster_m = false, int* task_state = nullptr) {
+  if (task_state) return cudaErrorInvalidValue;
+  if (raster_m) return cudaErrorInvalidValue;
   using Kernel = ReadyGemm<Element>;
   typename Kernel::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
                                   {1.0f, 0.0f}, a, b, out, out, 0, 0, 0, 0, int64_t(lda),

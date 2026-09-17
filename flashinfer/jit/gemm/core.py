@@ -70,7 +70,11 @@ def gen_gemm_module() -> JitSpec:
 
 
 def gen_masked_gemm_module(
-    *, ready_tma: bool = False, math_registers: int = 0, row_tile: int = 128
+    *,
+    ready_tma: bool = False,
+    math_registers: int = 0,
+    row_tile: int = 128,
+    startup_ramp: bool = False,
 ) -> JitSpec:
     source = jit_env.FLASHINFER_CSRC_DIR / "masked_gemm.cu"
     header = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer/gemm/masked_gemm.cuh"
@@ -81,11 +85,20 @@ def gen_masked_gemm_module(
         source.read_bytes()
         + header.read_bytes()
         + published.read_bytes()
-        + (tma.read_bytes() + entry.read_bytes() if ready_tma else b"")
+        + header.with_name("region_channel.cuh").read_bytes()
+        + (
+            tma.read_bytes()
+            + entry.read_bytes()
+            + header.with_name("eligible_ready_scheduler.cuh").read_bytes()
+            if ready_tma
+            else b""
+        )
     ).hexdigest()[:16]
     return gen_jit_spec(
-        f"masked_gemm_{identity}_tma{int(ready_tma)}_m{row_tile}_r{math_registers}",
+        f"masked_gemm_{identity}_tma{int(ready_tma)}_m{row_tile}_r{math_registers}"
+        f"_ramp{int(startup_ramp)}",
         [source],
+        extra_include_paths=[os.environ["TP_PORTCHANNEL_INCLUDE_DIR"]],
         extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[12] if ready_tma else [8, 9, 10, 11, 12]
         )
@@ -93,6 +106,7 @@ def gen_masked_gemm_module(
             f"-DFLASHINFER_READY_TMA_SM120={int(ready_tma)}",
             f"-DFLASHINFER_READY_MATH_REGISTERS={math_registers}",
             f"-DFLASHINFER_READY_ROW_TILE={row_tile}",
+            f"-DFLASHINFER_READY_STARTUP_RAMP={int(startup_ramp)}",
         ],
     )
 
