@@ -88,11 +88,14 @@ def permute_pair(
 
 
 class SparseGemmBf16Fp4:
-    def __init__(self, m, n, k, m_tiles=2, split_k=1, paired=False, prepared_a=False):
+    def __init__(
+        self, m, n, k, m_tiles=2, split_k=1, paired=False, prepared_a=False, stages=3
+    ):
         self.m, self.n, self.k = m, n, k
         self.m_tiles, self.split_k = m_tiles, split_k
         self.paired = paired
         self.prepared_a = prepared_a
+        self.stages = stages
 
     @cute.jit
     def __call__(
@@ -210,7 +213,6 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
 
     @cute.jit
     def __call__(self, x, w, sf, meta, alpha, y, stream):
-        self.stages = 3
         self.k_tiles = 4
         self.n_tiles = 8
         self.meta_width = 8 if self.paired else 16

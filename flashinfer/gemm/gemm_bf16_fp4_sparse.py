@@ -91,7 +91,7 @@ def prepare_bf16_fp4_sparse_weights(b, b_descale, *, paired=False):
 
 
 @functools.cache
-def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a):
+def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a, stages):
     import cutlass
     import cutlass.cute as cute
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -112,7 +112,7 @@ def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a):
             else kernel.SparseGemmBf16Fp4
         )
         return cute.compile(
-            implementation(m, n, k, m_tiles, split_k, paired, prepared_a),
+            implementation(m, n, k, m_tiles, split_k, paired, prepared_a, stages),
             tensor(
                 cutlass.Int32,
                 (((m + m_tiles * 8 - 1) // (m_tiles * 8)) * m_tiles * k // 8, 32)
@@ -132,7 +132,7 @@ def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a):
 
     return build_and_load_cute_dsl_kernel(
         "sparse_bf16_fp4",
-        f"m{m}_n{n}_k{k}_mt{m_tiles}_sk{split_k}_paired{int(paired)}_pa{int(prepared_a)}",
+        f"m{m}_n{n}_k{k}_mt{m_tiles}_sk{split_k}_paired{int(paired)}_pa{int(prepared_a)}_st{stages}",
         compile_kernel,
         extra_key_files=(__file__, kernel.__file__),
     )
@@ -177,6 +177,7 @@ def _run_sparse(
     split_k=1,
     paired=False,
     prepared_a=False,
+    stages=3,
 ):
     """BF16 activations against compressed scalar 2:4 NVFP4 weights."""
     m, k = a.shape
@@ -195,7 +196,7 @@ def _run_sparse(
         padded_m = (m + m_tiles * 8 - 1) // (m_tiles * 8) * m_tiles * 8
         x = torch.empty((padded_m * k // 64, 32), device=a.device, dtype=torch.int32)
         _activation_packer(m, k, padded_m, paired)(a.view(torch.int32), x)
-    _compiled(m, n, k, m_tiles, split_k, paired, prepared_a)(
+    _compiled(m, n, k, m_tiles, split_k, paired, prepared_a, stages)(
         x, b, b_descale, metadata, alpha, out
     )
     return out[0] if split_k == 1 else out.sum(0).to(torch.bfloat16)
@@ -203,13 +204,14 @@ def _run_sparse(
 
 def _tactics(m, n, k):
     return [
-        (mt, sk, pa)
+        (mt, sk, pa, stages)
         for mt in (1, 2, 4, 8)
         for sk in (1, 4, 16)
         for pa in ((False, True) if m <= 8 else (True,))
         if (mt <= max(1, (m + 7) // 8))
         and sk <= k // 32
         and (sk == 1 or sk * m * n * 4 <= 128 * 1024**2)
+        for stages in ((2, 3) if pa and sk == 1 and m >= 128 and k % 128 == 0 else (3,))
     ]
 
 
@@ -234,12 +236,13 @@ class _SparseRunner(TunableRunner):
             sk = 16 if ctas < 128 else 4 if ctas < 512 else 1
             while sk > k // 32 or (sk > 1 and sk * m * n * 4 > 128 * 1024**2):
                 sk = 4 if sk == 16 else 1
-            tactic = (mt, sk, m > 8)
+            tactic = (mt, sk, m > 8, 3)
         return _run_sparse(
             *inputs,
             m_tiles=tactic[0],
             split_k=tactic[1],
             prepared_a=tactic[2],
+            stages=tactic[3],
             paired=self.paired,
         )
 
@@ -309,7 +312,7 @@ def mm_bf16_fp4_sparse(
         pa = bool(prepared_a)
         if mt not in (1, 2, 4, 8) or sk not in (1, 4, 16):
             raise ValueError("Unsupported sparse MMA tile or split-K count")
-        return runner(inputs, tactic=(mt, sk, pa))
+        return runner(inputs, tactic=(mt, sk, pa, 3))
     chosen, tactic = AutoTuner.get().choose_one(
         "sparse_bf16_fp4", [runner], TuningConfig(), inputs
     )
