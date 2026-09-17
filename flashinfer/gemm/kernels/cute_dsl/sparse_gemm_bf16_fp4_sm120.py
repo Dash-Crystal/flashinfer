@@ -296,9 +296,12 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
     def tma_kernel(self, copy_x, tx, copy_w, tw, copy_sf, tsf, copy_e, te, alpha, y):
         tid, _, _ = cute.arch.thread_idx()
         bn, bm, bk = cute.arch.block_idx()
-        chunk = cute.ceil_div(self.k // 128, self.split_k)
-        begin = bk * chunk
-        end = cutlass.min((bk + 1) * chunk, self.k // 128)
+        if cutlass.const_expr(self.split_k == 1):
+            begin, end = 0, self.k // 128
+        else:
+            chunk = cute.ceil_div(self.k // 128, self.split_k)
+            begin = bk * chunk
+            end = cutlass.min((bk + 1) * chunk, self.k // 128)
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         group, t = lane // 4, lane % 4
