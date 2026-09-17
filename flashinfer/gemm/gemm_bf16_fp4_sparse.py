@@ -108,7 +108,7 @@ def _compiled(m, n, k, m_tiles, split_k, paired, prepared_a, stages):
     def compile_kernel():
         implementation = (
             kernel.SparseGemmBf16Fp4Tma
-            if prepared_a and split_k == 1 and m >= 128 and k % 128 == 0
+            if prepared_a and split_k <= k // 128 and m >= 128 and k % 128 == 0
             else kernel.SparseGemmBf16Fp4
         )
         return cute.compile(
@@ -206,12 +206,14 @@ def _tactics(m, n, k):
     return [
         (mt, sk, pa, stages)
         for mt in (1, 2, 4, 8)
-        for sk in (1, 4, 16)
+        for sk in (1, 2, 4, 16)
         for pa in ((False, True) if m <= 8 else (True,))
         if (mt <= max(1, (m + 7) // 8))
         and sk <= k // 32
         and (sk == 1 or sk * m * n * 4 <= 128 * 1024**2)
-        for stages in ((2, 3) if pa and sk == 1 and m >= 128 and k % 128 == 0 else (3,))
+        for stages in (
+            (2, 3) if pa and sk <= k // 128 and m >= 128 and k % 128 == 0 else (3,)
+        )
     ]
 
 
@@ -310,7 +312,7 @@ def mm_bf16_fp4_sparse(
         mt = 2 if m_tiles is None else m_tiles
         sk = 1 if split_k is None else split_k
         pa = bool(prepared_a)
-        if mt not in (1, 2, 4, 8) or sk not in (1, 4, 16):
+        if mt not in (1, 2, 4, 8) or sk not in (1, 2, 4, 16):
             raise ValueError("Unsupported sparse MMA tile or split-K count")
         return runner(inputs, tactic=(mt, sk, pa, 3))
     chosen, tactic = AutoTuner.get().choose_one(

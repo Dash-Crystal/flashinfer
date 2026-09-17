@@ -266,7 +266,7 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
             grid=(
                 cute.ceil_div(self.n, 128),
                 cute.ceil_div(self.m, self.m_tiles * 8),
-                1,
+                self.split_k,
             ),
             block=(160, 1, 1),
             stream=stream,
@@ -295,7 +295,10 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
     @cute.kernel
     def tma_kernel(self, copy_x, tx, copy_w, tw, copy_sf, tsf, copy_e, te, alpha, y):
         tid, _, _ = cute.arch.thread_idx()
-        bn, bm, _ = cute.arch.block_idx()
+        bn, bm, bk = cute.arch.block_idx()
+        chunk = cute.ceil_div(self.k // 128, self.split_k)
+        begin = bk * chunk
+        end = cutlass.min((bk + 1) * chunk, self.k // 128)
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
         group, t = lane // 4, lane % 4
@@ -332,7 +335,7 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
             weights = cute.make_rmem_tensor((2, 4), Uint32)
             metadata = cute.make_rmem_tensor((2,), Uint32)
             scale = Float32(alpha[0])
-            for _ in cutlass.range(self.k // 128, unroll=1):
+            for _ in cutlass.range(end - begin, unroll=1):
                 pipe.consumer_wait(state)
                 for ki in cutlass.range_constexpr(4):
                     for ni in cutlass.range_constexpr(2):
@@ -384,17 +387,17 @@ class SparseGemmBf16Fp4Tma(SparseGemmBf16Fp4):
                     for ri in cutlass.range_constexpr(2):
                         row = bm * self.m_tiles * 8 + mi * 8 + t * 2 + ri
                         if row < self.m and column < self.n:
-                            y[0, row, column] = (acc[ni, mi, ri] * scale).to(
+                            y[bk, row, column] = (acc[ni, mi, ri] * scale).to(
                                 y.element_type
                             )
-                            y[0, row, column + 8] = (acc[ni, mi, ri + 2] * scale).to(
+                            y[bk, row, column + 8] = (acc[ni, mi, ri + 2] * scale).to(
                                 y.element_type
                             )
         else:
             state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.stages
             )
-            for kt in cutlass.range(self.k // 128, unroll=1):
+            for kt in cutlass.range(begin, end, unroll=1):
                 pipe.producer_acquire(state)
                 barrier = pipe.producer_get_barrier(state)
                 cute.copy(
