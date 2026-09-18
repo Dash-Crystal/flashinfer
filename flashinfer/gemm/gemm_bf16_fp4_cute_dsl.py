@@ -284,11 +284,11 @@ def _prepare_cute_dsl(
 
 def _bf16_fp4_cute_dsl_tactic_configs(
     n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]]:
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
     Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma)`` tuples.
+    tile_swizzle)`` tuples. MMA precision follows the activation dtype.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -300,50 +300,48 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     tile_m_atoms.append((32, (2, 2, 1)))
     tile_m_atoms.append((64, (2, 2, 1)))
 
-    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]] = []
+    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1):
+    def add(tile_m, atom, pdepth, tile_n=64, tk=None, swz=1):
         cfg = (
             (tile_m, tile_n, tile_k if tk is None else tk),
             atom,
             pdepth,
-            fp16,
             swz,
         )
-        key = (cfg[0], cfg[1], pdepth, fp16, swz)
-        if key not in seen:
-            seen.add(key)
+        if cfg not in seen:
+            seen.add(cfg)
             configs.append(cfg)
 
     base_tile_m, base_atom = tile_m_atoms[0]
-    add(base_tile_m, base_atom, 1, 1)  # 0: baseline
-    add(base_tile_m, base_atom, 0, 1)  # no dequant prefetch (helps short-K)
+    add(base_tile_m, base_atom, 1)  # 0: baseline
+    add(base_tile_m, base_atom, 0)  # no dequant prefetch (helps short-K)
     for tile_m, atom in tile_m_atoms[1:]:
-        add(tile_m, atom, 1, 1)
+        add(tile_m, atom, 1)
 
     # tile_N=128 halves the (m,n)-tile count but needs large wave count.
     if tile_k == 128 and n >= 12288 and n % 128 == 0:
-        add(base_tile_m, base_atom, 1, 1, tile_n=128)
+        add(base_tile_m, base_atom, 1, tile_n=128)
 
     # tile_K=64 has more ab stages, but requires larger problem size.
     if tile_k == 128 and n >= 8192:
-        add(base_tile_m, base_atom, 1, 1, tile_n=64, tk=64)
+        add(base_tile_m, base_atom, 1, tile_n=64, tk=64)
 
     # tile_M=128 (taller M tile, atom (2,2,1)) -- the large-M *prefill* lever.
     if tile_k == 128:
-        add(128, (2, 2, 1), 1, 1)
+        add(128, (2, 2, 1), 1)
 
     # Threadblock swizzle (tile_swizzle=8) -- for large-M prefill.
     if tile_k == 128 and n * k >= 16 * 1024 * 1024:
-        add(64, (2, 2, 1), 1, 1, swz=8)
+        add(64, (2, 2, 1), 1, swz=8)
     if tile_k == 128:
-        add(128, (2, 2, 1), 1, 1, swz=8)
+        add(128, (2, 2, 1), 1, swz=8)
 
     # tile_N=128 (with tile_M=64, atom (2,2,1)) -- large shapes.
     if tile_k == 128 and n % 128 == 0 and n >= 4096:
-        add(64, (2, 2, 1), 1, 1, tile_n=128, swz=8)
-        add(64, (2, 2, 1), 1, 1, tile_n=128, swz=1)
+        add(64, (2, 2, 1), 1, tile_n=128, swz=8)
+        add(64, (2, 2, 1), 1, tile_n=128, swz=1)
 
     return configs
 
@@ -401,13 +399,12 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
+                pipeline_depth, tile_swizzle = 1, 1
             else:
                 (
                     tile_shape_mnk,
                     atom_layout,
                     pipeline_depth,
-                    use_fp16_mma,
                     tile_swizzle,
                 ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
             compiled = _get_cute_dsl_bf16_fp4_gemm(
@@ -416,7 +413,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 out_dtype,
                 atom_layout,
                 pipeline_depth,
-                use_fp16_mma,
+                int(a.dtype == torch.float16),
                 enable_pdl=enable_pdl,
                 tile_swizzle=tile_swizzle,
             )

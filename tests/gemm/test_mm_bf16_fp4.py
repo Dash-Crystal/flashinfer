@@ -224,6 +224,26 @@ def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 @pytest.mark.parametrize("auto_tuning", [False, True])
+def test_backend_preserves_large_bf16_activation_range(auto_tuning, backend):
+    """Draft MLP activations above FP16 range must remain finite through MMA."""
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    m, n, k = 1120, 3840, 15360
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16) * 2**16
+    b, sf, alpha = _make_random_fp4_weights(n, k, device)
+    prepared = prepare_bf16_fp4_weights(b, sf, alpha, backend=backend)
+    with autotune(auto_tuning):
+        out = mm_bf16_fp4(a, *prepared, backend=backend)
+    ref = (a.float() @ _dequantize_bf16_fp4_torch(b, sf, alpha, n, k, 16).T).to(
+        torch.bfloat16
+    )
+    assert torch.isfinite(out).all()
+    _assert_close_to_reference(out, ref, backend)
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("auto_tuning", [False, True])
 def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
     """alpha=None must produce identical output to alpha=tensor([1.0])."""
     _skip_if_backend_unavailable(backend)
