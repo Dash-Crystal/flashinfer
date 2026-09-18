@@ -166,6 +166,12 @@ def _activation_packer(m, k, padded_m, paired):
     )
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _reduce_split_k(partials):
+    # Accumulate in FP32 and convert at the final store in one kernel.
+    return partials.sum(0).to(torch.bfloat16)
+
+
 def _run_sparse(
     a,
     b,
@@ -199,7 +205,7 @@ def _run_sparse(
     _compiled(m, n, k, m_tiles, split_k, paired, prepared_a, stages)(
         x, b, b_descale, metadata, alpha, out
     )
-    return out[0] if split_k == 1 else out.sum(0).to(torch.bfloat16)
+    return out[0] if split_k == 1 else _reduce_split_k(out)
 
 
 def _tactics(m, n, k):
