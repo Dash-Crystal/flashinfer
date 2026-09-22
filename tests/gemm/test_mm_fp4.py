@@ -242,23 +242,25 @@ def test_mm_fp4_b12x_row_scales_survive_graph_replay(res_dtype, swap_ab):
 
     reference = torch.empty(m, n, device="cuda", dtype=res_dtype)
     output = torch.empty_like(reference)
-    run(scalar, reference)
+
+    def check_rows(multiplier):
+        # Scaling an already rounded FP16 reference can double-round subnormals.
+        for factor in (0, 0.25, 0.5, 1, 2, 4):
+            run(scalar * (multiplier * factor), reference)
+            selected = factors == factor
+            torch.testing.assert_close(
+                output[selected], reference[selected], rtol=0, atol=0
+            )
+
     for _ in range(3):
         run(alpha, output)
-    torch.testing.assert_close(
-        output, (reference.float() * factors[:, None]).to(res_dtype), rtol=0, atol=0
-    )
+    check_rows(1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(alpha, output)
     alpha.mul_(2)
     graph.replay()
-    torch.testing.assert_close(
-        output,
-        (reference.float() * (2 * factors[:, None])).to(res_dtype),
-        rtol=0,
-        atol=0,
-    )
+    check_rows(2)
     # Public dispatch must use a distinct compiled specialization from scalar alpha.
     observed = mm_fp4(
         a_fp4,
