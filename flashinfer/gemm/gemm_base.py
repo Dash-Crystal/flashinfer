@@ -5638,7 +5638,12 @@ def _check_mm_fp4_problem_size(
     if alpha is not None and alpha.dtype != torch.float:
         raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
     if alpha is not None and alpha.numel() != 1:
-        raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
+        if backend != "b12x" or alpha.shape != (a.shape[0],):
+            raise ValueError(
+                "alpha must be a scalar, or shape (M,) with backend='b12x'"
+            )
+        if alpha.device != a.device or not alpha.is_contiguous():
+            raise ValueError("Rowwise alpha must be contiguous on the input device")
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -6278,6 +6283,8 @@ def _b12x_gemm_fp4_runner(
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
+            rowwise_alpha = alpha_tensor is not None and alpha_tensor.numel() != 1
+
             sf_m = (m + 127) // 128
             sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
@@ -6303,6 +6310,7 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                rowwise_alpha=rowwise_alpha,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
@@ -6322,9 +6330,14 @@ def _b12x_gemm_fp4_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
+                rowwise_alpha=rowwise_alpha,
             )
 
-            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+            alpha_for_launch = (
+                alpha_tensor
+                if rowwise_alpha
+                else _prepare_alpha_for_launch(alpha_tensor, a.device)
+            )
 
             # `out` passed as-is (row-major (m, n)).
             compiled_gemm(
@@ -6562,7 +6575,9 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar.
+        Global scale tensor, float scalar. With explicit ``backend="b12x"``,
+        also accepts contiguous FP32 shape ``(m,)`` on the input device for
+        per-row scaling before output conversion.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.

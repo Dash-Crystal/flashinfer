@@ -58,6 +58,7 @@ def _compile_block_scaled_gemm(
     cluster_shape_k=1,
     cache_module_name=None,
     device_index=None,
+    rowwise_alpha=False,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -78,6 +79,8 @@ def _compile_block_scaled_gemm(
     if device_index is None:
         device_index = torch.cuda.current_device()
     mem_key = (device_index, cache_key)
+    if rowwise_alpha:
+        mem_key = (*mem_key, "rowwise_alpha")
     if mem_key in cache:
         return cache[mem_key]
 
@@ -100,6 +103,7 @@ def _compile_block_scaled_gemm(
         sf_k=sf_k,
         batch_size=batch_size,
         max_active_clusters=max_active_clusters,
+        rowwise_alpha=rowwise_alpha,
     )
 
     if cache_module_name is None:
@@ -109,7 +113,8 @@ def _compile_block_scaled_gemm(
 
         compiled_gemm = build_and_load_cute_dsl_kernel(
             cache_module_name,
-            _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters),
+            _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters)
+            + ("_rowalpha" if rowwise_alpha else ""),
             compile_kernel,
             extra_key_files=_blockscaled_gemm_cache_key_files(),
         )
@@ -160,6 +165,7 @@ def _make_blockscaled_gemm_compile_fn(
     sf_k,
     batch_size,
     max_active_clusters,
+    rowwise_alpha=False,
 ):
     """Build a zero-arg closure that runs ``cute.compile`` for gemm."""
     import cutlass
@@ -202,7 +208,7 @@ def _make_blockscaled_gemm_compile_fn(
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         alpha_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (1,), assumed_align=4
+            cutlass.Float32, (sym_m if rowwise_alpha else 1,), assumed_align=4
         )
 
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

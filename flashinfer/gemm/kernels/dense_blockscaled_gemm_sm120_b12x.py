@@ -209,6 +209,7 @@ class DenseGemmKernel:
         use_m1_non_tma_sfa: bool = False,
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
+        rowwise_alpha: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -238,6 +239,7 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
+        self.rowwise_alpha = rowwise_alpha
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
@@ -387,7 +389,7 @@ class DenseGemmKernel:
             sfa: Scale factor tensor for A
             sfb: Scale factor tensor for B
             c: Output tensor C
-            alpha: Alpha scaling factor tensor, shape (1,), float32
+            alpha: FP32 scale, shape (M,) when rowwise_alpha else (1,).
             max_active_clusters: Max active clusters
             stream: CUDA stream
             epilogue_op: Elementwise epilogue function
@@ -841,7 +843,9 @@ class DenseGemmKernel:
         alpha: cute.Tensor,
     ):
         # Keep alpha in FP32 for precision
-        alpha_value = alpha[0].to(cutlass.Float32)
+        alpha_value = cutlass.Float32(1.0)
+        if cutlass.const_expr(not self.rowwise_alpha):
+            alpha_value = alpha[0].to(cutlass.Float32)
 
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
@@ -1494,6 +1498,29 @@ class DenseGemmKernel:
                                 tCrB[None, _nt, k_block_idx],
                                 accumulators[None, _mt, _nt],
                             )
+
+                if cutlass.const_expr(self.rowwise_alpha):
+                    # Scale the MMA fragment before the existing store/split-K
+                    # epilogue so each path rounds only after FP32 row scaling.
+                    row_acc = _reshape_acc_to_mn(accumulators)
+                    row_coords = _reshape_acc_to_mn(
+                        thr_mma.partition_C(
+                            cute.make_identity_tensor(self.mma_tile_shape_mnk[:2])
+                        )
+                    )
+                    for acc_m in cutlass.range_constexpr(cute.size(row_acc.shape[0])):
+                        for acc_n in cutlass.range_constexpr(
+                            cute.size(row_acc.shape[1])
+                        ):
+                            coord = row_coords[acc_m, acc_n]
+                            row = (
+                                tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                                + coord[1 if self.swap_ab else 0]
+                            )
+                            row_scale = cutlass.Float32(0.0)
+                            if row < Int32(directC_mnl.shape[0]):
+                                row_scale = alpha[row].to(cutlass.Float32)
+                            row_acc[acc_m, acc_n] = row_scale * row_acc[acc_m, acc_n]
 
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)

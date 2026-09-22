@@ -204,6 +204,75 @@ def test_mm_fp4_b12x_misaligned_k_raises():
         )
 
 
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_mm_fp4_b12x_row_scales_survive_graph_replay(res_dtype, swap_ab):
+    """Row scaling shares scalar GEMM numerics and reads updated device scales."""
+    if get_compute_capability(torch.device("cuda")) != (12, 0):
+        pytest.skip("Requires SM120")
+    from flashinfer.gemm.gemm_base import _b12x_gemm_fp4_runner
+
+    m, n, k = 1121, 3840, 3840
+    torch.manual_seed(29)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    a_global = (448 * 6) / a.abs().amax().float()
+    b_global = (448 * 6) / b.abs().amax().float()
+    a_fp4, a_sf = nvfp4_quantize(a, a_global)
+    b_fp4, b_sf = nvfp4_quantize(b, b_global)
+    scalar = (a_global * b_global).reciprocal().reshape(1)
+    factors = torch.exp2(torch.arange(m, device="cuda", dtype=torch.float32) % 5 - 2)
+    factors[::7] = 0
+    alpha = scalar * factors
+    runner = _b12x_gemm_fp4_runner(12, 0, True, res_dtype, True)
+    tactic = (
+        (64, 32) if swap_ab else (128, 128),
+        (1, 1),
+        swap_ab,
+        False,
+        "sm120",
+        None,
+    )
+
+    def run(scale, output):
+        runner.forward(
+            [a_fp4, b_fp4.T, a_sf, b_sf.T, scale, res_dtype, output, 16, True, None],
+            tactic=tactic,
+        )
+
+    reference = torch.empty(m, n, device="cuda", dtype=res_dtype)
+    output = torch.empty_like(reference)
+    run(scalar, reference)
+    for _ in range(3):
+        run(alpha, output)
+    torch.testing.assert_close(
+        output, (reference.float() * factors[:, None]).to(res_dtype), rtol=0, atol=0
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(alpha, output)
+    alpha.mul_(2)
+    graph.replay()
+    torch.testing.assert_close(
+        output,
+        (reference.float() * (2 * factors[:, None])).to(res_dtype),
+        rtol=0,
+        atol=0,
+    )
+    # Public dispatch must use a distinct compiled specialization from scalar alpha.
+    observed = mm_fp4(
+        a_fp4,
+        b_fp4.T,
+        a_sf,
+        b_sf.T,
+        alpha,
+        out_dtype=res_dtype,
+        backend="b12x",
+        skip_check=False,
+    )
+    torch.testing.assert_close(observed, output, rtol=0.01, atol=0.01)
+
+
 def test_mm_fp4_cute_dsl_misaligned_n_raises():
     device = torch.device("cuda")
     if get_compute_capability(device)[0] != 10:
