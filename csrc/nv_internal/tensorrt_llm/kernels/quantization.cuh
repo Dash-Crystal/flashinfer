@@ -832,9 +832,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     if (threadIdx.x == 0) {
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
-    __syncthreads();
-    perTokenScale = perTokenScaleOutput[rowIdx];
-    globalEncodeScale = reciprocal_approximate_ftz(perTokenScale);
+    globalEncodeScale = perTokenScale != 0.0f ? reciprocal_approximate_ftz(perTokenScale) : 0.0f;
   }
 
   // quantize to fp4 with per-token scale, reading inputs from smem (each thread reads
