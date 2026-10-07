@@ -11,20 +11,21 @@ from tests.utils_fp8 import to_float8
     "transpose_a,transpose_b",
     [(False, False), (False, True), (True, False), (True, True)],
 )
+@pytest.mark.parametrize("m,n", [(64, 32), (512, 4096)])
 def test_tf32x3_fp32_preserves_batched_layouts_epilogue_and_graph(
-    transpose_a, transpose_b
+    transpose_a, transpose_b, m, n
 ):
     """The shared FP32 adapter must preserve views, beta*C, and live graph inputs."""
     from flashinfer.gemm.fp32 import bmm_fp32_tf32x3
 
     torch.manual_seed(91)
-    a = torch.randn(3, 64, 128, device="cuda")
-    b = torch.randn(3, 128, 32, device="cuda")
+    a = torch.randn(3, m, 128, device="cuda")
+    b = torch.randn(3, 128, n, device="cuda")
     if transpose_a:
         a = a.mT.contiguous().mT
     if transpose_b:
         b = b.mT.contiguous().mT
-    c = torch.randn(3, 64, 32, device="cuda")
+    c = torch.randn(3, m, n, device="cuda")
 
     def reference():
         return (0.75 * (a.double() @ b.double()) - 0.5 * c.double()).float()

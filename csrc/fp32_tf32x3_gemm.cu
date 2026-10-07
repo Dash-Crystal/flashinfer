@@ -10,13 +10,13 @@
 
 namespace {
 
-template <typename LayoutA, typename LayoutB>
+template <typename LayoutA, typename LayoutB, int Tile>
 void run(TensorView a, TensorView b, TensorView c, TensorView out, float alpha, float beta) {
   // CUTLASS example 27's stock three-product FP32 MMA, with its batched device adapter.
   using Gemm = cutlass::gemm::device::GemmBatched<
       float, LayoutA, float, LayoutB, float, cutlass::layout::RowMajor, float,
-      cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 64, 16>,
-      cutlass::gemm::GemmShape<64, 32, 16>, cutlass::gemm::GemmShape<16, 8, 8>,
+      cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, cutlass::gemm::GemmShape<Tile, Tile, 16>,
+      cutlass::gemm::GemmShape<Tile / 2, 32, 16>, cutlass::gemm::GemmShape<16, 8, 8>,
       cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
       cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, 3, 4, 4,
       cutlass::arch::OpMultiplyAddFastF32>;
@@ -36,6 +36,14 @@ void run(TensorView a, TensorView b, TensorView c, TensorView out, float alpha, 
   auto status = gemm(args, nullptr, get_stream(a.device()));
   TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
       << "TF32x3 GEMM failed with CUTLASS status " << int(status);
+}
+
+template <typename LayoutA, typename LayoutB>
+void dispatch(TensorView a, TensorView b, TensorView c, TensorView out, float alpha, float beta) {
+  if (b.size(2) >= 4096 && a.size(1) >= 512)
+    run<LayoutA, LayoutB, 128>(a, b, c, out, alpha, beta);
+  else
+    run<LayoutA, LayoutB, 64>(a, b, c, out, alpha, beta);
 }
 
 }  // namespace
@@ -81,14 +89,14 @@ void fp32_tf32x3_bmm(TensorView a, TensorView b, TensorView c, TensorView out, d
   using Col = cutlass::layout::ColumnMajor;
   if (a.stride(2) == 1) {
     if (b.stride(2) == 1)
-      run<Row, Row>(a, b, c, out, alpha, beta);
+      dispatch<Row, Row>(a, b, c, out, alpha, beta);
     else
-      run<Row, Col>(a, b, c, out, alpha, beta);
+      dispatch<Row, Col>(a, b, c, out, alpha, beta);
   } else {
     if (b.stride(2) == 1)
-      run<Col, Row>(a, b, c, out, alpha, beta);
+      dispatch<Col, Row>(a, b, c, out, alpha, beta);
     else
-      run<Col, Col>(a, b, c, out, alpha, beta);
+      dispatch<Col, Col>(a, b, c, out, alpha, beta);
   }
 }
 
