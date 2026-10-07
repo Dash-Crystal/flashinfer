@@ -14,6 +14,63 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
+def test_captured_scratch_survives_other_stream_workspace_writes():
+    """A serving stream must not overwrite another graph's retained scratch."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(first):
+        left = _get_cache_buf("gemm_scratch_isolation", 4096, device)
+        assert (
+            left.data_ptr()
+            == _get_cache_buf("gemm_scratch_isolation", 4096, device).data_ptr()
+        )
+    with torch.cuda.stream(second):
+        right = _get_cache_buf("gemm_scratch_isolation", 4096, device)
+    assert left.data_ptr() != right.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=first):
+        left.fill_(3)
+    graph.replay()
+    with torch.cuda.stream(second):
+        right.fill_(7)
+    torch.cuda.synchronize()
+    assert bool((left == 3).all())
+    assert bool((right == 7).all())
+
+
+def test_cudnn_handle_is_not_mutated_by_another_host_thread(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import count
+    from threading import Barrier
+    from types import SimpleNamespace
+
+    from flashinfer.gemm import gemm_base
+
+    handles = count(1)
+    monkeypatch.setattr(gemm_base, "_cudnn_handles", {})
+    monkeypatch.setattr(gemm_base, "_check_cudnn_availability", lambda: None)
+    monkeypatch.setattr(
+        gemm_base,
+        "cudnn",
+        SimpleNamespace(
+            create_handle=lambda: next(handles), set_stream=lambda *args: None
+        ),
+        raising=False,
+    )
+    barrier = Barrier(2)
+
+    def acquire():
+        device, stream = SimpleNamespace(index=0), SimpleNamespace(cuda_stream=1)
+        first = gemm_base._get_cudnn_handle(device, stream)
+        barrier.wait(timeout=10)
+        assert first == gemm_base._get_cudnn_handle(device, stream)
+        return first
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tasks = [pool.submit(acquire) for _ in range(2)]
+        assert tasks[0].result() != tasks[1].result()
+
+
 def _assert_engine_knob_tactic(tactic):
     """cuDNN tactics are stable (engine_id, knob_items) descriptors, not plan indices."""
     engine_id, knob_items = tactic

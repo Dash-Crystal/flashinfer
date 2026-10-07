@@ -21,6 +21,7 @@ from collections import defaultdict
 from dataclasses import replace
 from enum import Enum
 from types import SimpleNamespace
+from threading import get_ident
 from typing import Callable, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
@@ -2517,22 +2518,22 @@ def clear_cudnn_graph_cache() -> None:
     AutoTuner.get().clear_cache()
 
 
-# One cudnn handle per each GPU
-_cudnn_handles: dict[int, int] = {}
+_cudnn_handles: dict[tuple[int, int], int] = {}
 
 
 def _get_cudnn_handle(device, stream: torch.cuda.Stream):
     """Create and return a cached cuDNN handle."""
     global _cudnn_handles
     device_id = device.index
+    key = (device_id, get_ident())
 
-    if _cudnn_handles.get(device_id) is None:
+    if _cudnn_handles.get(key) is None:
         _check_cudnn_availability()
-        _cudnn_handles[device_id] = cudnn.create_handle()
+        _cudnn_handles[key] = cudnn.create_handle()
         print("cudnn_handle created for device_id = {}\n".format(device_id))
-    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+    cudnn.set_stream(_cudnn_handles[key], stream.cuda_stream)
 
-    return _cudnn_handles[device_id]
+    return _cudnn_handles[key]
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):

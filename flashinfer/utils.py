@@ -223,13 +223,20 @@ def get_alibi_slopes(
 
 SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
-_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_cache_buf: Dict[
+    Union[Tuple[str, torch.device], Tuple[str, torch.device, int]], torch.Tensor
+] = {}
 
 
 def _get_cache_buf(
     name: str, bytes: int, device: torch.device, zero_init: bool = False
 ) -> torch.Tensor:
-    key = (name, device)
+    # Captured kernels retain scratch addresses. Concurrent streams must not
+    # overwrite each other's workspace, even when graph replay skips Python.
+    stream = (
+        torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else 0
+    )
+    key = (name, device, stream)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < bytes:
         if zero_init:
