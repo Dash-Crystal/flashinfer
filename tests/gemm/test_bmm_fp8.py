@@ -7,6 +7,48 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
+@pytest.mark.parametrize(
+    "transpose_a,transpose_b",
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_tf32x3_fp32_preserves_batched_layouts_epilogue_and_graph(
+    transpose_a, transpose_b
+):
+    """The shared FP32 adapter must preserve views, beta*C, and live graph inputs."""
+    from flashinfer.gemm.fp32 import bmm_fp32_tf32x3
+
+    torch.manual_seed(91)
+    a = torch.randn(3, 64, 128, device="cuda")
+    b = torch.randn(3, 128, 32, device="cuda")
+    if transpose_a:
+        a = a.mT.contiguous().mT
+    if transpose_b:
+        b = b.mT.contiguous().mT
+    c = torch.randn(3, 64, 32, device="cuda")
+
+    def reference():
+        return (0.75 * (a.double() @ b.double()) - 0.5 * c.double()).float()
+
+    def check(value):
+        assert bool(torch.allclose(value, reference(), atol=7e-5, rtol=5e-5))
+
+    check(bmm_fp32_tf32x3(a, b, c, -0.5, 0.75))
+    bmm_fp32_tf32x3(a, b, c, -0.5, 0.75)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = bmm_fp32_tf32x3(a, b, c, -0.5, 0.75)
+    torch.cuda.current_stream().wait_stream(stream)
+    a.add_(0.125)
+    graph.replay()
+    check(actual)
+    c.fill_(float("nan"))
+    actual = bmm_fp32_tf32x3(a[0], b[0], c[0], 0.0)
+    expected = (a[0].double() @ b[0].double()).float()
+    assert bool(torch.allclose(actual, expected, atol=7e-5, rtol=5e-5))
+
+
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("m", [1, 48, 128])
 @pytest.mark.parametrize("n", [64, 80, 10304])
